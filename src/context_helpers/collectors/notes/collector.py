@@ -96,7 +96,6 @@ class NotesCollector(BaseCollector):
         if not self._db_path.exists():
             return False
         try:
-            from datetime import timezone
             apple_ts = watermark.timestamp() - _APPLE_EPOCH_OFFSET
             with sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True) as conn:
                 row = conn.execute(
