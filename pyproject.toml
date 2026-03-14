@@ -22,7 +22,19 @@ notes     = ["apple-notes-to-sqlite"]
 # Convenience bundle
 all = ["healthkit-to-sqlite", "apple-notes-to-sqlite"]
 
-dev = ["pytest", "httpx", "ruff", "mypy"]
+dev = [
+    "pytest",
+    "httpx",
+    "ruff",
+    "mypy",
+    # needed to import server/auth/cli without installing extras
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic-settings>=2",
+    "PyYAML",
+    "click",
+    "jinja2",
+]
 
 [project.scripts]
 context-helpers = "context_helpers.cli:main"
@@ -31,5 +43,5 @@ context-helpers = "context_helpers.cli:main"
 packages = ["src/context_helpers"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]   # "." makes `tests/` importable as a package (for conftest imports)
 testpaths = ["tests"]
