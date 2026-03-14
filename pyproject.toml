@@ -18,6 +18,7 @@ imessage  = []          # stdlib only: sqlite3
 music     = []          # stdlib only: plistlib + xml.etree
 health    = ["healthkit-to-sqlite"]
 notes     = ["apple-notes-to-sqlite"]
+obsidian  = ["obsidiantools", "python-frontmatter"]
 
 # Convenience bundle
 all = ["healthkit-to-sqlite", "apple-notes-to-sqlite"]
@@ -34,6 +35,8 @@ dev = [
     "PyYAML",
     "click",
     "jinja2",
+    "obsidiantools",
+    "python-frontmatter",
 ]
 
 [project.scripts]

@@ -69,4 +69,22 @@ def build_collector_registry(config: AppConfig) -> list[BaseCollector]:
         except ImportError as e:
             logger.warning(f"Skipping music collector (import error): {e}")
 
+    if config.collectors.filesystem.enabled:
+        try:
+            from context_helpers.collectors.filesystem.collector import FilesystemCollector
+
+            collectors.append(FilesystemCollector(config.collectors.filesystem))
+            logger.info("Registered collector: filesystem")
+        except ImportError as e:
+            logger.warning(f"Skipping filesystem collector (import error): {e}")
+
+    if config.collectors.obsidian.enabled:
+        try:
+            from context_helpers.collectors.obsidian.collector import ObsidianCollector
+
+            collectors.append(ObsidianCollector(config.collectors.obsidian))
+            logger.info("Registered collector: obsidian")
+        except ImportError as e:
+            logger.warning(f"Skipping obsidian collector (import error): {e}")
+
     return collectors

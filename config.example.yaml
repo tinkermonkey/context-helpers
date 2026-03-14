@@ -23,3 +23,13 @@ collectors:
   music:
     enabled: false
     library_path: ~/Music/iTunes/iTunes Library.xml
+
+  filesystem:
+    enabled: false
+    directory: ~/Documents        # directory to watch for markdown/text files
+    extensions:
+      - .md
+
+  obsidian:
+    enabled: false
+    vault_path: ~/Documents/Obsidian  # path to your Obsidian vault

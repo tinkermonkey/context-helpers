@@ -68,6 +68,21 @@ class MusicConfig(BaseSettings):
     library_path: str = "~/Music/iTunes/iTunes Library.xml"
 
 
+class FilesystemConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    directory: str = "~/Documents"
+    extensions: list[str] = [".md"]
+
+
+class ObsidianConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    vault_path: str = "~/Documents/Obsidian"
+
+
 class CollectorsConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
@@ -76,6 +91,8 @@ class CollectorsConfig(BaseSettings):
     imessage: iMessageConfig = iMessageConfig()
     notes: NotesConfig = NotesConfig()
     music: MusicConfig = MusicConfig()
+    filesystem: FilesystemConfig = FilesystemConfig()
+    obsidian: ObsidianConfig = ObsidianConfig()
 
 
 class AppConfig(BaseSettings):
@@ -128,5 +145,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             imessage=iMessageConfig(**collectors_raw.get("imessage", {})),
             notes=NotesConfig(**collectors_raw.get("notes", {})),
             music=MusicConfig(**collectors_raw.get("music", {})),
+            filesystem=FilesystemConfig(**collectors_raw.get("filesystem", {})),
+            obsidian=ObsidianConfig(**collectors_raw.get("obsidian", {})),
         ),
     )
