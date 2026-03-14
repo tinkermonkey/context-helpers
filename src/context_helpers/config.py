@@ -3,7 +3,6 @@
 Config is read from (in priority order):
 1. Path in CONTEXT_HELPERS_CONFIG environment variable
 2. ~/.config/context-helpers/config.yaml
-3. config.yaml in the current directory
 """
 
 from __future__ import annotations

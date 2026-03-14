@@ -23,7 +23,10 @@ def make_filesystem_router(collector: "FilesystemCollector") -> APIRouter:
 
         Matches the API contract expected by FilesystemHelperAdapter.
         """
-        ext_list = [e.strip() for e in extensions.split(",")] if extensions else None
+        if extensions:
+            ext_list = [e.strip() if e.strip().startswith(".") else f".{e.strip()}" for e in extensions.split(",")]
+        else:
+            ext_list = None
         return collector.fetch_documents(since=since, extensions=ext_list)
 
     return router

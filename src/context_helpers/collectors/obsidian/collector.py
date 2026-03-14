@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import ObsidianConfig
+
+_VAULT_CACHE_TTL = 300  # seconds between vault graph rebuilds
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +38,9 @@ class ObsidianCollector(BaseCollector):
     def __init__(self, config: ObsidianConfig) -> None:
         self._config = config
         self._vault_path = Path(config.vault_path).expanduser().resolve()
-        self._vault = None  # lazy-loaded
+        self._vault = None
+        self._vault_cache_time: float = 0.0
+        self._vault_lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -72,9 +78,12 @@ class ObsidianCollector(BaseCollector):
         return []
 
     def _get_vault(self):
-        if self._vault is None:
-            self._vault = otools.Vault(self._vault_path).connect()
-        return self._vault
+        now = time.monotonic()
+        with self._vault_lock:
+            if self._vault is None or (now - self._vault_cache_time) > _VAULT_CACHE_TTL:
+                self._vault = otools.Vault(self._vault_path).connect()
+                self._vault_cache_time = now
+            return self._vault
 
     def fetch_notes(self, since: str | None) -> list[dict]:
         """Return notes from the Obsidian vault.
@@ -108,8 +117,6 @@ class ObsidianCollector(BaseCollector):
             except ValueError:
                 logger.warning("Invalid since timestamp: %s", since)
 
-        # Rebuild vault graph on each call to pick up changes
-        self._vault = None
         vault = self._get_vault()
 
         results = []
@@ -121,7 +128,7 @@ class ObsidianCollector(BaseCollector):
                 stat = note_path.stat()
                 modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
 
-                if since_dt and modified_at <= since_dt:
+                if since_dt and modified_at < since_dt:
                     continue
 
                 # Parse frontmatter and content
@@ -149,10 +156,11 @@ class ObsidianCollector(BaseCollector):
                 elif not isinstance(aliases, list):
                     aliases = []
 
-                # Inline Dataview fields
+                # Inline Dataview fields (strip fenced code blocks first to avoid false matches)
                 dataview_fields: dict = {}
                 try:
-                    for key, value in re.findall(r'\[?(\w+(?:[-\s]\w+)*)\s*::\s*([^\n\]]+)', markdown):
+                    markdown_no_fences = re.sub(r'```.*?```', '', markdown, flags=re.DOTALL)
+                    for key, value in re.findall(r'\[?(\w+(?:[-\s]\w+)*)\s*::\s*([^\n\]]+)', markdown_no_fences):
                         norm_key = key.lower().replace(" ", "_").replace("-", "_")
                         if norm_key not in dataview_fields:
                             dataview_fields[norm_key] = value.strip()
@@ -185,7 +193,6 @@ class ObsidianCollector(BaseCollector):
                     "markdown": markdown,
                     "modified_at": modified_at_iso,
                     "created_at": created_at,
-                    "file_path": str(note_path),
                     "file_size_bytes": stat.st_size,
                     "has_headings": bool(re.search(r"^#{1,6}\s", markdown, re.MULTILINE)),
                     "has_lists": bool(re.search(r"^(?:[\-\*\+]|\d+\.)\s", markdown, re.MULTILINE)),

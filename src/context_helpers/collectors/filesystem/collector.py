@@ -85,7 +85,7 @@ class FilesystemCollector(BaseCollector):
                 stat = file_path.stat()
                 modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
 
-                if since_dt and modified_at <= since_dt:
+                if since_dt and modified_at < since_dt:
                     continue
 
                 content = file_path.read_text(encoding="utf-8")
@@ -99,7 +99,6 @@ class FilesystemCollector(BaseCollector):
                     "source_id": source_id,
                     "markdown": content,
                     "modified_at": modified_at_iso,
-                    "file_path": str(file_path),
                     "file_size_bytes": stat.st_size,
                     "has_headings": bool(re.search(r"^#{1,6}\s", content, re.MULTILINE)),
                     "has_lists": bool(re.search(r"^(?:[\-\*\+]|\d+\.)\s", content, re.MULTILINE)),

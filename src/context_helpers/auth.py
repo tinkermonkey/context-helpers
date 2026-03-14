@@ -1,5 +1,7 @@
 """Bearer token authentication middleware for context-helpers FastAPI app."""
 
+import secrets
+
 from fastapi import HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -18,7 +20,7 @@ def make_auth_dependency(api_key: str):
 
     async def _verify_token(request: Request) -> None:
         credentials: HTTPAuthorizationCredentials | None = await _bearer_scheme(request)
-        if credentials is None or credentials.credentials != api_key:
+        if credentials is None or not secrets.compare_digest(credentials.credentials, api_key):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing Bearer token",

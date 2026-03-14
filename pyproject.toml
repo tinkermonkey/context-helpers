@@ -21,7 +21,7 @@ notes     = ["apple-notes-to-sqlite"]
 obsidian  = ["obsidiantools", "python-frontmatter"]
 
 # Convenience bundle
-all = ["healthkit-to-sqlite", "apple-notes-to-sqlite"]
+all = ["healthkit-to-sqlite", "apple-notes-to-sqlite", "obsidiantools", "python-frontmatter"]
 
 dev = [
     "pytest",
