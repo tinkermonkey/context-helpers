@@ -82,6 +82,15 @@ class ObsidianConfig(BaseSettings):
     vault_path: str = "~/Documents/Obsidian"
 
 
+class PushConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    library_url: str = ""      # URL of context-library server, e.g. "http://server:8000"
+    library_secret: str = ""   # Must match CTX_WEBHOOK_SECRET on context-library
+    poll_interval: int = 60    # Seconds between polling cycles for non-file sources
+
+
 class CollectorsConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
@@ -99,6 +108,7 @@ class AppConfig(BaseSettings):
 
     server: ServerConfig = ServerConfig()
     collectors: CollectorsConfig = CollectorsConfig()
+    push: PushConfig = PushConfig()
 
 
 def load_config(config_path: Path | None = None) -> AppConfig:
@@ -128,6 +138,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
 
     server_raw = raw.get("server", {})
     collectors_raw = raw.get("collectors", {})
+    push_raw = raw.get("push", {})
 
     api_key = server_raw.get("api_key", "")
     if not api_key or api_key == "change-me":
@@ -147,4 +158,5 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             filesystem=FilesystemConfig(**collectors_raw.get("filesystem", {})),
             obsidian=ObsidianConfig(**collectors_raw.get("obsidian", {})),
         ),
+        push=PushConfig(**push_raw),
     )

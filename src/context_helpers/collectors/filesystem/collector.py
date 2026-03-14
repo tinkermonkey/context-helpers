@@ -52,6 +52,24 @@ class FilesystemCollector(BaseCollector):
             return [f"Read permission required for: {self._directory}"]
         return []
 
+    def has_changes_since(self, watermark: datetime | None) -> bool:
+        if watermark is None:
+            return True
+        for path in self._directory.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in set(self._config.extensions):
+                continue
+            try:
+                if datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) > watermark:
+                    return True
+            except OSError:
+                pass
+        return False
+
+    def watch_paths(self) -> list[Path]:
+        return [self._directory] if self._directory.is_dir() else []
+
     def fetch_documents(self, since: str | None, extensions: list[str] | None) -> list[dict]:
         """Return documents from the configured directory.
 

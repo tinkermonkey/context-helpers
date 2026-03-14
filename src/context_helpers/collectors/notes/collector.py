@@ -90,6 +90,24 @@ class NotesCollector(BaseCollector):
         except sqlite3.OperationalError:
             return ["Full Disk Access (System Settings → Privacy & Security → Full Disk Access)"]
 
+    def has_changes_since(self, watermark: datetime | None) -> bool:
+        if watermark is None:
+            return True
+        if not self._db_path.exists():
+            return False
+        try:
+            from datetime import timezone
+            apple_ts = watermark.timestamp() - _APPLE_EPOCH_OFFSET
+            with sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM ZICCLOUDSYNCINGOBJECT"
+                    " WHERE ZMODIFICATIONDATE > ? AND ZTITLE IS NOT NULL LIMIT 1",
+                    (apple_ts,),
+                ).fetchone()
+            return row is not None
+        except sqlite3.OperationalError:
+            return True  # conservative
+
     def fetch_notes(self, since: str | None, folder_filter: str | None) -> list[dict]:
         """Read notes from NoteStore.sqlite.
 

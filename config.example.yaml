@@ -33,3 +33,9 @@ collectors:
   obsidian:
     enabled: false
     vault_path: ~/Documents/Obsidian  # path to your Obsidian vault
+
+push:
+  enabled: false
+  library_url: "http://server-ip:8000"  # URL of context-library server
+  library_secret: ""                     # Must match CTX_WEBHOOK_SECRET on context-library
+  poll_interval: 60                      # Seconds between polling cycles for non-file sources

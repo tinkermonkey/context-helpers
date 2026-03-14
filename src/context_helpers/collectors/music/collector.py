@@ -50,6 +50,17 @@ class MusicCollector(BaseCollector):
         # iTunes Library.xml is in ~/Music — no special permissions needed
         return []
 
+    def has_changes_since(self, watermark: datetime | None) -> bool:
+        if watermark is None:
+            return True
+        if not self._library_path.exists():
+            return False
+        try:
+            mtime = datetime.fromtimestamp(self._library_path.stat().st_mtime, tz=timezone.utc)
+            return mtime > watermark
+        except OSError:
+            return True  # conservative
+
     def fetch_tracks(self, since: str | None) -> list[dict]:
         """Parse iTunes Library.xml and return tracks with play history.
 

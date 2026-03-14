@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
@@ -23,10 +24,34 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
     Returns:
         Configured FastAPI application
     """
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        push_trigger = None
+        if config.push.enabled and config.push.library_url:
+            try:
+                from context_helpers.state import StateStore
+                from context_helpers.push import PushTrigger
+
+                state_store = StateStore()
+                push_trigger = PushTrigger(config.push, collectors, state_store)
+                push_trigger.start()
+            except Exception as e:
+                logger.error("PushTrigger failed to start: %s", e)
+
+        yield
+
+        if push_trigger is not None:
+            try:
+                push_trigger.stop()
+            except Exception as e:
+                logger.error("PushTrigger failed to stop cleanly: %s", e)
+
     app = FastAPI(
         title="context-helpers",
         description="macOS bridge service for Apple data sources",
         version="0.1.0",
+        lifespan=lifespan,
     )
 
     auth_dep = make_auth_dependency(config.server.api_key)
@@ -35,7 +60,7 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
     for collector in collectors:
         router = collector.get_router()
         app.include_router(router, dependencies=[Depends(auth_dep)])
-        logger.info(f"Mounted routes for collector: {collector.name}")
+        logger.info("Mounted routes for collector: %s", collector.name)
 
     @app.get("/health", dependencies=[Depends(auth_dep)])
     async def health() -> dict:

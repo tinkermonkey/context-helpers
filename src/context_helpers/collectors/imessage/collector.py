@@ -91,6 +91,23 @@ class iMessageCollector(BaseCollector):
         except sqlite3.OperationalError:
             return ["Full Disk Access (System Settings → Privacy & Security → Full Disk Access)"]
 
+    def has_changes_since(self, watermark: datetime | None) -> bool:
+        if watermark is None:
+            return True
+        if not self._db_path.exists():
+            return False
+        try:
+            unix_ts = watermark.timestamp()
+            apple_ns = int((unix_ts - _APPLE_EPOCH_OFFSET) * 1_000_000_000)
+            with sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM message WHERE date > ? AND text IS NOT NULL LIMIT 1",
+                    (apple_ns,),
+                ).fetchone()
+            return row is not None
+        except sqlite3.OperationalError:
+            return True  # conservative: assume changed if we can't check
+
     def fetch_messages(self, since: str | None) -> list[dict]:
         """Read messages from chat.db.
 

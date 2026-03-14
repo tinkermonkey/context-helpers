@@ -1,6 +1,10 @@
 """BaseCollector abstract interface for context-helpers collectors."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
+from datetime import datetime
+from pathlib import Path
 
 from fastapi import APIRouter
 
@@ -52,3 +56,30 @@ class BaseCollector(ABC):
             human-readable permission descriptions (e.g., "Full Disk Access").
         """
         ...
+
+    def has_changes_since(self, watermark: "datetime | None") -> bool:
+        """Return True if this collector may have data newer than *watermark*.
+
+        The default returns True unconditionally (conservative: always trigger).
+        Override for cheap, source-specific change detection that avoids
+        unnecessary round-trips to context-library.
+
+        Args:
+            watermark: The last successful delivery timestamp; None means never delivered.
+
+        Returns:
+            True if there may be new data; False if definitely no changes.
+        """
+        return True
+
+    def watch_paths(self) -> "list[Path]":
+        """Return filesystem paths that should trigger near-instant push on change.
+
+        Used by the FSEvents watcher (watchdog) when available.  Override in
+        file-based collectors to enable sub-second change detection instead of
+        waiting for the poll interval.
+
+        Returns:
+            List of directories to watch recursively.  Empty list means polling only.
+        """
+        return []

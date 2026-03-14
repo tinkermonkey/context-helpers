@@ -77,6 +77,22 @@ class ObsidianCollector(BaseCollector):
             return [f"Read permission required for vault: {self._vault_path}"]
         return []
 
+    def has_changes_since(self, watermark: datetime | None) -> bool:
+        if watermark is None:
+            return True
+        for path in self._vault_path.rglob("*.md"):
+            if not path.is_file():
+                continue
+            try:
+                if datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) > watermark:
+                    return True
+            except OSError:
+                pass
+        return False
+
+    def watch_paths(self) -> list[Path]:
+        return [self._vault_path] if self._vault_path.is_dir() else []
+
     def _get_vault(self):
         now = time.monotonic()
         with self._vault_lock:

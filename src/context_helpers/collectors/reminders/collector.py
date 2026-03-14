@@ -94,6 +94,39 @@ class RemindersCollector(BaseCollector):
         # without actually running a script
         return []
 
+    def has_changes_since(self, watermark: datetime | None) -> bool:
+        if watermark is None:
+            return True
+        # Quick JXA check: get the most-recently-modified reminder's date
+        jxa = (
+            "var app = Application('Reminders');"
+            "var maxDate = new Date(0);"
+            "var lists = app.lists();"
+            "for (var i = 0; i < lists.length; i++) {"
+            "  var reminders = lists[i].reminders();"
+            "  for (var j = 0; j < reminders.length; j++) {"
+            "    var d = reminders[j].modificationDate();"
+            "    if (d && d > maxDate) maxDate = d;"
+            "  }"
+            "}"
+            "maxDate.toISOString();"
+        )
+        try:
+            result = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", jxa],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                return True  # conservative
+            max_dt = datetime.fromisoformat(result.stdout.strip().replace("Z", "+00:00"))
+            if max_dt.tzinfo is None:
+                max_dt = max_dt.replace(tzinfo=timezone.utc)
+            return max_dt > watermark
+        except Exception:
+            return True  # conservative
+
     def fetch_reminders(self, since: str | None, list_filter: str | None) -> list[dict]:
         """Run AppleScript and return reminders as a list of dicts.
 

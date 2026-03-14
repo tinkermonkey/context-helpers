@@ -19,9 +19,10 @@ music     = []          # stdlib only: plistlib + xml.etree
 health    = ["healthkit-to-sqlite"]
 notes     = ["apple-notes-to-sqlite"]
 obsidian  = ["obsidiantools", "python-frontmatter"]
+push      = ["watchdog"]
 
 # Convenience bundle
-all = ["healthkit-to-sqlite", "apple-notes-to-sqlite", "obsidiantools", "python-frontmatter"]
+all = ["healthkit-to-sqlite", "apple-notes-to-sqlite", "obsidiantools", "python-frontmatter", "watchdog"]
 
 dev = [
     "pytest",
@@ -37,6 +38,7 @@ dev = [
     "jinja2",
     "obsidiantools",
     "python-frontmatter",
+    "watchdog",
 ]
 
 [project.scripts]

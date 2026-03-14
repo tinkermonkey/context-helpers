@@ -88,6 +88,22 @@ class HealthCollector(BaseCollector):
         # Health data is read from exported zip files — no special permissions required
         return []
 
+    def has_changes_since(self, watermark: datetime | None) -> bool:
+        if watermark is None:
+            return True
+        try:
+            exports = sorted(
+                self._watch_dir.glob("export*.zip"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not exports:
+                return False
+            mtime = datetime.fromtimestamp(exports[0].stat().st_mtime, tz=timezone.utc)
+            return mtime > watermark
+        except OSError:
+            return True  # conservative
+
     def fetch_workouts(self, since: str | None, activity_type: str | None) -> list[dict]:
         """Convert the latest Health export and query workouts.
 
