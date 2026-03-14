@@ -1,0 +1,25 @@
+server:
+  host: 0.0.0.0
+  port: 7123
+  api_key: "change-me"          # Required: Bearer token for all requests
+
+collectors:
+  reminders:
+    enabled: true
+    list_filter: null             # null = all lists
+
+  health:
+    enabled: false
+    export_watch_dir: ~/Downloads # healthkit-to-sqlite processes Health.zip exports here
+
+  imessage:
+    enabled: true
+    db_path: ~/Library/Messages/chat.db
+
+  notes:
+    enabled: false
+    db_path: ~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite
+
+  music:
+    enabled: false
+    library_path: ~/Music/iTunes/iTunes Library.xml
