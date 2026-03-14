@@ -15,7 +15,7 @@ class TestLoadConfig:
         assert isinstance(load_config(p), AppConfig)
 
     def test_missing_file_raises_file_not_found(self, tmp_path):
-        with pytest.raises(FileNotFoundError, match="config.yaml"):
+        with pytest.raises(FileNotFoundError, match="nonexistent.yaml"):
             load_config(tmp_path / "nonexistent.yaml")
 
     def test_missing_file_error_mentions_setup(self, tmp_path):

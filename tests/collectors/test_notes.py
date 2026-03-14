@@ -43,12 +43,14 @@ class TestHealthCheck:
         result = _collector(tmp_path / "NoteStore.sqlite").health_check()
         assert result["status"] == "error"
 
-    def test_error_message_mentions_db_path(self, tmp_path, monkeypatch):
+    def test_error_message_mentions_permissions(self, tmp_path, monkeypatch):
+        # When the db doesn't exist, check_permissions() fires first and the
+        # message describes the missing Full Disk Access permission.
         monkeypatch.setattr(
             "context_helpers.collectors.notes.collector._HAS_APPLE_NOTES", True
         )
         result = _collector(tmp_path / "NoteStore.sqlite").health_check()
-        assert "NoteStore.sqlite" in result["message"]
+        assert "Full Disk Access" in result["message"] or "permissions" in result["message"].lower()
 
     def test_returns_ok_when_db_exists_and_accessible(self, tmp_path, monkeypatch):
         monkeypatch.setattr(

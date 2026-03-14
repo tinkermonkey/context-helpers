@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -30,16 +29,6 @@ class ServerConfig(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 7123
     api_key: str = ""
-
-    @field_validator("api_key")
-    @classmethod
-    def api_key_must_be_set(cls, v: str) -> str:
-        if not v or v == "change-me":
-            raise ValueError(
-                "api_key must be set in config.yaml (server.api_key). "
-                "Do not use the default 'change-me' value."
-            )
-        return v
 
 
 class RemindersConfig(BaseSettings):
@@ -123,6 +112,13 @@ def load_config(config_path: Path | None = None) -> AppConfig:
 
     server_raw = raw.get("server", {})
     collectors_raw = raw.get("collectors", {})
+
+    api_key = server_raw.get("api_key", "")
+    if not api_key or api_key == "change-me":
+        raise ValueError(
+            "api_key must be set in config.yaml (server.api_key). "
+            "Do not use the default 'change-me' value."
+        )
 
     return AppConfig(
         server=ServerConfig(**server_raw),
