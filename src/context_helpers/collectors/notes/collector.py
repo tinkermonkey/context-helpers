@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
-import sqlite3
-import tempfile
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -17,45 +17,28 @@ logger = logging.getLogger(__name__)
 
 _HAS_APPLE_NOTES = False
 try:
-    import apple_notes_to_sqlite  # type: ignore
+    from apple_notes_to_sqlite.cli import extract_notes  # type: ignore
 
     _HAS_APPLE_NOTES = True
 except ImportError:
     pass
 
-_NOTES_SQL = """
-SELECT
-    n.Z_PK           AS id,
-    n.ZTITLE         AS title,
-    n.ZSNIPPET       AS snippet,
-    f.ZTITLE         AS folder,
-    n.ZCREATIONDATE  AS created_at,
-    n.ZMODIFICATIONDATE AS modified_at
-FROM ZICCLOUDSYNCINGOBJECT n
-LEFT JOIN ZICCLOUDSYNCINGOBJECT f ON f.Z_PK = n.ZFOLDER
-WHERE n.ZTITLE IS NOT NULL
-AND n.ZMODIFICATIONDATE IS NOT NULL
-{since_clause}
-ORDER BY n.ZMODIFICATIONDATE DESC
-"""
-
-# Apple uses Core Data epoch: seconds since 2001-01-01
-_APPLE_EPOCH_OFFSET = 978307200
-
-
-def _apple_ts_to_iso(apple_ts: float) -> str:
-    """Convert Core Data timestamp to ISO 8601."""
-    from datetime import datetime, timezone
-
-    unix_ts = apple_ts + _APPLE_EPOCH_OFFSET
-    return datetime.fromtimestamp(unix_ts, tz=timezone.utc).isoformat()
-
 
 class NotesCollector(BaseCollector):
-    """Collects Apple Notes by reading NoteStore.sqlite via apple-notes-to-sqlite."""
+    """Collects Apple Notes via JXA (osascript).
+
+    Uses apple-notes-to-sqlite's extract_notes() generator which streams
+    notes from the Notes app via AppleScript. No direct database access
+    or Full Disk Access permission required — only Automation permission
+    for Notes.app (granted on first use via macOS dialog).
+
+    Note: folder info is not available via this approach; all notes report
+    folder as "Notes".
+    """
 
     def __init__(self, config: NotesConfig) -> None:
         self._config = config
+        # db_path kept in config for reference but not used at runtime
         self._db_path = Path(os.path.expanduser(config.db_path))
 
     @property
@@ -76,106 +59,79 @@ class NotesCollector(BaseCollector):
         missing = self.check_permissions()
         if missing:
             return {"status": "error", "message": f"Missing permissions: {', '.join(missing)}"}
-        if not self._db_path.exists():
-            return {"status": "error", "message": f"NoteStore.sqlite not found at {self._db_path}"}
-        return {"status": "ok", "message": "Notes database accessible"}
+        return {"status": "ok", "message": "Notes app accessible via AppleScript"}
 
     def check_permissions(self) -> list[str]:
-        if not self._db_path.exists():
-            return ["Full Disk Access (System Settings → Privacy & Security → Full Disk Access)"]
+        """Check Automation permission for Notes.app via a lightweight osascript call."""
         try:
-            with sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True):
-                pass
+            result = subprocess.run(
+                ["osascript", "-e", 'tell application "Notes" to count of notes'],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0 and "not authorized" in result.stderr.lower():
+                return ["Automation permission for Notes.app (System Settings → Privacy & Security → Automation)"]
             return []
-        except sqlite3.OperationalError:
-            return ["Full Disk Access (System Settings → Privacy & Security → Full Disk Access)"]
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return ["osascript not available"]
 
     def has_changes_since(self, watermark: datetime | None) -> bool:
         if watermark is None:
             return True
-        if not self._db_path.exists():
-            return False
+        # NoteStore.sqlite mtime updates whenever a note is created/modified/deleted.
+        # os.stat() works without Full Disk Access, so this is a cheap check.
         try:
-            apple_ts = watermark.timestamp() - _APPLE_EPOCH_OFFSET
-            with sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True) as conn:
-                row = conn.execute(
-                    "SELECT 1 FROM ZICCLOUDSYNCINGOBJECT"
-                    " WHERE ZMODIFICATIONDATE > ? AND ZTITLE IS NOT NULL LIMIT 1",
-                    (apple_ts,),
-                ).fetchone()
-            return row is not None
-        except sqlite3.OperationalError:
-            return True  # conservative
+            mtime = datetime.fromtimestamp(self._db_path.stat().st_mtime, tz=timezone.utc)
+            return mtime > watermark
+        except OSError:
+            return True  # conservative: can't stat, assume changed
 
     def fetch_notes(self, since: str | None, folder_filter: str | None) -> list[dict]:
-        """Read notes from NoteStore.sqlite.
-
-        Falls back to apple-notes-to-sqlite for body content extraction.
+        """Read notes from the Notes app via JXA.
 
         Args:
-            since: Optional ISO 8601 timestamp
-            folder_filter: Optional folder name filter
+            since: Optional ISO 8601 timestamp; return only notes modified after this
+            folder_filter: Optional folder name filter (currently all notes report "Notes")
 
         Returns:
             List of note dicts matching the API contract
 
         Raises:
-            RuntimeError: If the database cannot be opened
+            RuntimeError: If apple-notes-to-sqlite is not installed or osascript fails
         """
         if not _HAS_APPLE_NOTES:
             raise RuntimeError("apple-notes-to-sqlite is not installed")
 
-        since_clause = ""
-        params: list = []
-
+        since_dt: datetime | None = None
         if since:
-            from datetime import datetime, timezone
-
             since_dt = datetime.fromisoformat(since)
             if since_dt.tzinfo is None:
                 since_dt = since_dt.replace(tzinfo=timezone.utc)
-            apple_ts = since_dt.timestamp() - _APPLE_EPOCH_OFFSET
-            since_clause = "AND n.ZMODIFICATIONDATE > ?"
-            params.append(apple_ts)
-
-        sql = _NOTES_SQL.format(since_clause=since_clause)
-
-        # Export notes to a temp SQLite file using apple-notes-to-sqlite
-        with tempfile.TemporaryDirectory() as tmpdir:
-            export_db = Path(tmpdir) / "notes_export.db"
-            try:
-                apple_notes_to_sqlite.cli.convert(str(self._db_path), str(export_db))
-            except Exception as e:
-                raise RuntimeError(f"apple-notes-to-sqlite conversion failed: {e}") from e
-
-            try:
-                with sqlite3.connect(str(export_db)) as conn:
-                    conn.row_factory = sqlite3.Row
-                    rows = conn.execute("SELECT * FROM notes").fetchall()
-            except sqlite3.OperationalError as e:
-                raise RuntimeError(f"Cannot read exported notes database: {e}") from e
 
         notes = []
-        for row in rows:
-            w = dict(row)
-            folder = w.get("folder") or "Notes"
+        for raw in extract_notes():
+            folder = "Notes"
 
             if folder_filter and folder != folder_filter:
                 continue
 
-            note_id = str(w.get("id") or w.get("rowid", ""))
-            title = w.get("title") or "Untitled"
-            body = w.get("body") or w.get("content") or ""
-            created = w.get("created_at") or w.get("creation_date") or ""
-            modified = w.get("modified_at") or w.get("modification_date") or ""
+            updated_str = raw.get("updated") or ""
+            if since_dt and updated_str:
+                try:
+                    updated_dt = datetime.fromisoformat(updated_str)
+                    if updated_dt.tzinfo is None:
+                        updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                    if updated_dt <= since_dt:
+                        continue
+                except ValueError:
+                    pass
 
             notes.append({
-                "id": note_id,
-                "title": title,
-                "body_markdown": body,
+                "id": str(raw.get("id") or ""),
+                "title": raw.get("title") or "Untitled",
+                "body_markdown": raw.get("body") or "",
                 "folder": folder,
-                "created_at": created,
-                "modified_at": modified,
+                "created_at": raw.get("created") or "",
+                "modified_at": updated_str,
             })
 
         return notes

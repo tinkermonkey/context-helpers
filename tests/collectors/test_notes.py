@@ -1,7 +1,8 @@
 """Tests for NotesCollector — health_check and permissions (no live apple-notes dep)."""
 
-import sqlite3
+import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -11,13 +12,6 @@ from context_helpers.config import NotesConfig
 
 def _collector(db_path: str | Path) -> NotesCollector:
     return NotesCollector(NotesConfig(enabled=True, db_path=str(db_path)))
-
-
-def _make_sqlite_db(path: Path) -> Path:
-    """Create a minimal SQLite file that can be opened in read-only mode."""
-    with sqlite3.connect(str(path)) as conn:
-        conn.execute("CREATE TABLE dummy (id INTEGER PRIMARY KEY)")
-    return path
 
 
 class TestHealthCheck:
@@ -36,40 +30,70 @@ class TestHealthCheck:
         result = _collector(tmp_path / "NoteStore.sqlite").health_check()
         assert "pip install" in result["message"]
 
-    def test_returns_error_when_db_missing(self, tmp_path, monkeypatch):
+    def test_returns_error_when_osascript_not_authorized(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "context_helpers.collectors.notes.collector._HAS_APPLE_NOTES", True
         )
-        result = _collector(tmp_path / "NoteStore.sqlite").health_check()
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="not authorized to send Apple events"
+        )
+        with patch("subprocess.run", return_value=mock_result):
+            result = _collector(tmp_path / "NoteStore.sqlite").health_check()
         assert result["status"] == "error"
+        assert "permissions" in result["message"].lower() or "automation" in result["message"].lower()
 
-    def test_error_message_mentions_permissions(self, tmp_path, monkeypatch):
-        # When the db doesn't exist, check_permissions() fires first and the
-        # message describes the missing Full Disk Access permission.
+    def test_returns_ok_when_osascript_succeeds(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "context_helpers.collectors.notes.collector._HAS_APPLE_NOTES", True
         )
-        result = _collector(tmp_path / "NoteStore.sqlite").health_check()
-        assert "Full Disk Access" in result["message"] or "permissions" in result["message"].lower()
-
-    def test_returns_ok_when_db_exists_and_accessible(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "context_helpers.collectors.notes.collector._HAS_APPLE_NOTES", True
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="42", stderr=""
         )
-        db = _make_sqlite_db(tmp_path / "NoteStore.sqlite")
-        result = _collector(db).health_check()
+        with patch("subprocess.run", return_value=mock_result):
+            result = _collector(tmp_path / "NoteStore.sqlite").health_check()
         assert result["status"] == "ok"
 
 
 class TestCheckPermissions:
-    def test_returns_empty_when_db_accessible(self, tmp_path):
-        db = _make_sqlite_db(tmp_path / "NoteStore.sqlite")
-        assert _collector(db).check_permissions() == []
+    def test_returns_empty_when_osascript_succeeds(self, tmp_path):
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="42", stderr=""
+        )
+        with patch("subprocess.run", return_value=mock_result):
+            assert _collector(tmp_path / "NoteStore.sqlite").check_permissions() == []
 
-    def test_returns_full_disk_access_when_db_missing(self, tmp_path):
-        perms = _collector(tmp_path / "NoteStore.sqlite").check_permissions()
+    def test_returns_automation_permission_when_not_authorized(self, tmp_path):
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="not authorized to send Apple events"
+        )
+        with patch("subprocess.run", return_value=mock_result):
+            perms = _collector(tmp_path / "NoteStore.sqlite").check_permissions()
         assert len(perms) == 1
-        assert "Full Disk Access" in perms[0]
+        assert "Automation" in perms[0]
+
+
+class TestHasChangesSince:
+    def test_returns_true_when_watermark_is_none(self, tmp_path):
+        assert _collector(tmp_path / "NoteStore.sqlite").has_changes_since(None) is True
+
+    def test_returns_true_when_db_missing(self, tmp_path):
+        from datetime import datetime, timezone
+        watermark = datetime(2099, 1, 1, tzinfo=timezone.utc)
+        assert _collector(tmp_path / "NoteStore.sqlite").has_changes_since(watermark) is True
+
+    def test_returns_true_when_mtime_newer_than_watermark(self, tmp_path):
+        from datetime import datetime, timezone
+        db = tmp_path / "NoteStore.sqlite"
+        db.touch()
+        watermark = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        assert _collector(db).has_changes_since(watermark) is True
+
+    def test_returns_false_when_mtime_older_than_watermark(self, tmp_path):
+        from datetime import datetime, timezone
+        db = tmp_path / "NoteStore.sqlite"
+        db.touch()
+        watermark = datetime(2099, 1, 1, tzinfo=timezone.utc)
+        assert _collector(db).has_changes_since(watermark) is False
 
 
 class TestFetchNotesErrors:
