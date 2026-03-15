@@ -2,6 +2,8 @@
 
 import json
 import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -269,6 +271,120 @@ class TestCheckPermissions:
     def test_returns_empty_list(self):
         # Permissions are auto-prompted; we can't check them without running
         assert _collector().check_permissions() == []
+
+
+# ---------------------------------------------------------------------------
+# fetch_page
+# ---------------------------------------------------------------------------
+
+def _page_payload(items=None, has_more=False) -> str:
+    return json.dumps({"items": items or [], "hasMore": has_more})
+
+
+class TestFetchPage:
+    def test_returns_tuple_of_items_and_has_more(self, tmp_path):
+        items = [_reminder()]
+        payload = _page_payload(items=items, has_more=True)
+        with patch(_PATCH, return_value=_mock_proc(payload)):
+            result = _collector().fetch_page(after=None, limit=200)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        items_out, has_more = result
+        assert isinstance(items_out, list)
+        assert has_more is True
+
+    def test_fetch_page_returns_items(self, tmp_path):
+        items = [_reminder(id="r1"), _reminder(id="r2")]
+        payload = _page_payload(items=items, has_more=False)
+        with patch(_PATCH, return_value=_mock_proc(payload)):
+            result_items, has_more = _collector().fetch_page(after=None, limit=200)
+        assert len(result_items) == 2
+        assert has_more is False
+
+    def test_fetch_page_list_filter_applied(self):
+        items = [_reminder(id="r1", list="Work"), _reminder(id="r2", list="Personal")]
+        payload = _page_payload(items=items, has_more=False)
+        collector = RemindersCollector(RemindersConfig(enabled=True, list_filter="Work"))
+        with patch(_PATCH, return_value=_mock_proc(payload)):
+            result_items, _ = collector.fetch_page(after=None, limit=200)
+        assert len(result_items) == 1
+        assert result_items[0]["id"] == "r1"
+
+    def test_fetch_page_non_zero_returncode_raises_runtime_error(self):
+        proc = _mock_proc("", returncode=1, stderr="permission denied")
+        with patch(_PATCH, return_value=proc):
+            with pytest.raises(RuntimeError, match="JXA fetch_page failed"):
+                _collector().fetch_page(after=None, limit=200)
+
+    def test_fetch_page_timeout_propagates(self):
+        with patch(_PATCH, side_effect=subprocess.TimeoutExpired(cmd="osascript", timeout=60)):
+            with pytest.raises(subprocess.TimeoutExpired):
+                _collector().fetch_page(after=None, limit=200)
+
+    def test_fetch_page_passes_after_iso_to_script(self):
+        payload = _page_payload(items=[], has_more=False)
+        with patch(_PATCH, return_value=_mock_proc(payload)) as mock_run:
+            after = datetime(2026, 3, 10, 12, 0, 0, tzinfo=timezone.utc)
+            _collector().fetch_page(after=after, limit=50)
+        call_args = mock_run.call_args
+        script = call_args[0][0][4]  # -e <script>
+        assert after.isoformat() in script
+        assert "50" in script
+
+
+# ---------------------------------------------------------------------------
+# has_changes_since (cursor-based)
+# ---------------------------------------------------------------------------
+
+class TestHasChangesSince:
+    def test_returns_true_when_has_pending(self, tmp_path):
+        c = _collector()
+        c._stash = [_reminder()]
+        assert c.has_changes_since(watermark=None) is True
+
+    def test_returns_true_when_has_more(self):
+        c = _collector()
+        c._has_more = True
+        assert c.has_changes_since(watermark=None) is True
+
+    def test_returns_true_when_cursor_is_none(self, tmp_path):
+        c = _collector()
+        cursor_path = tmp_path / "reminders.json"
+        with patch.object(type(c), "_cursor_path", new_callable=lambda: property(lambda self: cursor_path)):
+            result = c.has_changes_since(watermark=datetime(2026, 3, 1, tzinfo=timezone.utc))
+        assert result is True
+
+    def test_returns_true_when_max_dt_exceeds_cursor(self, tmp_path):
+        c = _collector()
+        cursor_path = tmp_path / "reminders.json"
+        cursor_ts = datetime(2026, 3, 10, tzinfo=timezone.utc)
+        cursor_path.write_text(json.dumps({"cursor": cursor_ts.isoformat()}) + "\n")
+        max_dt_str = "2026-03-11T00:00:00.000Z"
+        with patch(_PATCH, return_value=_mock_proc(max_dt_str)):
+            with patch.object(type(c), "_cursor_path", new_callable=lambda: property(lambda self: cursor_path)):
+                result = c.has_changes_since(watermark=None)
+        assert result is True
+
+    def test_returns_false_when_max_dt_at_or_before_cursor(self, tmp_path):
+        c = _collector()
+        cursor_path = tmp_path / "reminders.json"
+        cursor_ts = datetime(2026, 3, 10, tzinfo=timezone.utc)
+        cursor_path.write_text(json.dumps({"cursor": cursor_ts.isoformat()}) + "\n")
+        max_dt_str = "2026-03-09T00:00:00.000Z"
+        with patch(_PATCH, return_value=_mock_proc(max_dt_str)):
+            with patch.object(type(c), "_cursor_path", new_callable=lambda: property(lambda self: cursor_path)):
+                result = c.has_changes_since(watermark=None)
+        assert result is False
+
+    def test_returns_true_conservatively_on_jxa_failure(self, tmp_path):
+        c = _collector()
+        cursor_path = tmp_path / "reminders.json"
+        cursor_ts = datetime(2026, 3, 10, tzinfo=timezone.utc)
+        cursor_path.write_text(json.dumps({"cursor": cursor_ts.isoformat()}) + "\n")
+        with patch(_PATCH, return_value=_mock_proc("", returncode=1, stderr="error")):
+            with patch.object(type(c), "_cursor_path", new_callable=lambda: property(lambda self: cursor_path)):
+                result = c.has_changes_since(watermark=None)
+        assert result is True
 
 
 # ---------------------------------------------------------------------------

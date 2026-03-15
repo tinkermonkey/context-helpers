@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Query
 
 if TYPE_CHECKING:
     from context_helpers.collectors.reminders.collector import RemindersCollector
@@ -23,7 +23,17 @@ def make_reminders_router(collector: "RemindersCollector") -> APIRouter:
 
         Matches the API contract expected by AppleRemindersAdapter.
         """
-        list_filter = list or collector._config.list_filter
-        return collector.fetch_reminders(since=since, list_filter=list_filter)
+        # Primary path: serve from pre-loaded stash (fast, no JXA on request)
+        if collector.has_pending():
+            return collector.consume_stash()
+
+        # Backward-compat: direct fetch when caller provides since
+        # (tests, direct HTTP calls that don't go through push trigger)
+        if since is not None:
+            list_filter = list or collector._config.list_filter
+            return collector.fetch_reminders(since=since, list_filter=list_filter)
+
+        # No stash and no since: return empty rather than triggering full JXA fetch
+        return []
 
     return router
