@@ -6,7 +6,6 @@ import logging
 import os
 import sqlite3
 import tempfile
-import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,29 +18,29 @@ logger = logging.getLogger(__name__)
 
 _HAS_HEALTHKIT = False
 try:
-    import healthkit_to_sqlite  # type: ignore
+    from healthkit_to_sqlite.utils import convert_xml_to_sqlite  # type: ignore
+    import sqlite_utils  # type: ignore
+    import zipfile as _zipfile
 
     _HAS_HEALTHKIT = True
 except ImportError:
     pass
 
-# SQL to query workouts from healthkit-to-sqlite output database
+# SQL to query workouts from healthkit-to-sqlite output database.
+# healthkit-to-sqlite produces a `workouts` table; duration is stored in
+# the unit given by `durationUnit` (typically 'min').
 _WORKOUTS_SQL = """
 SELECT
-    HKWorkout.uuid                          AS id,
-    HKWorkout.workoutActivityType           AS activityType,
-    HKWorkout.startDate                     AS startDate,
-    HKWorkout.endDate                       AS endDate,
-    HKWorkout.duration                      AS durationSeconds,
-    HKWorkout.totalEnergyBurned             AS totalEnergyBurned,
-    HKWorkout.totalDistance                 AS totalDistance,
-    HKWorkoutEvent.value                    AS averageHeartRate
-FROM HKWorkout
-LEFT JOIN HKWorkoutEvent ON HKWorkoutEvent.workoutId = HKWorkout.id
-    AND HKWorkoutEvent.type = 'averageHeartRate'
+    id                  AS id,
+    workoutActivityType AS activityType,
+    startDate           AS startDate,
+    endDate             AS endDate,
+    duration            AS duration,
+    durationUnit        AS durationUnit
+FROM workouts
 WHERE 1=1
 {since_clause}
-ORDER BY HKWorkout.startDate DESC
+ORDER BY startDate DESC
 """
 
 
@@ -88,6 +87,9 @@ class HealthCollector(BaseCollector):
         # Health data is read from exported zip files — no special permissions required
         return []
 
+    def watch_paths(self) -> list[Path]:
+        return [self._watch_dir] if self._watch_dir.exists() else []
+
     def has_changes_since(self, watermark: datetime | None) -> bool:
         if watermark is None:
             return True
@@ -129,13 +131,30 @@ class HealthCollector(BaseCollector):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "health.db"
 
-            # Convert export to SQLite
-            healthkit_to_sqlite.convert(str(export_zip), str(db_path))
+            # Convert export to SQLite using internal API.
+            # Replicate healthkit_to_sqlite's XML discovery: find the first .xml
+            # at depth 1 whose content starts with HealthData markers.
+            with _zipfile.ZipFile(export_zip) as zf:
+                candidates = [
+                    zi.filename for zi in zf.filelist
+                    if zi.filename.count("/") == 1 and zi.filename.endswith(".xml")
+                ]
+                export_xml_path = None
+                for candidate in candidates:
+                    firstbytes = zf.open(candidate).read(1024)
+                    if b"<!DOCTYPE HealthData" in firstbytes or b"<HealthData " in firstbytes:
+                        export_xml_path = candidate
+                        break
+                if export_xml_path is None:
+                    raise RuntimeError(f"No valid HealthData XML found in {export_zip.name}")
+                fp = zf.open(export_xml_path)
+                db = sqlite_utils.Database(str(db_path))
+                convert_xml_to_sqlite(fp, db, zipfile=zf)
 
             since_clause = ""
             params: list = []
             if since:
-                since_clause = "AND HKWorkout.startDate > ?"
+                since_clause = "AND startDate > ?"
                 params.append(since)
 
             sql = _WORKOUTS_SQL.format(since_clause=since_clause)
@@ -149,15 +168,27 @@ class HealthCollector(BaseCollector):
             w = dict(row)
             if activity_type and w.get("activityType") != activity_type:
                 continue
+            # Normalise duration to seconds regardless of the stored unit
+            raw_duration = float(w["duration"]) if w["duration"] else 0.0
+            unit = (w.get("durationUnit") or "min").lower()
+            if unit in ("min", "minutes"):
+                duration_seconds = int(raw_duration * 60)
+            elif unit in ("s", "sec", "seconds"):
+                duration_seconds = int(raw_duration)
+            elif unit in ("hr", "hour", "hours"):
+                duration_seconds = int(raw_duration * 3600)
+            else:
+                duration_seconds = int(raw_duration * 60)  # assume minutes
+
             workouts.append({
                 "id": w["id"],
                 "activityType": w["activityType"],
                 "startDate": w["startDate"],
                 "endDate": w["endDate"],
-                "durationSeconds": int(w["durationSeconds"]) if w["durationSeconds"] else 0,
-                "totalEnergyBurned": w["totalEnergyBurned"],
-                "totalDistance": w["totalDistance"],
-                "averageHeartRate": w["averageHeartRate"],
+                "durationSeconds": duration_seconds,
+                "totalEnergyBurned": None,
+                "totalDistance": None,
+                "averageHeartRate": None,
                 "notes": None,
             })
 
