@@ -18,6 +18,7 @@ def make_filesystem_router(collector: "FilesystemCollector") -> APIRouter:
     def get_documents(
         since: str | None = Query(default=None, description="ISO 8601 timestamp for incremental fetch"),
         extensions: str | None = Query(default=None, description="Comma-separated file extensions, e.g. .md,.txt"),
+        max_size_mb: float | None = Query(default=None, description="Maximum file size in MB; overrides server config when set"),
     ) -> list[dict]:
         """Return documents from the configured local directory.
 
@@ -27,6 +28,6 @@ def make_filesystem_router(collector: "FilesystemCollector") -> APIRouter:
             ext_list = [e.strip() if e.strip().startswith(".") else f".{e.strip()}" for e in extensions.split(",")]
         else:
             ext_list = None
-        return collector.fetch_documents(since=since, extensions=ext_list)
+        return collector.fetch_documents(since=since, extensions=ext_list, max_size_mb=max_size_mb)
 
     return router

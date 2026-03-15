@@ -1,4 +1,4 @@
-"""FilesystemCollector — serves local markdown/text files over HTTP."""
+"""FilesystemCollector — serves local text files over HTTP."""
 
 from __future__ import annotations
 
@@ -11,6 +11,26 @@ from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import FilesystemConfig
 
 logger = logging.getLogger(__name__)
+
+# Directories that are never worth scanning — contain no user content
+_SKIP_DIRS = {
+    ".git", ".hg", ".svn",
+    "node_modules", ".venv", "venv", "__pycache__",
+    ".DS_Store", ".Trash",
+}
+
+# Extensions that are definitively binary — skip before attempting a read.
+# This is a fast-path optimisation; the UTF-8 decode attempt is the real gate.
+_KNOWN_BINARY_EXTENSIONS = {
+    ".iso", ".dmg", ".img", ".bin",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".exe", ".dll", ".so", ".dylib",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".heic",
+    ".mp3", ".mp4", ".m4a", ".flac", ".wav", ".aac", ".mov", ".avi", ".mkv",
+    ".db", ".sqlite", ".sqlite3",
+    ".pyc", ".class", ".o", ".a",
+}
 
 
 class FilesystemCollector(BaseCollector):
@@ -52,16 +72,29 @@ class FilesystemCollector(BaseCollector):
             return [f"Read permission required for: {self._directory}"]
         return []
 
+    def _should_skip_path(self, path: Path) -> bool:
+        """Return True if this path should be excluded from scanning."""
+        if any(part.startswith(".") or part in _SKIP_DIRS for part in path.parts):
+            return True
+        ext = path.suffix.lower()
+        if ext in _KNOWN_BINARY_EXTENSIONS:
+            return True
+        if self._config.extensions and ext not in {e.lower() for e in self._config.extensions}:
+            return True
+        return False
+
     def has_changes_since(self, watermark: datetime | None) -> bool:
         if watermark is None:
             return True
+        max_bytes = int(self._config.max_file_size_mb * 1024 * 1024)
         for path in self._directory.rglob("*"):
-            if not path.is_file():
-                continue
-            if path.suffix.lower() not in set(self._config.extensions):
+            if not path.is_file() or self._should_skip_path(path):
                 continue
             try:
-                if datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) > watermark:
+                stat = path.stat()
+                if stat.st_size > max_bytes:
+                    continue
+                if datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc) > watermark:
                     return True
             except OSError:
                 pass
@@ -70,13 +103,20 @@ class FilesystemCollector(BaseCollector):
     def watch_paths(self) -> list[Path]:
         return [self._directory] if self._directory.is_dir() else []
 
-    def fetch_documents(self, since: str | None, extensions: list[str] | None) -> list[dict]:
+    def fetch_documents(
+        self,
+        since: str | None,
+        extensions: list[str] | None,
+        max_size_mb: float | None = None,
+    ) -> list[dict]:
         """Return documents from the configured directory.
 
         Args:
             since: Optional ISO 8601 timestamp; only return files modified after this time.
             extensions: Optional list of file extensions to include (e.g. [".md", ".txt"]).
                         Defaults to the configured extensions.
+            max_size_mb: Optional size cap in MB; overrides the configured max_file_size_mb
+                         when provided by the caller (e.g. the adapter).
 
         Returns:
             List of document dicts with source_id, markdown, and structural hint fields.
@@ -90,17 +130,31 @@ class FilesystemCollector(BaseCollector):
             except ValueError:
                 logger.warning("Invalid since timestamp: %s", since)
 
-        exts = set(extensions or self._config.extensions)
+        # extensions param overrides config; empty = all readable text files
+        override_exts = {e.lower() for e in extensions} if extensions else None
+        effective_max_mb = max_size_mb if max_size_mb is not None else self._config.max_file_size_mb
+        max_bytes = int(effective_max_mb * 1024 * 1024)
         results = []
 
         for file_path in self._directory.rglob("*"):
             if not file_path.is_file():
                 continue
-            if file_path.suffix.lower() not in exts:
+
+            ext = file_path.suffix.lower()
+            if override_exts is not None:
+                if ext not in override_exts:
+                    continue
+            elif self._should_skip_path(file_path):
                 continue
 
             try:
                 stat = file_path.stat()
+
+                if stat.st_size > max_bytes:
+                    logger.debug("Skipping %s: exceeds max_file_size_mb (%.1f MB)",
+                                 file_path, stat.st_size / 1024 / 1024)
+                    continue
+
                 modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
 
                 if since_dt and modified_at < since_dt:
