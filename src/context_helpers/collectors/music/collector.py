@@ -1,10 +1,10 @@
-"""MusicCollector: parse Apple Music play history from iTunes Library.xml."""
+"""MusicCollector: fetch Apple Music play history via JXA (JavaScript for Automation)."""
 
 from __future__ import annotations
 
+import json
 import logging
-import os
-import plistlib
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,16 +15,56 @@ from context_helpers.config import MusicConfig
 
 logger = logging.getLogger(__name__)
 
+# Fetch all tracks that have been played at least once.
+# Filters in JXA to avoid shipping unplayed tracks across the subprocess boundary.
+_JXA_TRACKS_SCRIPT = """\
+var music = Application('Music');
+var tracks = music.tracks();
+var afterDate = {after_expr};
+var result = [];
+for (var i = 0; i < tracks.length; i++) {{
+    var t = tracks[i];
+    var playedCount = t.playedCount();
+    if (!playedCount || playedCount < 1) continue;
+    var playedDate = t.playedDate();
+    if (!playedDate) continue;
+    if (afterDate && playedDate <= afterDate) continue;
+    result.push({{
+        id: String(t.id()),
+        title: t.name(),
+        artist: t.artist() || null,
+        album: t.album() || null,
+        played_at: playedDate.toISOString(),
+        duration_seconds: Math.round(t.duration()),
+        play_count: playedCount
+    }});
+}}
+JSON.stringify(result);
+"""
+
+_JXA_HAS_CHANGES_SCRIPT = """\
+var music = Application('Music');
+var tracks = music.tracks();
+var maxDate = new Date(0);
+for (var i = 0; i < tracks.length; i++) {
+    var d = tracks[i].playedDate();
+    if (d && d > maxDate) maxDate = d;
+}
+maxDate.toISOString();
+"""
+
 
 class MusicCollector(BaseCollector):
-    """Collects Apple Music track play history from iTunes Library.xml.
+    """Collects Apple Music play history via JXA (JavaScript for Automation).
 
-    No special permissions required — reads an XML file.
+    Queries the Music app directly via osascript — no library file or
+    special permissions required beyond Automation access to Music.app.
     """
 
     def __init__(self, config: MusicConfig) -> None:
         self._config = config
-        self._library_path = Path(os.path.expanduser(config.library_path))
+        # library_path kept in config but unused at runtime (JXA-based)
+        self._library_path = Path(config.library_path).expanduser()
 
     @property
     def name(self) -> str:
@@ -36,107 +76,85 @@ class MusicCollector(BaseCollector):
         return make_music_router(self)
 
     def health_check(self) -> dict:
-        if not self._library_path.exists():
-            return {
-                "status": "error",
-                "message": (
-                    f"iTunes Library.xml not found at {self._library_path}. "
-                    "Enable XML sharing: Music → File → Library → Export Library."
-                ),
-            }
-        return {"status": "ok", "message": f"Library file found: {self._library_path}"}
+        missing = self.check_permissions()
+        if missing:
+            return {"status": "error", "message": f"Missing permissions: {', '.join(missing)}"}
+        try:
+            result = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e",
+                 "Application('Music').tracks().length"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                return {"status": "error", "message": result.stderr.strip()}
+            return {"status": "ok", "message": f"{int(result.stdout.strip()):,} tracks in library"}
+        except subprocess.TimeoutExpired:
+            return {"status": "error", "message": "AppleScript timed out"}
+        except FileNotFoundError:
+            return {"status": "error", "message": "osascript not found (not on macOS?)"}
 
     def check_permissions(self) -> list[str]:
-        # iTunes Library.xml is in ~/Music — no special permissions needed
-        return []
+        try:
+            result = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e",
+                 "Application('Music').tracks().length"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0 and "not authorized" in result.stderr.lower():
+                return ["Automation permission for Music.app (System Settings → Privacy & Security → Automation)"]
+            return []
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return ["osascript not available"]
 
     def has_changes_since(self, watermark: datetime | None) -> bool:
         if watermark is None:
             return True
-        if not self._library_path.exists():
-            return False
         try:
-            mtime = datetime.fromtimestamp(self._library_path.stat().st_mtime, tz=timezone.utc)
-            return mtime > watermark
-        except OSError:
-            return True  # conservative
+            result = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", _JXA_HAS_CHANGES_SCRIPT],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                return True
+            max_dt = datetime.fromisoformat(result.stdout.strip().replace("Z", "+00:00"))
+            if max_dt.tzinfo is None:
+                max_dt = max_dt.replace(tzinfo=timezone.utc)
+            return max_dt > watermark
+        except Exception:
+            return True
 
     def fetch_tracks(self, since: str | None) -> list[dict]:
-        """Parse iTunes Library.xml and return tracks with play history.
-
-        Only tracks with a play count > 0 and a Play Date are included.
+        """Fetch played tracks from the Music app via JXA.
 
         Args:
-            since: Optional ISO 8601 timestamp; return only tracks played after this time
+            since: Optional ISO 8601 timestamp; return only tracks last played after this time
 
         Returns:
-            List of track dicts matching the API contract
+            List of track dicts sorted by most recently played
 
         Raises:
-            FileNotFoundError: If the library file does not exist
-            ValueError: If the library file cannot be parsed
+            RuntimeError: If osascript fails
         """
-        if not self._library_path.exists():
-            raise FileNotFoundError(f"iTunes Library.xml not found at {self._library_path}")
-
-        since_dt: datetime | None = None
         if since:
             since_dt = datetime.fromisoformat(since)
             if since_dt.tzinfo is None:
                 since_dt = since_dt.replace(tzinfo=timezone.utc)
+            after_expr = f"new Date('{since_dt.isoformat()}')"
+        else:
+            after_expr = "null"
 
+        script = _JXA_TRACKS_SCRIPT.format(after_expr=after_expr)
         try:
-            with open(self._library_path, "rb") as f:
-                library = plistlib.load(f)
-        except Exception as e:
-            raise ValueError(f"Failed to parse iTunes Library.xml: {e}") from e
+            result = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", script],
+                capture_output=True, text=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Music.app JXA query timed out after 60s")
 
-        tracks_dict = library.get("Tracks", {})
-        tracks = []
+        if result.returncode != 0:
+            raise RuntimeError(f"JXA failed: {result.stderr.strip()}")
 
-        for track_id, track in tracks_dict.items():
-            # Skip tracks without play history
-            play_count = track.get("Play Count", 0)
-            if not play_count:
-                continue
-
-            play_date = track.get("Play Date UTC")
-            if play_date is None:
-                continue
-
-            # Convert plist datetime to ISO 8601
-            if isinstance(play_date, datetime):
-                if play_date.tzinfo is None:
-                    play_date = play_date.replace(tzinfo=timezone.utc)
-                played_at = play_date.isoformat()
-            else:
-                played_at = str(play_date)
-
-            # Apply since filter
-            if since_dt:
-                try:
-                    play_dt = datetime.fromisoformat(played_at)
-                    if play_dt.tzinfo is None:
-                        play_dt = play_dt.replace(tzinfo=timezone.utc)
-                    if play_dt <= since_dt:
-                        continue
-                except ValueError:
-                    logger.warning(f"Cannot parse play date '{played_at}' for track {track_id}")
-                    continue
-
-            duration_ms = track.get("Total Time")
-            duration_seconds = int(duration_ms // 1000) if duration_ms else None
-
-            tracks.append({
-                "id": str(track.get("Track ID", track_id)),
-                "title": track.get("Name") or "Unknown",
-                "artist": track.get("Artist"),
-                "album": track.get("Album"),
-                "played_at": played_at,
-                "duration_seconds": duration_seconds,
-                "play_count": play_count,
-            })
-
-        # Sort by most recently played
+        tracks: list[dict] = json.loads(result.stdout.strip())
         tracks.sort(key=lambda t: t["played_at"], reverse=True)
         return tracks
