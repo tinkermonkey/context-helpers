@@ -10,6 +10,8 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from context_helpers.collectors.base import PagedCollector
+
 if TYPE_CHECKING:
     from context_helpers.collectors.base import BaseCollector
     from context_helpers.config import PushConfig
@@ -171,6 +173,12 @@ class PushTrigger:
         changed = []
         for collector in self._collectors:
             try:
+                # Paged collectors with a loaded stash or more pages are always changed
+                if isinstance(collector, PagedCollector) and (
+                    collector.has_pending() or collector.has_more()
+                ):
+                    changed.append(collector.name)
+                    continue
                 if collector.has_changes_since(watermark):
                     changed.append(collector.name)
             except Exception as e:
@@ -183,7 +191,21 @@ class PushTrigger:
             logger.debug("PushTrigger: no changes detected")
             return
 
-        logger.info("PushTrigger: changes detected in %s — triggering delivery", changed)
+        # Pre-fill stash for paged collectors in changed that have no stash yet
+        for collector in self._collectors:
+            if isinstance(collector, PagedCollector) and collector.name in changed:
+                if not collector.has_pending():
+                    page_size = getattr(getattr(collector, "_config", None), "page_size", 200)
+                    collector.fill_stash(limit=page_size)
+                    # If fill produced nothing and no more pages remain, skip delivery
+                    if not collector.has_pending() and not collector.has_more():
+                        changed.remove(collector.name)
+
+        if not changed:
+            logger.debug("PushTrigger: stash empty after fill — no delivery needed")
+            return
+
+        logger.info("PushTrigger: changes in %s — triggering delivery", changed)
         self._deliver(watermark)
 
     def _deliver(self, watermark: datetime | None) -> None:
@@ -206,6 +228,15 @@ class PushTrigger:
                     logger.info(
                         "PushTrigger: delivery succeeded, watermark advanced to %s", now.isoformat()
                     )
+                    # Chain next page immediately for paged collectors with more data
+                    for collector in self._collectors:
+                        if isinstance(collector, PagedCollector) and collector.has_more():
+                            logger.debug(
+                                "PushTrigger: collector '%s' has more pages — scheduling immediate next cycle",
+                                collector.name,
+                            )
+                            self._pending.set()
+                            break
                 else:
                     logger.warning("PushTrigger: unexpected response status %d", resp.status)
         except urllib.error.HTTPError as e:

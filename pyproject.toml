@@ -19,6 +19,7 @@ music     = []          # stdlib only: plistlib + xml.etree
 health    = ["healthkit-to-sqlite"]
 notes     = ["apple-notes-to-sqlite"]
 obsidian  = ["obsidiantools", "python-frontmatter"]
+oura      = []          # stdlib only: urllib
 push      = ["watchdog"]
 
 # Convenience bundle

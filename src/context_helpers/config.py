@@ -35,6 +35,7 @@ class RemindersConfig(BaseSettings):
 
     enabled: bool = False
     list_filter: str | None = None
+    page_size: int = 200
 
 
 class HealthConfig(BaseSettings):
@@ -64,7 +65,7 @@ class MusicConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
     enabled: bool = False
-    library_path: str = "~/Music/iTunes/iTunes Library.xml"
+    library_path: str = "~/Music/Music/Music Library.xml"
 
 
 class FilesystemConfig(BaseSettings):
@@ -72,7 +73,8 @@ class FilesystemConfig(BaseSettings):
 
     enabled: bool = False
     directory: str = "~/Documents"
-    extensions: list[str] = [".md"]
+    extensions: list[str] = []          # empty = all readable text files; non-empty = explicit allowlist
+    max_file_size_mb: float = 1.0       # files larger than this are skipped before reading
 
 
 class ObsidianConfig(BaseSettings):
@@ -80,6 +82,19 @@ class ObsidianConfig(BaseSettings):
 
     enabled: bool = False
     vault_path: str = "~/Documents/Obsidian"
+
+
+class OuraConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    client_id: str = ""
+    client_secret: str = ""
+    # Seed tokens — paste here once to bootstrap; subsequent tokens are stored automatically
+    access_token: str = ""
+    refresh_token: str = ""
+    base_url: str = "https://api.ouraring.com/v2"  # overridable for testing
+    token_url: str = "https://api.ouraring.com/oauth/token"  # overridable for testing
 
 
 class PushConfig(BaseSettings):
@@ -101,6 +116,7 @@ class CollectorsConfig(BaseSettings):
     music: MusicConfig = MusicConfig()
     filesystem: FilesystemConfig = FilesystemConfig()
     obsidian: ObsidianConfig = ObsidianConfig()
+    oura: OuraConfig = OuraConfig()
 
 
 class AppConfig(BaseSettings):
@@ -157,6 +173,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             music=MusicConfig(**collectors_raw.get("music", {})),
             filesystem=FilesystemConfig(**collectors_raw.get("filesystem", {})),
             obsidian=ObsidianConfig(**collectors_raw.get("obsidian", {})),
+            oura=OuraConfig(**collectors_raw.get("oura", {})),
         ),
         push=PushConfig(**push_raw),
     )

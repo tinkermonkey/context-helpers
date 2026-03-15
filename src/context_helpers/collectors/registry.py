@@ -87,4 +87,13 @@ def build_collector_registry(config: AppConfig) -> list[BaseCollector]:
         except ImportError as e:
             logger.warning(f"Skipping obsidian collector (import error): {e}")
 
+    if config.collectors.oura.enabled:
+        try:
+            from context_helpers.collectors.oura.collector import OuraCollector
+
+            collectors.append(OuraCollector(config.collectors.oura))
+            logger.info("Registered collector: oura")
+        except ImportError as e:
+            logger.warning("Skipping oura collector (import error): %s", e)
+
     return collectors

@@ -7,6 +7,7 @@ collectors:
   reminders:
     enabled: true
     list_filter: null             # null = all lists
+    page_size: 200                # Items fetched per page (default 200)
 
   health:
     enabled: false
@@ -22,17 +23,30 @@ collectors:
 
   music:
     enabled: false
-    library_path: ~/Music/iTunes/iTunes Library.xml
+    library_path: ~/Music/Music/Music Library.xml
 
   filesystem:
     enabled: false
-    directory: ~/Documents        # directory to watch for markdown/text files
-    extensions:
-      - .md
+    directory: ~/Documents        # directory to watch for text files
+    extensions: []                # empty = all readable text files; non-empty = explicit allowlist (e.g. [.md, .txt])
+    max_file_size_mb: 1.0         # files larger than this are skipped
 
   obsidian:
     enabled: false
     vault_path: ~/Documents/Obsidian  # path to your Obsidian vault
+
+  oura:
+    enabled: false
+    # Register an OAuth2 app at https://cloud.ouraring.com/oauth/applications
+    # then run the server-side flow to get your initial access_token + refresh_token.
+    # After the first successful refresh, tokens are stored automatically in
+    # ~/.local/share/context-helpers/oura_tokens.json and the config values are ignored.
+    client_id: ""
+    client_secret: ""
+    access_token: ""   # initial access token (seed only)
+    refresh_token: ""  # initial refresh token (seed only)
+    # base_url: "https://api.ouraring.com/v2"      # override for testing only
+    # token_url: "https://api.ouraring.com/oauth/token"  # override for testing only
 
 push:
   enabled: false
