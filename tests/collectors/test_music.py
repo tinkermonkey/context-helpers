@@ -12,8 +12,8 @@ from context_helpers.collectors.music.collector import MusicCollector
 from context_helpers.config import MusicConfig
 
 
-def _collector(library_path: str | Path = "/tmp/Music Library.xml") -> MusicCollector:
-    return MusicCollector(MusicConfig(enabled=True, library_path=str(library_path)))
+def _collector() -> MusicCollector:
+    return MusicCollector(MusicConfig(enabled=True))
 
 
 def _osascript_ok(stdout: str) -> subprocess.CompletedProcess:
@@ -185,7 +185,7 @@ class TestFetchTracksErrors:
                 _collector().fetch_tracks(since=None)
 
     def test_timeout_raises_runtime_error(self):
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=[], timeout=60)):
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=[], timeout=120)):
             with pytest.raises(RuntimeError, match="timed out"):
                 _collector().fetch_tracks(since=None)
 

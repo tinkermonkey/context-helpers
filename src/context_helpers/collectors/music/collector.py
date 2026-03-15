@@ -6,7 +6,6 @@ import json
 import logging
 import subprocess
 from datetime import datetime, timezone
-from pathlib import Path
 
 from fastapi import APIRouter
 
@@ -16,27 +15,35 @@ from context_helpers.config import MusicConfig
 logger = logging.getLogger(__name__)
 
 # Fetch all tracks that have been played at least once.
-# Filters in JXA to avoid shipping unplayed tracks across the subprocess boundary.
+#
+# Uses JXA array-specifier form (music.tracks.playedCount() etc.) to bulk-fetch
+# each property in a single Apple Events round-trip rather than one per track.
+# This is dramatically faster than the per-track property access pattern.
 _JXA_TRACKS_SCRIPT = """\
 var music = Application('Music');
-var tracks = music.tracks();
 var afterDate = {after_expr};
+var ids        = music.tracks.id();
+var names      = music.tracks.name();
+var artists    = music.tracks.artist();
+var albums     = music.tracks.album();
+var durations  = music.tracks.duration();
+var playCounts = music.tracks.playedCount();
+var playDates  = music.tracks.playedDate();
 var result = [];
-for (var i = 0; i < tracks.length; i++) {{
-    var t = tracks[i];
-    var playedCount = t.playedCount();
-    if (!playedCount || playedCount < 1) continue;
-    var playedDate = t.playedDate();
-    if (!playedDate) continue;
-    if (afterDate && playedDate <= afterDate) continue;
+for (var i = 0; i < ids.length; i++) {{
+    var count = playCounts[i];
+    if (!count || count < 1) continue;
+    var played = playDates[i];
+    if (!played) continue;
+    if (afterDate && played <= afterDate) continue;
     result.push({{
-        id: String(t.id()),
-        title: t.name(),
-        artist: t.artist() || null,
-        album: t.album() || null,
-        played_at: playedDate.toISOString(),
-        duration_seconds: Math.round(t.duration()),
-        play_count: playedCount
+        id: String(ids[i]),
+        title: names[i] || null,
+        artist: artists[i] || null,
+        album: albums[i] || null,
+        played_at: played.toISOString(),
+        duration_seconds: Math.round(durations[i] || 0),
+        play_count: count
     }});
 }}
 JSON.stringify(result);
@@ -44,10 +51,10 @@ JSON.stringify(result);
 
 _JXA_HAS_CHANGES_SCRIPT = """\
 var music = Application('Music');
-var tracks = music.tracks();
+var dates = music.tracks.playedDate();
 var maxDate = new Date(0);
-for (var i = 0; i < tracks.length; i++) {
-    var d = tracks[i].playedDate();
+for (var i = 0; i < dates.length; i++) {
+    var d = dates[i];
     if (d && d > maxDate) maxDate = d;
 }
 maxDate.toISOString();
@@ -63,8 +70,6 @@ class MusicCollector(BaseCollector):
 
     def __init__(self, config: MusicConfig) -> None:
         self._config = config
-        # library_path kept in config but unused at runtime (JXA-based)
-        self._library_path = Path(config.library_path).expanduser()
 
     @property
     def name(self) -> str:
@@ -82,8 +87,8 @@ class MusicCollector(BaseCollector):
         try:
             result = subprocess.run(
                 ["osascript", "-l", "JavaScript", "-e",
-                 "Application('Music').tracks().length"],
-                capture_output=True, text=True, timeout=10,
+                 "Application('Music').tracks.id().length"],
+                capture_output=True, text=True, timeout=15,
             )
             if result.returncode != 0:
                 return {"status": "error", "message": result.stderr.strip()}
@@ -97,8 +102,8 @@ class MusicCollector(BaseCollector):
         try:
             result = subprocess.run(
                 ["osascript", "-l", "JavaScript", "-e",
-                 "Application('Music').tracks().length"],
-                capture_output=True, text=True, timeout=10,
+                 "Application('Music').tracks.id().length"],
+                capture_output=True, text=True, timeout=15,
             )
             if result.returncode != 0 and "not authorized" in result.stderr.lower():
                 return ["Automation permission for Music.app (System Settings → Privacy & Security → Automation)"]
@@ -147,10 +152,10 @@ class MusicCollector(BaseCollector):
         try:
             result = subprocess.run(
                 ["osascript", "-l", "JavaScript", "-e", script],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=120,
             )
         except subprocess.TimeoutExpired:
-            raise RuntimeError("Music.app JXA query timed out after 60s")
+            raise RuntimeError("Music.app JXA query timed out after 120s")
 
         if result.returncode != 0:
             raise RuntimeError(f"JXA failed: {result.stderr.strip()}")
