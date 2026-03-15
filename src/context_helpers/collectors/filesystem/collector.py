@@ -6,8 +6,9 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
-from context_helpers.collectors.base import BaseCollector
+from context_helpers.collectors.base import PagedCollector
 from context_helpers.config import FilesystemConfig
 
 logger = logging.getLogger(__name__)
@@ -33,10 +34,13 @@ _KNOWN_BINARY_EXTENSIONS = {
 }
 
 
-class FilesystemCollector(BaseCollector):
+class FilesystemCollector(PagedCollector):
     """Collector that reads files from a local directory and serves them over HTTP."""
 
+    cursor_field = "modified_at"
+
     def __init__(self, config: FilesystemConfig) -> None:
+        super().__init__()
         self._config = config
         self._directory = Path(config.directory).expanduser().resolve()
 
@@ -103,6 +107,157 @@ class FilesystemCollector(BaseCollector):
     def watch_paths(self) -> list[Path]:
         return [self._directory] if self._directory.is_dir() else []
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _collect_candidates(
+        self,
+        after: datetime | None,
+        extensions: list[str] | None,
+        max_size_mb: float | None,
+    ) -> list[tuple[datetime, Path, object]]:
+        """Collect candidate files matching filters, sorted ASC by modified_at.
+
+        Reads only file metadata (stat); no file content is read here.
+        """
+        effective_max_mb = max_size_mb if max_size_mb is not None else self._config.max_file_size_mb
+        max_file_bytes = int(effective_max_mb * 1024 * 1024)
+        override_exts = {e.lower() for e in extensions} if extensions else None
+
+        candidates = []
+        for file_path in self._directory.rglob("*"):
+            if not file_path.is_file():
+                continue
+            ext = file_path.suffix.lower()
+            if override_exts is not None:
+                if ext not in override_exts:
+                    continue
+            elif self._should_skip_path(file_path):
+                continue
+            try:
+                stat = file_path.stat()
+                if stat.st_size > max_file_bytes:
+                    logger.debug(
+                        "Skipping %s: exceeds max_file_size_mb (%.1f MB)",
+                        file_path, stat.st_size / 1024 / 1024,
+                    )
+                    continue
+                modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                # Strictly greater than cursor — exclude the file at the cursor timestamp
+                # so that repeated fetches with the same cursor don't re-deliver it.
+                if after and modified_at <= after:
+                    continue
+                candidates.append((modified_at, file_path, stat))
+            except OSError:
+                pass
+
+        candidates.sort(key=lambda x: x[0])
+        return candidates
+
+    def _make_doc(self, file_path: Path, content: str, modified_at: datetime, stat: object) -> dict:
+        """Build the flat document dict for a file whose content has been read."""
+        source_id = str(file_path.relative_to(self._directory))
+        return {
+            "source_id": source_id,
+            "markdown": content,
+            "modified_at": modified_at.isoformat(),
+            "file_size_bytes": stat.st_size,  # type: ignore[attr-defined]
+            "has_headings": bool(re.search(r"^#{1,6}\s", content, re.MULTILINE)),
+            "has_lists": bool(re.search(r"^(?:[\-\*\+]|\d+\.)\s", content, re.MULTILINE)),
+            "has_tables": bool(re.search(r"^\|.+\|$", content, re.MULTILINE)),
+        }
+
+    # ------------------------------------------------------------------
+    # PagedCollector protocol
+    # ------------------------------------------------------------------
+
+    def fetch_page(
+        self,
+        after: datetime | None,
+        limit: int,
+        extensions: list[str] | None = None,
+        max_size_mb: float | None = None,
+    ) -> tuple[list[dict], bool]:
+        """Fetch up to limit files modified after `after`, bounded by content budget.
+
+        Args:
+            after: Cursor; only return files with modified_at strictly > after.
+            limit: Maximum number of files to return.
+            extensions: Optional override for file extension filter.
+            max_size_mb: Optional override for per-file size cap.
+
+        Returns:
+            (files sorted ASC by modified_at, has_more)
+        """
+        candidates = self._collect_candidates(after, extensions, max_size_mb)
+        max_content_bytes = int(self._config.max_response_mb * 1024 * 1024)
+
+        results = []
+        content_bytes = 0
+        idx = 0
+        while idx < len(candidates) and len(results) < limit and content_bytes < max_content_bytes:
+            modified_at, file_path, stat = candidates[idx]
+            idx += 1
+            try:
+                content = file_path.read_text(encoding="utf-8")
+                if not content.strip():
+                    continue
+                content_bytes += len(content.encode("utf-8"))
+                results.append(self._make_doc(file_path, content, modified_at, stat))
+            except (UnicodeDecodeError, PermissionError, OSError) as e:
+                logger.warning("Skipping %s: %s", file_path, e)
+                continue
+
+        return results, idx < len(candidates)
+
+    def iter_page(
+        self,
+        after: datetime | None,
+        limit: int,
+        extensions: list[str] | None = None,
+        max_size_mb: float | None = None,
+    ) -> Iterator[dict]:
+        """Lazily yield document dicts one at a time within the page budget.
+
+        Yields file dicts (same shape as fetch_page items) for each file,
+        then a final sentinel dict: ``{"__meta__": True, "has_more": bool,
+        "next_cursor": str | None}`` marking the end of the page.
+
+        Unlike fetch_page(), file content is read one file at a time —
+        peak memory is bounded to the size of a single file rather than
+        the full page.
+        """
+        candidates = self._collect_candidates(after, extensions, max_size_mb)
+        max_content_bytes = int(self._config.max_response_mb * 1024 * 1024)
+
+        content_bytes = 0
+        count = 0
+        idx = 0
+        last_ts: str | None = None
+
+        while idx < len(candidates) and count < limit and content_bytes < max_content_bytes:
+            modified_at, file_path, stat = candidates[idx]
+            idx += 1
+            try:
+                content = file_path.read_text(encoding="utf-8")
+                if not content.strip():
+                    continue
+                content_bytes += len(content.encode("utf-8"))
+                doc = self._make_doc(file_path, content, modified_at, stat)
+                count += 1
+                last_ts = doc["modified_at"]
+                yield doc
+            except (UnicodeDecodeError, PermissionError, OSError) as e:
+                logger.warning("Skipping %s: %s", file_path, e)
+                continue
+
+        yield {"__meta__": True, "has_more": idx < len(candidates), "next_cursor": last_ts}
+
+    # ------------------------------------------------------------------
+    # Backward-compatible direct API (GET /documents)
+    # ------------------------------------------------------------------
+
     def fetch_documents(
         self,
         since: str | None,
@@ -120,6 +275,14 @@ class FilesystemCollector(BaseCollector):
 
         Returns:
             List of document dicts with source_id, markdown, and structural hint fields.
+
+        Note on cursor semantics vs fetch_page():
+            This method uses ``modified_at >= since`` (i.e. ``not < since``) so that
+            files modified exactly at ``since`` are included.  This is correct for the
+            incremental GET /documents use-case where the caller passes the previous
+            response's latest timestamp and expects idempotent re-delivery of boundary
+            items.  fetch_page() / _collect_candidates() use ``> after`` (i.e. ``<= after``
+            exclusion) to prevent re-delivery in the paged push-trigger flow.
         """
         since_dt: datetime | None = None
         if since:
@@ -164,18 +327,7 @@ class FilesystemCollector(BaseCollector):
                 if not content.strip():
                     continue
 
-                source_id = str(file_path.relative_to(self._directory))
-                modified_at_iso = modified_at.isoformat()
-
-                results.append({
-                    "source_id": source_id,
-                    "markdown": content,
-                    "modified_at": modified_at_iso,
-                    "file_size_bytes": stat.st_size,
-                    "has_headings": bool(re.search(r"^#{1,6}\s", content, re.MULTILINE)),
-                    "has_lists": bool(re.search(r"^(?:[\-\*\+]|\d+\.)\s", content, re.MULTILINE)),
-                    "has_tables": bool(re.search(r"^\|.+\|$", content, re.MULTILINE)),
-                })
+                results.append(self._make_doc(file_path, content, modified_at, stat))
             except (UnicodeDecodeError, PermissionError, OSError) as e:
                 logger.warning("Skipping %s: %s", file_path, e)
                 continue

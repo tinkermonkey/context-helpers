@@ -65,7 +65,6 @@ class MusicConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
     enabled: bool = False
-    library_path: str = "~/Music/Music/Music Library.xml"
 
 
 class FilesystemConfig(BaseSettings):
@@ -75,6 +74,8 @@ class FilesystemConfig(BaseSettings):
     directory: str = "~/Documents"
     extensions: list[str] = []          # empty = all readable text files; non-empty = explicit allowlist
     max_file_size_mb: float = 1.0       # files larger than this are skipped before reading
+    page_size: int = 50                 # max files per paged delivery cycle
+    max_response_mb: float = 10.0       # max total content bytes per page
 
 
 class ObsidianConfig(BaseSettings):

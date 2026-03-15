@@ -23,13 +23,14 @@ collectors:
 
   music:
     enabled: false
-    library_path: ~/Music/Music/Music Library.xml
 
   filesystem:
     enabled: false
     directory: ~/Documents        # directory to watch for text files
     extensions: []                # empty = all readable text files; non-empty = explicit allowlist (e.g. [.md, .txt])
-    max_file_size_mb: 1.0         # files larger than this are skipped
+    max_file_size_mb: 1.0         # files larger than this are skipped before reading
+    page_size: 50                 # max files per push-trigger delivery cycle
+    max_response_mb: 10.0         # max total content bytes per page (soft limit)
 
   obsidian:
     enabled: false
