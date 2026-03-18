@@ -8,8 +8,12 @@ import threading
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter
+
+if TYPE_CHECKING:
+    from context_helpers.state import StateStore
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +92,29 @@ class BaseCollector(ABC):
             List of directories to watch recursively.  Empty list means polling only.
         """
         return []
+
+    _state_store: "StateStore | None" = None
+
+    def set_state_store(self, state_store: "StateStore") -> None:
+        """Inject the shared StateStore so routers can resolve the delivery watermark."""
+        self._state_store = state_store
+
+    def get_watermark(self) -> "datetime | None":
+        """Return the last-delivered-at watermark, or None if not available."""
+        if self._state_store is None:
+            return None
+        return self._state_store.get_watermark()
+
+    def resolve_since(self, since: "str | None") -> "str | None":
+        """Return *since* if provided, otherwise fall back to the delivery watermark.
+
+        Routers call this so that omitting `since` automatically scopes the
+        response to data newer than the last successful push delivery.
+        """
+        if since is not None:
+            return since
+        wm = self.get_watermark()
+        return wm.isoformat() if wm else None
 
 
 _CURSORS_DIR = Path.home() / ".local" / "share" / "context-helpers" / "cursors"

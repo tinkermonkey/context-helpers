@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI
 from context_helpers.auth import make_auth_dependency
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import AppConfig
+from context_helpers.state import StateStore
 
 logger = logging.getLogger(__name__)
 
@@ -25,15 +26,19 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
         Configured FastAPI application
     """
 
+    # Create StateStore once; inject into all collectors so routers can resolve
+    # the delivery watermark without relying on the caller to supply it.
+    state_store = StateStore()
+    for collector in collectors:
+        collector.set_state_store(state_store)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         push_trigger = None
         if config.push.enabled and config.push.library_url:
             try:
-                from context_helpers.state import StateStore
                 from context_helpers.push import PushTrigger
 
-                state_store = StateStore()
                 push_trigger = PushTrigger(config.push, collectors, state_store)
                 push_trigger.start()
             except Exception as e:

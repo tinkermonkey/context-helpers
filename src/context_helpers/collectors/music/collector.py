@@ -22,28 +22,33 @@ logger = logging.getLogger(__name__)
 _JXA_TRACKS_SCRIPT = """\
 var music = Application('Music');
 var afterDate = {after_expr};
-var ids        = music.tracks.id();
-var names      = music.tracks.name();
-var artists    = music.tracks.artist();
-var albums     = music.tracks.album();
-var durations  = music.tracks.duration();
+// Pass 1: fetch only the two filtering criteria for all tracks (2 round-trips
+// instead of 7) to keep the bulk scan fast even for large libraries.
 var playCounts = music.tracks.playedCount();
 var playDates  = music.tracks.playedDate();
-var result = [];
-for (var i = 0; i < ids.length; i++) {{
+// Collect the indices of tracks that pass the filter.
+var indices = [];
+for (var i = 0; i < playCounts.length; i++) {{
     var count = playCounts[i];
     if (!count || count < 1) continue;
     var played = playDates[i];
     if (!played) continue;
     if (afterDate && played <= afterDate) continue;
+    indices.push(i);
+}}
+// Pass 2: fetch full details only for the (typically small) qualifying set.
+var result = [];
+for (var j = 0; j < indices.length; j++) {{
+    var idx = indices[j];
+    var track = music.tracks[idx];
     result.push({{
-        id: String(ids[i]),
-        title: names[i] || null,
-        artist: artists[i] || null,
-        album: albums[i] || null,
-        played_at: played.toISOString(),
-        duration_seconds: Math.round(durations[i] || 0),
-        play_count: count
+        id: String(track.id()),
+        title: track.name() || null,
+        artist: track.artist() || null,
+        album: track.album() || null,
+        played_at: playDates[idx].toISOString(),
+        duration_seconds: Math.round(track.duration() || 0),
+        play_count: playCounts[idx]
     }});
 }}
 JSON.stringify(result);

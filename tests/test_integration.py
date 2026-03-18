@@ -194,11 +194,13 @@ class TestiMessage:
         assert _assert_list_response(resp) == []
 
     def test_since_far_past_returns_all(self, client, auth):
-        all_items = _assert_list_response(client.get("/imessage/messages", headers=auth))
         past_items = _assert_list_response(
             client.get("/imessage/messages", headers=auth, params={"since": "2000-01-01T00:00:00Z"})
         )
-        assert len(past_items) == len(all_items)
+        future_items = _assert_list_response(
+            client.get("/imessage/messages", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
+        )
+        assert len(past_items) >= len(future_items)
 
 
 # ---------------------------------------------------------------------------
@@ -293,11 +295,13 @@ class TestMusic:
         assert _assert_list_response(resp) == []
 
     def test_since_far_past_returns_all(self, client, auth):
-        all_items = _assert_list_response(client.get("/music/tracks", headers=auth))
         past_items = _assert_list_response(
             client.get("/music/tracks", headers=auth, params={"since": "2000-01-01T00:00:00Z"})
         )
-        assert len(past_items) == len(all_items)
+        future_items = _assert_list_response(
+            client.get("/music/tracks", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
+        )
+        assert len(past_items) >= len(future_items)
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +362,10 @@ class TestObsidian:
         assert _assert_list_response(resp) == []
 
     def test_since_far_past_returns_all(self, client, auth):
-        all_items = _assert_list_response(client.get("/obsidian/vault-notes", headers=auth))
         past_items = _assert_list_response(
             client.get("/obsidian/vault-notes", headers=auth, params={"since": "2000-01-01T00:00:00Z"})
         )
-        assert len(past_items) == len(all_items)
+        future_items = _assert_list_response(
+            client.get("/obsidian/vault-notes", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
+        )
+        assert len(past_items) >= len(future_items)

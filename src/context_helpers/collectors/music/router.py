@@ -16,12 +16,12 @@ def make_music_router(collector: "MusicCollector") -> APIRouter:
 
     @router.get("/music/tracks")
     def get_tracks(
-        since: str | None = Query(default=None, description="ISO 8601 timestamp for incremental fetch"),
+        since: str | None = Query(default=None, description="ISO 8601 timestamp; defaults to last-delivered watermark"),
     ) -> list[dict]:
         """Return Apple Music play history.
 
         Matches the API contract expected by AppleMusicAdapter.
         """
-        return collector.fetch_tracks(since=since)
+        return collector.fetch_tracks(since=collector.resolve_since(since))
 
     return router

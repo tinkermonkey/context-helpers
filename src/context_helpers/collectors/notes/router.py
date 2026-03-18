@@ -16,13 +16,13 @@ def make_notes_router(collector: "NotesCollector") -> APIRouter:
 
     @router.get("/notes/notes")
     def get_notes(
-        since: str | None = Query(default=None, description="ISO 8601 timestamp for incremental fetch"),
+        since: str | None = Query(default=None, description="ISO 8601 timestamp; defaults to last-delivered watermark"),
         folder: str | None = Query(default=None, description="Filter by folder name"),
     ) -> list[dict]:
         """Return notes from Apple Notes app.
 
         Matches the API contract expected by AppleNotesAdapter.
         """
-        return collector.fetch_notes(since=since, folder_filter=folder)
+        return collector.fetch_notes(since=collector.resolve_since(since), folder_filter=folder)
 
     return router

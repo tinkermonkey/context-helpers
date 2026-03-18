@@ -17,12 +17,12 @@ def make_health_router(collector: "HealthCollector") -> APIRouter:
     @router.get("/health/workouts")
     def get_workouts(
         type: str | None = Query(default=None, description="Filter by activity type (e.g., 'running')"),
-        since: str | None = Query(default=None, description="ISO 8601 timestamp for incremental fetch"),
+        since: str | None = Query(default=None, description="ISO 8601 timestamp; defaults to last-delivered watermark"),
     ) -> list[dict]:
         """Return workouts from Apple Health export.
 
         Matches the API contract expected by AppleHealthAdapter.
         """
-        return collector.fetch_workouts(since=since, activity_type=type)
+        return collector.fetch_workouts(since=collector.resolve_since(since), activity_type=type)
 
     return router
