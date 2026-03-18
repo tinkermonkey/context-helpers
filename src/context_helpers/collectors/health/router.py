@@ -14,7 +14,7 @@ def make_health_router(collector: "HealthCollector") -> APIRouter:
     """Build and return the health router bound to a collector instance."""
     router = APIRouter()
 
-    @router.get("/workouts")
+    @router.get("/health/workouts")
     def get_workouts(
         type: str | None = Query(default=None, description="Filter by activity type (e.g., 'running')"),
         since: str | None = Query(default=None, description="ISO 8601 timestamp for incremental fetch"),

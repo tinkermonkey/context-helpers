@@ -14,7 +14,7 @@ def make_music_router(collector: "MusicCollector") -> APIRouter:
     """Build and return the music router bound to a collector instance."""
     router = APIRouter()
 
-    @router.get("/tracks")
+    @router.get("/music/tracks")
     def get_tracks(
         since: str | None = Query(default=None, description="ISO 8601 timestamp for incremental fetch"),
     ) -> list[dict]:

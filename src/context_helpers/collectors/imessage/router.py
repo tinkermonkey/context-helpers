@@ -14,7 +14,7 @@ def make_imessage_router(collector: "iMessageCollector") -> APIRouter:
     """Build and return the iMessage router bound to a collector instance."""
     router = APIRouter()
 
-    @router.get("/messages")
+    @router.get("/imessage/messages")
     def get_messages(
         since: str | None = Query(default=None, description="ISO 8601 timestamp for incremental fetch"),
     ) -> list[dict]:

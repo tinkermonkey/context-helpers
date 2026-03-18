@@ -14,7 +14,7 @@ def make_obsidian_router(collector: "ObsidianCollector") -> APIRouter:
     """Build and return the obsidian router bound to a collector instance."""
     router = APIRouter()
 
-    @router.get("/vault-notes")
+    @router.get("/obsidian/vault-notes")
     def get_vault_notes(
         since: str | None = Query(default=None, description="ISO 8601 timestamp for incremental fetch"),
     ) -> list[dict]:

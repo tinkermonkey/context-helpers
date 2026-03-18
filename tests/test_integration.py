@@ -14,8 +14,6 @@ Run a single collector:
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 from starlette.testclient import TestClient
 
@@ -23,15 +21,13 @@ from starlette.testclient import TestClient
 # Config / app fixtures (module-scoped so the server starts once per run)
 # ---------------------------------------------------------------------------
 
-_CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
-
-
 @pytest.fixture(scope="module")
 def real_config():
-    if not _CONFIG_PATH.exists():
-        pytest.skip(f"No config.yaml found at {_CONFIG_PATH}")
-    from context_helpers.config import load_config
-    cfg = load_config(_CONFIG_PATH)
+    from context_helpers.config import _default_config_path, load_config
+    config_path = _default_config_path()
+    if not config_path.exists():
+        pytest.skip(f"No config.yaml found at {config_path} (set CONTEXT_HELPERS_CONFIG to override)")
+    cfg = load_config(config_path)
     # Disable push so tests don't spawn a background thread that dials out
     from context_helpers.config import PushConfig
     cfg.push = PushConfig(enabled=False)
@@ -140,33 +136,36 @@ class TestReminders:
     def test_bare_get_returns_empty_without_stash(self, client, auth):
         # With the paged stash pattern, GET /reminders with no pre-loaded stash
         # returns [] instead of triggering a full JXA scan on request.
-        resp = client.get("/reminders", headers=auth)
+        resp = client.get("/reminders/reminders", headers=auth)
         assert _assert_list_response(resp) == []
 
-    def test_since_returns_empty_for_far_future(self, client, auth):
-        # since= path uses fetch_reminders (legacy full scan). Only practical for
-        # libraries small enough to complete within 30s.
-        pytest.skip(
-            "Full JXA scan via since= param times out on large Reminders libraries. "
-            "Use push trigger + stash for paged delivery."
-        )
+    def test_since_far_future_returns_empty(self, client, auth):
+        resp = client.get("/reminders/reminders", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
+        assert _assert_list_response(resp) == []
 
-    def test_since_far_past_returns_all(self, client, auth):
-        # The paged stash pattern delivers all reminders over multiple push-trigger
-        # cycles. A single GET /reminders?since=... still works but requires a full
-        # JXA scan that may time out on large libraries.
-        pytest.skip(
-            "Full JXA scan via since= param times out on large Reminders libraries. "
-            "Use push trigger + stash for paged delivery."
+    def test_since_far_past_returns_items(self, client, auth):
+        items = _assert_list_response(
+            client.get("/reminders/reminders", headers=auth, params={"since": "2000-01-01T00:00:00Z"})
         )
+        assert len(items) > 0
+
+    def test_item_fields(self, client, auth):
+        items = _assert_list_response(
+            client.get("/reminders/reminders", headers=auth, params={"since": "2000-01-01T00:00:00Z"})
+        )
+        if not items:
+            pytest.skip("No reminders returned — nothing to validate")
+        _assert_fields(items[0], ["id", "title", "list", "completed", "priority", "modifiedAt", "collaborators"])
 
     def test_list_filter(self, client, auth):
-        items = _assert_list_response(client.get("/reminders", headers=auth))
+        items = _assert_list_response(
+            client.get("/reminders/reminders", headers=auth, params={"since": "2000-01-01T00:00:00Z"})
+        )
         if not items:
-            pytest.skip("No reminders in stash — nothing to validate list filter")
+            pytest.skip("No reminders returned — nothing to validate list filter")
         list_name = items[0]["list"]
         filtered = _assert_list_response(
-            client.get("/reminders", headers=auth, params={"list": list_name})
+            client.get("/reminders/reminders", headers=auth, params={"since": "2000-01-01T00:00:00Z", "list": list_name})
         )
         assert all(r["list"] == list_name for r in filtered)
 
@@ -182,22 +181,22 @@ class TestiMessage:
         _skip_if_unhealthy(collector_health, "imessage")
 
     def test_returns_list(self, client, auth):
-        _assert_list_response(client.get("/messages", headers=auth))
+        _assert_list_response(client.get("/imessage/messages", headers=auth))
 
     def test_item_fields(self, client, auth):
-        items = _assert_list_response(client.get("/messages", headers=auth))
+        items = _assert_list_response(client.get("/imessage/messages", headers=auth))
         if not items:
             pytest.skip("No messages returned — nothing to validate")
         _assert_fields(items[0], ["id", "text", "is_from_me", "timestamp", "thread_id", "recipients"])
 
     def test_since_far_future_returns_empty(self, client, auth):
-        resp = client.get("/messages", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
+        resp = client.get("/imessage/messages", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
         assert _assert_list_response(resp) == []
 
     def test_since_far_past_returns_all(self, client, auth):
-        all_items = _assert_list_response(client.get("/messages", headers=auth))
+        all_items = _assert_list_response(client.get("/imessage/messages", headers=auth))
         past_items = _assert_list_response(
-            client.get("/messages", headers=auth, params={"since": "2000-01-01T00:00:00Z"})
+            client.get("/imessage/messages", headers=auth, params={"since": "2000-01-01T00:00:00Z"})
         )
         assert len(past_items) == len(all_items)
 
@@ -213,25 +212,25 @@ class TestNotes:
         _skip_if_unhealthy(collector_health, "notes")
 
     def test_returns_list(self, client, auth):
-        _assert_list_response(client.get("/notes", headers=auth))
+        _assert_list_response(client.get("/notes/notes", headers=auth))
 
     def test_item_fields(self, client, auth):
-        items = _assert_list_response(client.get("/notes", headers=auth))
+        items = _assert_list_response(client.get("/notes/notes", headers=auth))
         if not items:
             pytest.skip("No notes returned — nothing to validate")
         _assert_fields(items[0], ["id", "title", "body_markdown", "folder", "modified_at"])
 
     def test_since_far_future_returns_empty(self, client, auth):
-        resp = client.get("/notes", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
+        resp = client.get("/notes/notes", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
         assert _assert_list_response(resp) == []
 
     def test_folder_filter(self, client, auth):
-        items = _assert_list_response(client.get("/notes", headers=auth))
+        items = _assert_list_response(client.get("/notes/notes", headers=auth))
         if not items:
             pytest.skip("No notes returned")
         folder = items[0]["folder"]
         filtered = _assert_list_response(
-            client.get("/notes", headers=auth, params={"folder": folder})
+            client.get("/notes/notes", headers=auth, params={"folder": folder})
         )
         assert all(n["folder"] == folder for n in filtered)
 
@@ -247,25 +246,25 @@ class TestHealth_Workouts:
         _skip_if_unhealthy(collector_health, "health")
 
     def test_returns_list(self, client, auth):
-        _assert_list_response(client.get("/workouts", headers=auth))
+        _assert_list_response(client.get("/health/workouts", headers=auth))
 
     def test_item_fields(self, client, auth):
-        items = _assert_list_response(client.get("/workouts", headers=auth))
+        items = _assert_list_response(client.get("/health/workouts", headers=auth))
         if not items:
             pytest.skip("No workouts returned — nothing to validate")
         _assert_fields(items[0], ["id", "activityType", "startDate", "endDate", "durationSeconds"])
 
     def test_since_far_future_returns_empty(self, client, auth):
-        resp = client.get("/workouts", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
+        resp = client.get("/health/workouts", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
         assert _assert_list_response(resp) == []
 
     def test_type_filter(self, client, auth):
-        items = _assert_list_response(client.get("/workouts", headers=auth))
+        items = _assert_list_response(client.get("/health/workouts", headers=auth))
         if not items:
             pytest.skip("No workouts returned")
         activity = items[0]["activityType"]
         filtered = _assert_list_response(
-            client.get("/workouts", headers=auth, params={"type": activity})
+            client.get("/health/workouts", headers=auth, params={"type": activity})
         )
         assert all(w["activityType"] == activity for w in filtered)
 
@@ -281,22 +280,22 @@ class TestMusic:
         _skip_if_unhealthy(collector_health, "music")
 
     def test_returns_list(self, client, auth):
-        _assert_list_response(client.get("/tracks", headers=auth))
+        _assert_list_response(client.get("/music/tracks", headers=auth))
 
     def test_item_fields(self, client, auth):
-        items = _assert_list_response(client.get("/tracks", headers=auth))
+        items = _assert_list_response(client.get("/music/tracks", headers=auth))
         if not items:
             pytest.skip("No tracks returned — nothing to validate")
         _assert_fields(items[0], ["id", "title", "played_at", "play_count"])
 
     def test_since_far_future_returns_empty(self, client, auth):
-        resp = client.get("/tracks", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
+        resp = client.get("/music/tracks", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
         assert _assert_list_response(resp) == []
 
     def test_since_far_past_returns_all(self, client, auth):
-        all_items = _assert_list_response(client.get("/tracks", headers=auth))
+        all_items = _assert_list_response(client.get("/music/tracks", headers=auth))
         past_items = _assert_list_response(
-            client.get("/tracks", headers=auth, params={"since": "2000-01-01T00:00:00Z"})
+            client.get("/music/tracks", headers=auth, params={"since": "2000-01-01T00:00:00Z"})
         )
         assert len(past_items) == len(all_items)
 
@@ -312,25 +311,25 @@ class TestFilesystem:
         _skip_if_unhealthy(collector_health, "filesystem")
 
     def test_returns_list(self, client, auth):
-        _assert_list_response(client.get("/documents", headers=auth))
+        _assert_list_response(client.get("/filesystem/documents", headers=auth))
 
     def test_item_fields(self, client, auth):
-        items = _assert_list_response(client.get("/documents", headers=auth))
+        items = _assert_list_response(client.get("/filesystem/documents", headers=auth))
         if not items:
             pytest.skip("No documents returned — nothing to validate")
         _assert_fields(items[0], ["source_id", "markdown", "modified_at", "file_size_bytes"])
 
     def test_since_far_future_returns_empty(self, client, auth):
-        resp = client.get("/documents", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
+        resp = client.get("/filesystem/documents", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
         assert _assert_list_response(resp) == []
 
     def test_extension_filter(self, client, auth):
-        items = _assert_list_response(client.get("/documents", headers=auth))
+        items = _assert_list_response(client.get("/filesystem/documents", headers=auth))
         if not items:
             pytest.skip("No documents returned")
         # Filter to .md only — should match a subset or all
         filtered = _assert_list_response(
-            client.get("/documents", headers=auth, params={"extensions": ".md"})
+            client.get("/filesystem/documents", headers=auth, params={"extensions": ".md"})
         )
         assert all(f["source_id"].endswith(".md") for f in filtered)
 
@@ -346,21 +345,21 @@ class TestObsidian:
         _skip_if_unhealthy(collector_health, "obsidian")
 
     def test_returns_list(self, client, auth):
-        _assert_list_response(client.get("/vault-notes", headers=auth))
+        _assert_list_response(client.get("/obsidian/vault-notes", headers=auth))
 
     def test_item_fields(self, client, auth):
-        items = _assert_list_response(client.get("/vault-notes", headers=auth))
+        items = _assert_list_response(client.get("/obsidian/vault-notes", headers=auth))
         if not items:
             pytest.skip("No vault notes returned — nothing to validate")
         _assert_fields(items[0], ["source_id", "markdown", "modified_at", "tags", "wikilinks"])
 
     def test_since_far_future_returns_empty(self, client, auth):
-        resp = client.get("/vault-notes", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
+        resp = client.get("/obsidian/vault-notes", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
         assert _assert_list_response(resp) == []
 
     def test_since_far_past_returns_all(self, client, auth):
-        all_items = _assert_list_response(client.get("/vault-notes", headers=auth))
+        all_items = _assert_list_response(client.get("/obsidian/vault-notes", headers=auth))
         past_items = _assert_list_response(
-            client.get("/vault-notes", headers=auth, params={"since": "2000-01-01T00:00:00Z"})
+            client.get("/obsidian/vault-notes", headers=auth, params={"since": "2000-01-01T00:00:00Z"})
         )
         assert len(past_items) == len(all_items)

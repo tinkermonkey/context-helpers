@@ -14,7 +14,7 @@ def make_reminders_router(collector: "RemindersCollector") -> APIRouter:
     """Build and return the reminders router bound to a collector instance."""
     router = APIRouter()
 
-    @router.get("/reminders")
+    @router.get("/reminders/reminders")
     def get_reminders(
         list: str | None = Query(default=None, description="Filter by Reminders list name"),
         since: str | None = Query(default=None, description="ISO 8601 timestamp for incremental fetch"),

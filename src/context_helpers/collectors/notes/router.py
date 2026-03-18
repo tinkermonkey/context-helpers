@@ -14,7 +14,7 @@ def make_notes_router(collector: "NotesCollector") -> APIRouter:
     """Build and return the notes router bound to a collector instance."""
     router = APIRouter()
 
-    @router.get("/notes")
+    @router.get("/notes/notes")
     def get_notes(
         since: str | None = Query(default=None, description="ISO 8601 timestamp for incremental fetch"),
         folder: str | None = Query(default=None, description="Filter by folder name"),

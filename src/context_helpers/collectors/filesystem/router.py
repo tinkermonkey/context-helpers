@@ -64,7 +64,7 @@ def make_filesystem_router(collector: "FilesystemCollector") -> APIRouter:
     """Build and return the filesystem router bound to a collector instance."""
     router = APIRouter()
 
-    @router.get("/documents")
+    @router.get("/filesystem/documents")
     def get_documents(
         since: str | None = Query(default=None, description="ISO 8601 timestamp for incremental fetch"),
         extensions: str | None = Query(default=None, description="Comma-separated file extensions, e.g. .md,.txt"),

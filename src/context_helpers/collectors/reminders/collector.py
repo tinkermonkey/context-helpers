@@ -1,11 +1,16 @@
-"""RemindersCollector: fetch Apple Reminders via JXA (JavaScript for Automation) subprocess."""
+"""RemindersCollector: fetch Apple Reminders via direct SQLite database access.
+
+Reading the Reminders SQLite database is dramatically faster than JXA for large
+collections — milliseconds instead of minutes. The database is in the app's Group
+Container which is readable without Full Disk Access.
+"""
 
 from __future__ import annotations
 
-import json
 import logging
-import subprocess
+import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter
 
@@ -14,120 +19,121 @@ from context_helpers.config import RemindersConfig
 
 logger = logging.getLogger(__name__)
 
-# JXA (JavaScript for Automation) script that returns reminders as JSON.
-#
-# JXA is used instead of AppleScript because it can call JSON.stringify(), which
-# correctly escapes all special characters (quotes, backslashes, newlines, etc.)
-# in field values. AppleScript has no JSON encoder, making string concatenation
-# approaches vulnerable to injection when reminder titles or notes contain
-# special characters.
-_JXA_SCRIPT = """\
-var app = Application('Reminders');
-var result = [];
-var lists = app.lists();
-for (var i = 0; i < lists.length; i++) {
-    var list = lists[i];
-    var listName = list.name();
-    var reminders = list.reminders();
-    for (var j = 0; j < reminders.length; j++) {
-        var r = reminders[j];
-        var modDate = r.modificationDate();
-        var dueDate = r.dueDate();
-        var completionDate = r.completionDate();
-        var body = r.body();
-        result.push({
-            id: r.id(),
-            title: r.name(),
-            notes: (body && body.length > 0) ? body : null,
-            list: listName,
-            completed: r.completed(),
-            completionDate: completionDate ? completionDate.toISOString() : null,
-            dueDate: dueDate ? dueDate.toISOString() : null,
-            priority: r.priority(),
-            modifiedAt: modDate ? modDate.toISOString() : new Date().toISOString(),
-            collaborators: []
-        });
-    }
-}
-JSON.stringify(result);
-"""
+# Apple Core Data timestamps are seconds since 2001-01-01, not Unix epoch (1970-01-01).
+_APPLE_EPOCH_OFFSET = 978307200
 
-# Two-phase paged fetch: Phase 1 reads only modificationDate for all reminders,
-# Phase 2 reads full fields for only the selected page of items.
-_JXA_FETCH_PAGE_SCRIPT = """\
-var app = Application('Reminders');
-var lists = app.lists();
-var afterISO = "{after_iso}";
-var limit = {limit};
-var afterDate = afterISO ? new Date(afterISO) : null;
-
-// Phase 1: scan all reminders — read only modificationDate (cheap)
-// Cache reminder arrays per list so Phase 2 can re-use without re-fetching
-var cachedReminders = [];
-var candidates = [];
-for (var i = 0; i < lists.length; i++) {{
-    var reminders = lists[i].reminders();
-    cachedReminders.push(reminders);
-    for (var j = 0; j < reminders.length; j++) {{
-        var modDate = reminders[j].modificationDate();
-        if (!modDate) continue;
-        if (afterDate && modDate <= afterDate) continue;
-        candidates.push({{listIdx: i, remIdx: j, modDate: modDate}});
-    }}
-}}
-
-// Sort ascending — oldest pages first
-candidates.sort(function(a, b) {{ return a.modDate - b.modDate; }});
-
-var hasMore = candidates.length > limit;
-var selected = candidates.slice(0, limit);
-
-// Phase 2: full field access for selected items only
-var result = [];
-for (var k = 0; k < selected.length; k++) {{
-    var c = selected[k];
-    var r = cachedReminders[c.listIdx][c.remIdx];
-    var dueDate = r.dueDate();
-    var completionDate = r.completionDate();
-    var body = r.body();
-    result.push({{
-        id: r.id(),
-        title: r.name(),
-        notes: (body && body.length > 0) ? body : null,
-        list: lists[c.listIdx].name(),
-        completed: r.completed(),
-        completionDate: completionDate ? completionDate.toISOString() : null,
-        dueDate: dueDate ? dueDate.toISOString() : null,
-        priority: r.priority(),
-        modifiedAt: c.modDate.toISOString(),
-        collaborators: []
-    }});
-}}
-
-JSON.stringify({{items: result, hasMore: hasMore}});
-"""
-
-_JXA_HAS_CHANGES_SCRIPT = (
-    "var app = Application('Reminders');"
-    "var maxDate = new Date(0);"
-    "var lists = app.lists();"
-    "for (var i = 0; i < lists.length; i++) {"
-    "  var reminders = lists[i].reminders();"
-    "  for (var j = 0; j < reminders.length; j++) {"
-    "    var d = reminders[j].modificationDate();"
-    "    if (d && d > maxDate) maxDate = d;"
-    "  }"
-    "}"
-    "maxDate.toISOString();"
+_REMINDERS_STORE_DIR = (
+    Path.home()
+    / "Library"
+    / "Group Containers"
+    / "group.com.apple.reminders"
+    / "Container_v1"
+    / "Stores"
 )
+
+_QUERY_PAGE = """
+    SELECT
+        r.ZCKIDENTIFIER    AS id,
+        r.ZTITLE           AS title,
+        r.ZNOTES           AS notes,
+        r.ZCOMPLETED       AS completed,
+        r.ZPRIORITY        AS priority,
+        r.ZLASTMODIFIEDDATE AS modified_ts,
+        r.ZDUEDATE          AS due_ts,
+        r.ZCOMPLETIONDATE   AS completion_ts,
+        l.ZNAME             AS list_name
+    FROM ZREMCDREMINDER r
+    JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK
+    WHERE r.ZMARKEDFORDELETION = 0
+      AND (? IS NULL OR r.ZLASTMODIFIEDDATE > ?)
+    ORDER BY r.ZLASTMODIFIEDDATE ASC
+    LIMIT ?
+"""
+
+_QUERY_ALL = """
+    SELECT
+        r.ZCKIDENTIFIER    AS id,
+        r.ZTITLE           AS title,
+        r.ZNOTES           AS notes,
+        r.ZCOMPLETED       AS completed,
+        r.ZPRIORITY        AS priority,
+        r.ZLASTMODIFIEDDATE AS modified_ts,
+        r.ZDUEDATE          AS due_ts,
+        r.ZCOMPLETIONDATE   AS completion_ts,
+        l.ZNAME             AS list_name
+    FROM ZREMCDREMINDER r
+    JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK
+    WHERE r.ZMARKEDFORDELETION = 0
+      AND (? IS NULL OR r.ZLASTMODIFIEDDATE > ?)
+    ORDER BY r.ZLASTMODIFIEDDATE DESC
+"""
+
+_QUERY_MAX_MODIFIED = """
+    SELECT MAX(ZLASTMODIFIEDDATE)
+    FROM ZREMCDREMINDER
+    WHERE ZMARKEDFORDELETION = 0
+"""
+
+
+def _find_db_path() -> Path | None:
+    """Return the Reminders SQLite database with the most records, or None."""
+    if not _REMINDERS_STORE_DIR.exists():
+        return None
+    best: Path | None = None
+    best_count = -1
+    for candidate in _REMINDERS_STORE_DIR.glob("Data-*.sqlite"):
+        try:
+            with sqlite3.connect(f"file:{candidate}?mode=ro", uri=True) as conn:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM ZREMCDREMINDER"
+                ).fetchone()[0]
+                if count > best_count:
+                    best_count = count
+                    best = candidate
+        except Exception:
+            continue
+    return best
+
+
+def _apple_ts_to_datetime(ts: float) -> datetime:
+    return datetime.fromtimestamp(ts + _APPLE_EPOCH_OFFSET, tz=timezone.utc)
+
+
+def _datetime_to_apple_ts(dt: datetime) -> float:
+    return dt.timestamp() - _APPLE_EPOCH_OFFSET
+
+
+def _row_to_dict(row: sqlite3.Row) -> dict:
+    modified_dt = (
+        _apple_ts_to_datetime(row["modified_ts"])
+        if row["modified_ts"]
+        else datetime.now(tz=timezone.utc)
+    )
+    due_dt = _apple_ts_to_datetime(row["due_ts"]) if row["due_ts"] else None
+    completion_dt = (
+        _apple_ts_to_datetime(row["completion_ts"]) if row["completion_ts"] else None
+    )
+    return {
+        "id": row["id"] or "",
+        "title": row["title"] or "",
+        "notes": row["notes"] if row["notes"] else None,
+        "list": row["list_name"] or "",
+        "completed": bool(row["completed"]),
+        "completionDate": completion_dt.isoformat() if completion_dt else None,
+        "dueDate": due_dt.isoformat() if due_dt else None,
+        "priority": row["priority"] or 0,
+        "modifiedAt": modified_dt.isoformat(),
+        "collaborators": [],
+    }
 
 
 class RemindersCollector(PagedCollector):
-    """Collects Apple Reminders via AppleScript."""
+    """Collects Apple Reminders via direct SQLite database access."""
 
     def __init__(self, config: RemindersConfig) -> None:
         super().__init__()
         self._config = config
+        self._db_path: Path | None = None
 
     @property
     def name(self) -> str:
@@ -138,111 +144,93 @@ class RemindersCollector(PagedCollector):
 
         return make_reminders_router(self)
 
+    def _get_db(self) -> Path:
+        """Return the db path, discovering it once and caching."""
+        if self._db_path is None:
+            self._db_path = _find_db_path()
+        if self._db_path is None:
+            raise RuntimeError(
+                f"Reminders database not found in {_REMINDERS_STORE_DIR}. "
+                "Ensure Reminders.app has synced at least once."
+            )
+        return self._db_path
+
     def health_check(self) -> dict:
         missing = self.check_permissions()
         if missing:
             return {"status": "error", "message": f"Missing permissions: {', '.join(missing)}"}
         try:
-            # Quick check: count lists via JXA
-            result = subprocess.run(
-                ["osascript", "-l", "JavaScript", "-e",
-                 "Application('Reminders').lists().length"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode != 0:
-                return {"status": "error", "message": result.stderr.strip()}
-            return {"status": "ok", "message": f"Reminders accessible ({result.stdout.strip()} lists)"}
-        except subprocess.TimeoutExpired:
-            return {"status": "error", "message": "AppleScript timed out"}
-        except FileNotFoundError:
-            return {"status": "error", "message": "osascript not found (not on macOS?)"}
+            db = self._get_db()
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(DISTINCT l.Z_PK), COUNT(r.Z_PK) "
+                    "FROM ZREMCDBASELIST l "
+                    "LEFT JOIN ZREMCDREMINDER r ON r.ZLIST = l.Z_PK AND r.ZMARKEDFORDELETION = 0"
+                ).fetchone()
+            return {
+                "status": "ok",
+                "message": f"Reminders accessible ({row[0]} lists, {row[1]:,} reminders)",
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
     def check_permissions(self) -> list[str]:
-        # Permissions are auto-prompted by AppleScript; we can't check them programmatically
-        # without actually running a script
-        return []
+        try:
+            db = self._get_db()
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True):
+                pass
+            return []
+        except Exception:
+            return [
+                f"Read access to Reminders database in {_REMINDERS_STORE_DIR} "
+                "(grant Full Disk Access to Terminal in System Settings → Privacy & Security)"
+            ]
 
-    def fetch_page(
-        self, after: datetime | None, limit: int
-    ) -> tuple[list[dict], bool]:
-        after_iso = after.isoformat() if after else ""
-        script = _JXA_FETCH_PAGE_SCRIPT.format(after_iso=after_iso, limit=limit)
-        result = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", script],
-            capture_output=True, text=True, timeout=60,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"JXA fetch_page failed: {result.stderr.strip()}")
-        payload = json.loads(result.stdout.strip())
-        items: list[dict] = payload["items"]
-        has_more: bool = payload["hasMore"]
-        if self._config.list_filter:
-            items = [r for r in items if r.get("list") == self._config.list_filter]
-        return items, has_more
+    def watch_paths(self) -> list[Path]:
+        return [_REMINDERS_STORE_DIR] if _REMINDERS_STORE_DIR.exists() else []
 
     def has_changes_since(self, watermark: datetime | None) -> bool:
         if self.has_pending() or self.has_more():
             return True
-        cursor = self.get_cursor()
-        if cursor is None:
+        if watermark is None:
             return True
         try:
-            result = subprocess.run(
-                ["osascript", "-l", "JavaScript", "-e", _JXA_HAS_CHANGES_SCRIPT],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode != 0:
-                return True
-            max_dt = datetime.fromisoformat(result.stdout.strip().replace("Z", "+00:00"))
-            if max_dt.tzinfo is None:
-                max_dt = max_dt.replace(tzinfo=timezone.utc)
-            return max_dt > cursor
+            db = self._get_db()
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+                row = conn.execute(_QUERY_MAX_MODIFIED).fetchone()
+            if row and row[0]:
+                max_dt = _apple_ts_to_datetime(row[0])
+                return max_dt > watermark
         except Exception:
-            return True
+            pass
+        return True
+
+    def fetch_page(self, after: datetime | None, limit: int) -> tuple[list[dict], bool]:
+        db = self._get_db()
+        after_ts = _datetime_to_apple_ts(after) if after else None
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(_QUERY_PAGE, (after_ts, after_ts, limit + 1)).fetchall()
+        has_more = len(rows) > limit
+        items = [_row_to_dict(r) for r in rows[:limit]]
+        if self._config.list_filter:
+            items = [r for r in items if r.get("list") == self._config.list_filter]
+        return items, has_more
 
     def fetch_reminders(self, since: str | None, list_filter: str | None) -> list[dict]:
-        """Run AppleScript and return reminders as a list of dicts.
-
-        Args:
-            since: Optional ISO 8601 timestamp; filter modifiedAt > since
-            list_filter: Optional list name filter
-
-        Returns:
-            List of reminder dicts matching the API contract
-
-        Raises:
-            RuntimeError: If osascript fails
-            ValueError: If AppleScript output is not valid JSON
-        """
-        result = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", _JXA_SCRIPT],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"AppleScript failed: {result.stderr.strip()}")
-
-        reminders: list[dict] = json.loads(result.stdout.strip())
-
-        # Apply list filter
-        if list_filter:
-            reminders = [r for r in reminders if r.get("list") == list_filter]
-
-        # Apply since filter
+        """Fetch reminders directly (used for HTTP endpoint with since= param)."""
+        after: datetime | None = None
         if since:
-            since_dt = datetime.fromisoformat(since)
-            if since_dt.tzinfo is None:
-                since_dt = since_dt.replace(tzinfo=timezone.utc)
-            filtered = []
-            for r in reminders:
-                modified = datetime.fromisoformat(r["modifiedAt"])
-                if modified.tzinfo is None:
-                    modified = modified.replace(tzinfo=timezone.utc)
-                if modified > since_dt:
-                    filtered.append(r)
-            reminders = filtered
-
-        return reminders
+            after = datetime.fromisoformat(since)
+            if after.tzinfo is None:
+                after = after.replace(tzinfo=timezone.utc)
+        db = self._get_db()
+        after_ts = _datetime_to_apple_ts(after) if after else None
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(_QUERY_ALL, (after_ts, after_ts)).fetchall()
+        items = [_row_to_dict(r) for r in rows]
+        lf = list_filter or self._config.list_filter
+        if lf:
+            items = [r for r in items if r.get("list") == lf]
+        return items

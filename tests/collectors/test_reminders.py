@@ -1,14 +1,18 @@
-"""Tests for RemindersCollector — JXA subprocess, filtering, health check."""
+"""Tests for RemindersCollector — SQLite-backed, filtering, health check."""
 
-import json
-import subprocess
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from context_helpers.collectors.reminders.collector import RemindersCollector
+from context_helpers.collectors.reminders.collector import (
+    RemindersCollector,
+    _APPLE_EPOCH_OFFSET,
+    _apple_ts_to_datetime,
+    _datetime_to_apple_ts,
+)
 from context_helpers.config import RemindersConfig
 
 
@@ -20,42 +24,64 @@ def _collector(enabled=True, list_filter=None) -> RemindersCollector:
     return RemindersCollector(RemindersConfig(enabled=enabled, list_filter=list_filter))
 
 
-def _mock_proc(stdout: str, returncode: int = 0, stderr: str = "") -> MagicMock:
-    m = MagicMock()
-    m.returncode = returncode
-    m.stdout = stdout
-    m.stderr = stderr
-    return m
+def _to_apple_ts(iso: str) -> float:
+    dt = datetime.fromisoformat(iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp() - _APPLE_EPOCH_OFFSET
 
 
-def _reminder(
-    *,
-    id: str = "rem-1",
-    title: str = "Buy milk",
-    notes=None,
-    list: str = "Shopping",
-    completed: bool = False,
-    completion_date=None,
-    due_date=None,
-    priority: int = 0,
-    modified_at: str = "2026-03-06T10:00:00.000Z",
-    collaborators=None,
-) -> dict:
-    return {
-        "id": id,
-        "title": title,
-        "notes": notes,
-        "list": list,
-        "completed": completed,
-        "completionDate": completion_date,
-        "dueDate": due_date,
-        "priority": priority,
-        "modifiedAt": modified_at,
-        "collaborators": collaborators or [],
-    }
+@pytest.fixture
+def tmp_db(tmp_path) -> Path:
+    """Create a minimal Reminders SQLite database with test data."""
+    db_path = tmp_path / "Data-TEST.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE ZREMCDBASELIST (
+                Z_PK INTEGER PRIMARY KEY,
+                ZNAME VARCHAR
+            );
+            CREATE TABLE ZREMCDREMINDER (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCKIDENTIFIER VARCHAR,
+                ZTITLE VARCHAR,
+                ZNOTES VARCHAR,
+                ZCOMPLETED INTEGER DEFAULT 0,
+                ZPRIORITY INTEGER DEFAULT 0,
+                ZLASTMODIFIEDDATE TIMESTAMP,
+                ZDUEDATE TIMESTAMP,
+                ZCOMPLETIONDATE TIMESTAMP,
+                ZLIST INTEGER,
+                ZMARKEDFORDELETION INTEGER DEFAULT 0
+            );
+
+            INSERT INTO ZREMCDBASELIST VALUES (1, 'Shopping');
+            INSERT INTO ZREMCDBASELIST VALUES (2, 'Work');
+
+            INSERT INTO ZREMCDREMINDER VALUES (
+                1, 'rem-1', 'Buy milk', NULL, 0, 0,
+                {ts_2026_03_06}, NULL, NULL, 1, 0
+            );
+            INSERT INTO ZREMCDREMINDER VALUES (
+                2, 'rem-2', 'Write report', 'Some notes', 1, 5,
+                {ts_2026_03_07}, {ts_due}, {ts_done}, 2, 0
+            );
+            INSERT INTO ZREMCDREMINDER VALUES (
+                3, 'rem-3', 'Deleted item', NULL, 0, 0,
+                {ts_2026_03_08}, NULL, NULL, 1, 1
+            );
+        """.format(
+            ts_2026_03_06=_to_apple_ts("2026-03-06T10:00:00+00:00"),
+            ts_2026_03_07=_to_apple_ts("2026-03-07T10:00:00+00:00"),
+            ts_2026_03_08=_to_apple_ts("2026-03-08T10:00:00+00:00"),
+            ts_due=_to_apple_ts("2026-03-10T17:00:00+00:00"),
+            ts_done=_to_apple_ts("2026-03-07T11:00:00+00:00"),
+        ))
+    return db_path
 
 
-_PATCH = "context_helpers.collectors.reminders.collector.subprocess.run"
+def _patch_db(collector, db_path):
+    collector._db_path = db_path
 
 
 # ---------------------------------------------------------------------------
@@ -63,67 +89,58 @@ _PATCH = "context_helpers.collectors.reminders.collector.subprocess.run"
 # ---------------------------------------------------------------------------
 
 class TestFetchRemindersHappyPath:
-    def test_returns_list_of_dicts(self):
-        payload = json.dumps([_reminder()])
-        with patch(_PATCH, return_value=_mock_proc(payload)):
-            result = _collector().fetch_reminders(since=None, list_filter=None)
+    def test_returns_list_of_dicts(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.fetch_reminders(since=None, list_filter=None)
         assert isinstance(result, list)
-        assert len(result) == 1
+        assert len(result) == 2  # deleted item excluded
 
-    def test_all_api_contract_fields_present(self):
-        r = _reminder(
-            id="x-apple://ABC",
-            title="Task",
-            notes="Some notes",
-            list="Work",
-            completed=True,
-            due_date="2026-03-10T17:00:00.000Z",
-            priority=5,
-            modified_at="2026-03-06T09:00:00.000Z",
-            collaborators=["a@b.com"],
-        )
-        with patch(_PATCH, return_value=_mock_proc(json.dumps([r]))):
-            result = _collector().fetch_reminders(since=None, list_filter=None)
-        item = result[0]
-        assert item["id"] == "x-apple://ABC"
-        assert item["title"] == "Task"
+    def test_all_api_contract_fields_present(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.fetch_reminders(since=None, list_filter=None)
+        item = next(r for r in result if r["id"] == "rem-2")
+        assert item["id"] == "rem-2"
+        assert item["title"] == "Write report"
         assert item["notes"] == "Some notes"
         assert item["list"] == "Work"
         assert item["completed"] is True
-        assert item["dueDate"] == "2026-03-10T17:00:00.000Z"
+        assert item["dueDate"] is not None
+        assert item["completionDate"] is not None
         assert item["priority"] == 5
-        assert item["modifiedAt"] == "2026-03-06T09:00:00.000Z"
-        assert item["collaborators"] == ["a@b.com"]
+        assert item["modifiedAt"] is not None
+        assert item["collaborators"] == []
 
-    def test_multiple_reminders_returned(self):
-        payload = json.dumps([_reminder(id="r1"), _reminder(id="r2")])
-        with patch(_PATCH, return_value=_mock_proc(payload)):
-            result = _collector().fetch_reminders(since=None, list_filter=None)
-        assert len(result) == 2
+    def test_deleted_items_excluded(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.fetch_reminders(since=None, list_filter=None)
+        ids = [r["id"] for r in result]
+        assert "rem-3" not in ids
 
-    def test_empty_list_returned_when_no_reminders(self):
-        with patch(_PATCH, return_value=_mock_proc("[]")):
-            result = _collector().fetch_reminders(since=None, list_filter=None)
-        assert result == []
+    def test_null_notes_returned_as_none(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.fetch_reminders(since=None, list_filter=None)
+        item = next(r for r in result if r["id"] == "rem-1")
+        assert item["notes"] is None
 
-    def test_title_with_quotes_is_parsed_correctly(self):
-        """JXA uses JSON.stringify so quoted titles don't break parsing."""
-        r = _reminder(title='Say "hello" to Bob')
-        with patch(_PATCH, return_value=_mock_proc(json.dumps([r]))):
-            result = _collector().fetch_reminders(since=None, list_filter=None)
-        assert result[0]["title"] == 'Say "hello" to Bob'
-
-    def test_notes_with_backslashes_parsed_correctly(self):
-        r = _reminder(notes="Path: C:\\Users\\foo")
-        with patch(_PATCH, return_value=_mock_proc(json.dumps([r]))):
-            result = _collector().fetch_reminders(since=None, list_filter=None)
-        assert result[0]["notes"] == "Path: C:\\Users\\foo"
-
-    def test_notes_with_newlines_parsed_correctly(self):
-        r = _reminder(notes="line1\nline2")
-        with patch(_PATCH, return_value=_mock_proc(json.dumps([r]))):
-            result = _collector().fetch_reminders(since=None, list_filter=None)
-        assert result[0]["notes"] == "line1\nline2"
+    def test_empty_result_when_no_reminders(self, tmp_path):
+        db_path = tmp_path / "Data-EMPTY.sqlite"
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript("""
+                CREATE TABLE ZREMCDBASELIST (Z_PK INTEGER PRIMARY KEY, ZNAME VARCHAR);
+                CREATE TABLE ZREMCDREMINDER (
+                    Z_PK INTEGER PRIMARY KEY, ZCKIDENTIFIER VARCHAR, ZTITLE VARCHAR,
+                    ZNOTES VARCHAR, ZCOMPLETED INTEGER, ZPRIORITY INTEGER,
+                    ZLASTMODIFIEDDATE TIMESTAMP, ZDUEDATE TIMESTAMP,
+                    ZCOMPLETIONDATE TIMESTAMP, ZLIST INTEGER, ZMARKEDFORDELETION INTEGER
+                );
+            """)
+        c = _collector()
+        _patch_db(c, db_path)
+        assert c.fetch_reminders(since=None, list_filter=None) == []
 
 
 # ---------------------------------------------------------------------------
@@ -131,41 +148,32 @@ class TestFetchRemindersHappyPath:
 # ---------------------------------------------------------------------------
 
 class TestSinceFilter:
-    def test_reminder_modified_after_since_is_included(self):
-        r = _reminder(modified_at="2026-03-07T10:00:00+00:00")
-        with patch(_PATCH, return_value=_mock_proc(json.dumps([r]))):
-            result = _collector().fetch_reminders(since="2026-03-06T00:00:00+00:00", list_filter=None)
+    def test_reminder_modified_after_since_is_included(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.fetch_reminders(since="2026-03-06T12:00:00+00:00", list_filter=None)
+        ids = [r["id"] for r in result]
+        assert "rem-2" in ids
+        assert "rem-1" not in ids
+
+    def test_reminder_modified_before_since_is_excluded(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.fetch_reminders(since="2026-03-08T00:00:00+00:00", list_filter=None)
+        assert result == []  # both non-deleted are before cutoff
+
+    def test_no_since_returns_all_non_deleted(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.fetch_reminders(since=None, list_filter=None)
+        assert len(result) == 2
+
+    def test_since_filters_correctly_across_multiple_reminders(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.fetch_reminders(since="2026-03-06T12:00:00+00:00", list_filter=None)
         assert len(result) == 1
-
-    def test_reminder_modified_before_since_is_excluded(self):
-        r = _reminder(modified_at="2026-03-05T10:00:00+00:00")
-        with patch(_PATCH, return_value=_mock_proc(json.dumps([r]))):
-            result = _collector().fetch_reminders(since="2026-03-06T00:00:00+00:00", list_filter=None)
-        assert len(result) == 0
-
-    def test_reminder_modified_exactly_at_since_is_excluded(self):
-        # Filter is strict >; equal timestamps are excluded
-        ts = "2026-03-06T10:00:00+00:00"
-        r = _reminder(modified_at=ts)
-        with patch(_PATCH, return_value=_mock_proc(json.dumps([r]))):
-            result = _collector().fetch_reminders(since=ts, list_filter=None)
-        assert len(result) == 0
-
-    def test_no_since_returns_all(self):
-        reminders = [_reminder(id=f"r{i}", modified_at="2020-01-01T00:00:00+00:00") for i in range(3)]
-        with patch(_PATCH, return_value=_mock_proc(json.dumps(reminders))):
-            result = _collector().fetch_reminders(since=None, list_filter=None)
-        assert len(result) == 3
-
-    def test_since_filters_correctly_across_multiple_reminders(self):
-        reminders = [
-            _reminder(id="old", modified_at="2026-03-05T00:00:00+00:00"),
-            _reminder(id="new", modified_at="2026-03-07T00:00:00+00:00"),
-        ]
-        with patch(_PATCH, return_value=_mock_proc(json.dumps(reminders))):
-            result = _collector().fetch_reminders(since="2026-03-06T00:00:00+00:00", list_filter=None)
-        assert len(result) == 1
-        assert result[0]["id"] == "new"
+        assert result[0]["id"] == "rem-2"
 
 
 # ---------------------------------------------------------------------------
@@ -173,36 +181,33 @@ class TestSinceFilter:
 # ---------------------------------------------------------------------------
 
 class TestListFilter:
-    def test_list_filter_keeps_matching_list(self):
-        reminders = [
-            _reminder(id="r1", list="Work"),
-            _reminder(id="r2", list="Shopping"),
-        ]
-        with patch(_PATCH, return_value=_mock_proc(json.dumps(reminders))):
-            result = _collector().fetch_reminders(since=None, list_filter="Work")
+    def test_list_filter_keeps_matching_list(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.fetch_reminders(since=None, list_filter="Work")
         assert len(result) == 1
-        assert result[0]["id"] == "r1"
+        assert result[0]["id"] == "rem-2"
 
-    def test_list_filter_excludes_non_matching_list(self):
-        reminders = [_reminder(list="Personal")]
-        with patch(_PATCH, return_value=_mock_proc(json.dumps(reminders))):
-            result = _collector().fetch_reminders(since=None, list_filter="Work")
+    def test_list_filter_excludes_non_matching_list(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.fetch_reminders(since=None, list_filter="Nonexistent")
         assert result == []
 
-    def test_no_list_filter_returns_all_lists(self):
-        reminders = [_reminder(id="r1", list="Work"), _reminder(id="r2", list="Personal")]
-        with patch(_PATCH, return_value=_mock_proc(json.dumps(reminders))):
-            result = _collector().fetch_reminders(since=None, list_filter=None)
-        assert len(result) == 2
+    def test_no_list_filter_returns_all_lists(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.fetch_reminders(since=None, list_filter=None)
+        lists = {r["list"] for r in result}
+        assert "Shopping" in lists
+        assert "Work" in lists
 
-    def test_config_list_filter_applied_via_router(self):
-        """Config-level list_filter is passed through."""
-        collector = _collector(list_filter="Work")
-        reminders = [_reminder(id="r1", list="Work"), _reminder(id="r2", list="Personal")]
-        # Simulate the router passing config list_filter
-        with patch(_PATCH, return_value=_mock_proc(json.dumps(reminders))):
-            result = collector.fetch_reminders(since=None, list_filter=collector._config.list_filter)
+    def test_config_list_filter_applied(self, tmp_db):
+        c = _collector(list_filter="Work")
+        _patch_db(c, tmp_db)
+        result = c.fetch_reminders(since=None, list_filter=c._config.list_filter)
         assert len(result) == 1
+        assert result[0]["list"] == "Work"
 
 
 # ---------------------------------------------------------------------------
@@ -210,21 +215,11 @@ class TestListFilter:
 # ---------------------------------------------------------------------------
 
 class TestFetchRemindersErrors:
-    def test_non_zero_returncode_raises_runtime_error(self):
-        proc = _mock_proc("", returncode=1, stderr="Reminders not authorized")
-        with patch(_PATCH, return_value=proc):
-            with pytest.raises(RuntimeError, match="AppleScript failed"):
-                _collector().fetch_reminders(since=None, list_filter=None)
-
-    def test_invalid_json_output_raises_value_error(self):
-        with patch(_PATCH, return_value=_mock_proc("not-valid-json")):
-            with pytest.raises((ValueError, json.JSONDecodeError)):
-                _collector().fetch_reminders(since=None, list_filter=None)
-
-    def test_subprocess_timeout_propagates(self):
-        with patch(_PATCH, side_effect=subprocess.TimeoutExpired(cmd="osascript", timeout=30)):
-            with pytest.raises(subprocess.TimeoutExpired):
-                _collector().fetch_reminders(since=None, list_filter=None)
+    def test_missing_db_raises_runtime_error(self):
+        c = _collector()
+        c._db_path = Path("/nonexistent/path/Data-FAKE.sqlite")
+        with pytest.raises(Exception):
+            c.fetch_reminders(since=None, list_filter=None)
 
 
 # ---------------------------------------------------------------------------
@@ -232,35 +227,27 @@ class TestFetchRemindersErrors:
 # ---------------------------------------------------------------------------
 
 class TestHealthCheck:
-    def test_returns_ok_when_osascript_succeeds(self):
-        proc = _mock_proc(stdout="3\n", returncode=0)
-        with patch(_PATCH, return_value=proc):
-            result = _collector().health_check()
+    def test_returns_ok_when_db_accessible(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.health_check()
         assert result["status"] == "ok"
 
-    def test_ok_message_mentions_list_count(self):
-        proc = _mock_proc(stdout="3\n", returncode=0)
-        with patch(_PATCH, return_value=proc):
-            result = _collector().health_check()
-        assert "3" in result["message"]
+    def test_ok_message_mentions_list_and_reminder_counts(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.health_check()
+        assert "lists" in result["message"]
+        assert "reminders" in result["message"]
 
-    def test_returns_error_when_osascript_fails(self):
-        proc = _mock_proc("", returncode=1, stderr="not authorized")
-        with patch(_PATCH, return_value=proc):
-            result = _collector().health_check()
+    def test_returns_error_when_db_not_found(self):
+        c = _collector()
+        with patch(
+            "context_helpers.collectors.reminders.collector._find_db_path",
+            return_value=None,
+        ):
+            result = c.health_check()
         assert result["status"] == "error"
-
-    def test_returns_error_on_timeout(self):
-        with patch(_PATCH, side_effect=subprocess.TimeoutExpired(cmd="osascript", timeout=5)):
-            result = _collector().health_check()
-        assert result["status"] == "error"
-        assert "timed out" in result["message"]
-
-    def test_returns_error_when_osascript_not_found(self):
-        with patch(_PATCH, side_effect=FileNotFoundError("osascript")):
-            result = _collector().health_check()
-        assert result["status"] == "error"
-        assert "osascript" in result["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -268,123 +255,129 @@ class TestHealthCheck:
 # ---------------------------------------------------------------------------
 
 class TestCheckPermissions:
-    def test_returns_empty_list(self):
-        # Permissions are auto-prompted; we can't check them without running
-        assert _collector().check_permissions() == []
+    def test_returns_empty_list_when_db_accessible(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        assert c.check_permissions() == []
+
+    def test_returns_permission_error_when_db_missing(self):
+        c = _collector()
+        with patch(
+            "context_helpers.collectors.reminders.collector._find_db_path",
+            return_value=None,
+        ):
+            missing = c.check_permissions()
+        assert len(missing) > 0
 
 
 # ---------------------------------------------------------------------------
 # fetch_page
 # ---------------------------------------------------------------------------
 
-def _page_payload(items=None, has_more=False) -> str:
-    return json.dumps({"items": items or [], "hasMore": has_more})
-
-
 class TestFetchPage:
-    def test_returns_tuple_of_items_and_has_more(self, tmp_path):
-        items = [_reminder()]
-        payload = _page_payload(items=items, has_more=True)
-        with patch(_PATCH, return_value=_mock_proc(payload)):
-            result = _collector().fetch_page(after=None, limit=200)
+    def test_returns_tuple_of_items_and_has_more(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        result = c.fetch_page(after=None, limit=200)
         assert isinstance(result, tuple)
-        assert len(result) == 2
-        items_out, has_more = result
-        assert isinstance(items_out, list)
-        assert has_more is True
+        items, has_more = result
+        assert isinstance(items, list)
+        assert isinstance(has_more, bool)
 
-    def test_fetch_page_returns_items(self, tmp_path):
-        items = [_reminder(id="r1"), _reminder(id="r2")]
-        payload = _page_payload(items=items, has_more=False)
-        with patch(_PATCH, return_value=_mock_proc(payload)):
-            result_items, has_more = _collector().fetch_page(after=None, limit=200)
-        assert len(result_items) == 2
+    def test_fetch_page_returns_items(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        items, has_more = c.fetch_page(after=None, limit=200)
+        assert len(items) == 2
         assert has_more is False
 
-    def test_fetch_page_list_filter_applied(self):
-        items = [_reminder(id="r1", list="Work"), _reminder(id="r2", list="Personal")]
-        payload = _page_payload(items=items, has_more=False)
-        collector = RemindersCollector(RemindersConfig(enabled=True, list_filter="Work"))
-        with patch(_PATCH, return_value=_mock_proc(payload)):
-            result_items, _ = collector.fetch_page(after=None, limit=200)
-        assert len(result_items) == 1
-        assert result_items[0]["id"] == "r1"
+    def test_fetch_page_has_more_true_when_exceeds_limit(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        items, has_more = c.fetch_page(after=None, limit=1)
+        assert len(items) == 1
+        assert has_more is True
 
-    def test_fetch_page_non_zero_returncode_raises_runtime_error(self):
-        proc = _mock_proc("", returncode=1, stderr="permission denied")
-        with patch(_PATCH, return_value=proc):
-            with pytest.raises(RuntimeError, match="JXA fetch_page failed"):
-                _collector().fetch_page(after=None, limit=200)
+    def test_fetch_page_list_filter_applied(self, tmp_db):
+        c = _collector(list_filter="Work")
+        _patch_db(c, tmp_db)
+        items, _ = c.fetch_page(after=None, limit=200)
+        assert len(items) == 1
+        assert items[0]["id"] == "rem-2"
 
-    def test_fetch_page_timeout_propagates(self):
-        with patch(_PATCH, side_effect=subprocess.TimeoutExpired(cmd="osascript", timeout=60)):
-            with pytest.raises(subprocess.TimeoutExpired):
-                _collector().fetch_page(after=None, limit=200)
+    def test_fetch_page_after_filters_by_modified(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        after = datetime(2026, 3, 6, 12, 0, 0, tzinfo=timezone.utc)
+        items, _ = c.fetch_page(after=after, limit=200)
+        ids = [r["id"] for r in items]
+        assert "rem-2" in ids
+        assert "rem-1" not in ids
 
-    def test_fetch_page_passes_after_iso_to_script(self):
-        payload = _page_payload(items=[], has_more=False)
-        with patch(_PATCH, return_value=_mock_proc(payload)) as mock_run:
-            after = datetime(2026, 3, 10, 12, 0, 0, tzinfo=timezone.utc)
-            _collector().fetch_page(after=after, limit=50)
-        call_args = mock_run.call_args
-        script = call_args[0][0][4]  # -e <script>
-        assert after.isoformat() in script
-        assert "50" in script
+    def test_fetch_page_sorted_ascending_by_modified(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        items, _ = c.fetch_page(after=None, limit=200)
+        dates = [r["modifiedAt"] for r in items]
+        assert dates == sorted(dates)
 
 
 # ---------------------------------------------------------------------------
-# has_changes_since (cursor-based)
+# has_changes_since
 # ---------------------------------------------------------------------------
 
 class TestHasChangesSince:
-    def test_returns_true_when_has_pending(self, tmp_path):
+    def test_returns_true_when_has_pending(self, tmp_db):
         c = _collector()
-        c._stash = [_reminder()]
+        _patch_db(c, tmp_db)
+        c._stash = [{"id": "x"}]
         assert c.has_changes_since(watermark=None) is True
 
-    def test_returns_true_when_has_more(self):
+    def test_returns_true_when_has_more(self, tmp_db):
         c = _collector()
+        _patch_db(c, tmp_db)
         c._has_more = True
         assert c.has_changes_since(watermark=None) is True
 
-    def test_returns_true_when_cursor_is_none(self, tmp_path):
+    def test_returns_true_when_watermark_is_none(self, tmp_db):
         c = _collector()
-        cursor_path = tmp_path / "reminders.json"
-        with patch.object(type(c), "_cursor_path", new_callable=lambda: property(lambda self: cursor_path)):
-            result = c.has_changes_since(watermark=datetime(2026, 3, 1, tzinfo=timezone.utc))
-        assert result is True
+        _patch_db(c, tmp_db)
+        assert c.has_changes_since(watermark=None) is True
 
-    def test_returns_true_when_max_dt_exceeds_cursor(self, tmp_path):
+    def test_returns_true_when_max_dt_exceeds_watermark(self, tmp_db):
         c = _collector()
-        cursor_path = tmp_path / "reminders.json"
-        cursor_ts = datetime(2026, 3, 10, tzinfo=timezone.utc)
-        cursor_path.write_text(json.dumps({"cursor": cursor_ts.isoformat()}) + "\n")
-        max_dt_str = "2026-03-11T00:00:00.000Z"
-        with patch(_PATCH, return_value=_mock_proc(max_dt_str)):
-            with patch.object(type(c), "_cursor_path", new_callable=lambda: property(lambda self: cursor_path)):
-                result = c.has_changes_since(watermark=None)
-        assert result is True
+        _patch_db(c, tmp_db)
+        watermark = datetime(2026, 3, 6, tzinfo=timezone.utc)
+        assert c.has_changes_since(watermark=watermark) is True
 
-    def test_returns_false_when_max_dt_at_or_before_cursor(self, tmp_path):
+    def test_returns_false_when_watermark_after_all_reminders(self, tmp_db):
         c = _collector()
-        cursor_path = tmp_path / "reminders.json"
-        cursor_ts = datetime(2026, 3, 10, tzinfo=timezone.utc)
-        cursor_path.write_text(json.dumps({"cursor": cursor_ts.isoformat()}) + "\n")
-        max_dt_str = "2026-03-09T00:00:00.000Z"
-        with patch(_PATCH, return_value=_mock_proc(max_dt_str)):
-            with patch.object(type(c), "_cursor_path", new_callable=lambda: property(lambda self: cursor_path)):
-                result = c.has_changes_since(watermark=None)
-        assert result is False
+        _patch_db(c, tmp_db)
+        watermark = datetime(2026, 3, 10, tzinfo=timezone.utc)
+        assert c.has_changes_since(watermark=watermark) is False
 
-    def test_returns_true_conservatively_on_jxa_failure(self, tmp_path):
+    def test_returns_true_conservatively_on_db_failure(self):
         c = _collector()
-        cursor_path = tmp_path / "reminders.json"
-        cursor_ts = datetime(2026, 3, 10, tzinfo=timezone.utc)
-        cursor_path.write_text(json.dumps({"cursor": cursor_ts.isoformat()}) + "\n")
-        with patch(_PATCH, return_value=_mock_proc("", returncode=1, stderr="error")):
-            with patch.object(type(c), "_cursor_path", new_callable=lambda: property(lambda self: cursor_path)):
-                result = c.has_changes_since(watermark=None)
-        assert result is True
+        c._db_path = Path("/nonexistent/Data-FAKE.sqlite")
+        watermark = datetime(2026, 3, 10, tzinfo=timezone.utc)
+        assert c.has_changes_since(watermark=watermark) is True
+
+
+# ---------------------------------------------------------------------------
+# Timestamp conversion helpers
+# ---------------------------------------------------------------------------
+
+class TestTimestampHelpers:
+    def test_apple_ts_to_datetime_round_trips(self):
+        dt = datetime(2026, 3, 7, 10, 0, 0, tzinfo=timezone.utc)
+        apple_ts = _datetime_to_apple_ts(dt)
+        result = _apple_ts_to_datetime(apple_ts)
+        assert abs((result - dt).total_seconds()) < 1
+
+    def test_apple_epoch_offset(self):
+        # 2001-01-01 00:00:00 UTC should be Apple timestamp 0
+        epoch_2001 = datetime(2001, 1, 1, tzinfo=timezone.utc)
+        assert abs(_datetime_to_apple_ts(epoch_2001)) < 1
 
 
 # ---------------------------------------------------------------------------
@@ -398,3 +391,9 @@ class TestBaseInterface:
     def test_get_router_returns_api_router(self):
         from fastapi import APIRouter
         assert isinstance(_collector().get_router(), APIRouter)
+
+    def test_watch_paths_returns_reminders_store(self):
+        c = _collector()
+        paths = c.watch_paths()
+        # Returns empty list on machines where the store dir doesn't exist, or the dir
+        assert isinstance(paths, list)
