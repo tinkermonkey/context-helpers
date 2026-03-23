@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import sqlite3
-import tempfile
+import threading
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,9 +29,23 @@ try:
 except ImportError:
     pass
 
-# SQL to query workouts from healthkit-to-sqlite output database.
-# healthkit-to-sqlite produces a `workouts` table; duration is stored in
-# the unit given by `durationUnit` (typically 'min').
+# Sleep category value constants
+_SLEEP_DEEP = "HKCategoryValueSleepAnalysisAsleepDeep"
+_SLEEP_REM = "HKCategoryValueSleepAnalysisAsleepREM"
+_SLEEP_CORE = "HKCategoryValueSleepAnalysisAsleepCore"
+_SLEEP_ASLEEP_UNSPECIFIED = {"HKCategoryValueSleepAnalysisAsleepUnspecified", "HKCategoryValueSleepAnalysisAsleep"}
+_SLEEP_IN_BED = "HKCategoryValueSleepAnalysisInBed"
+_SLEEP_AWAKE = "HKCategoryValueSleepAnalysisAwake"
+_SLEEP_ANY = {_SLEEP_DEEP, _SLEEP_REM, _SLEEP_CORE} | _SLEEP_ASLEEP_UNSPECIFIED
+
+# Persistent SQLite cache location
+_CACHE_DIR = Path.home() / ".local" / "share" / "context-helpers"
+_CACHE_DB = _CACHE_DIR / "health_cache.db"
+_CACHE_META = _CACHE_DIR / "health_cache_meta.json"
+# Serialize cache check + rebuild so concurrent requests don't double-convert
+_CACHE_LOCK = threading.Lock()
+
+# SQL for workouts query
 _WORKOUTS_SQL = """
 SELECT
     id                  AS id,
@@ -44,11 +61,26 @@ ORDER BY startDate DESC
 """
 
 
-class HealthCollector(BaseCollector):
-    """Collects Apple Health workout data from exported Health.zip files.
+def _to_meters(value: float, unit: str) -> float:
+    """Convert a distance value to meters based on unit string."""
+    unit_lower = (unit or "").lower().strip()
+    if unit_lower in ("mi", "miles"):
+        return value * 1609.344
+    elif unit_lower in ("km", "kilometers"):
+        return value * 1000.0
+    else:
+        return value  # assume meters
 
-    Uses healthkit-to-sqlite to convert Apple Health exports into a SQLite database,
-    then queries that database for workout records.
+
+class HealthCollector(BaseCollector):
+    """Collects Apple Health data from exported Health.zip files.
+
+    Uses healthkit-to-sqlite to convert Apple Health exports into a persistent
+    SQLite cache, then queries that database for all supported health record types:
+    workouts, activity summaries, sleep analysis, heart rate, SpO2, and mindfulness.
+
+    The SQLite cache is keyed by export zip mtime+size so the expensive XML
+    conversion only runs when a new export is dropped into export_watch_dir.
     """
 
     def __init__(self, config: HealthConfig) -> None:
@@ -75,11 +107,11 @@ class HealthCollector(BaseCollector):
                 "status": "error",
                 "message": f"export_watch_dir does not exist: {self._watch_dir}",
             }
-        exports = list(self._watch_dir.glob("export.zip"))
+        exports = list(self._watch_dir.glob("export*.zip"))
         if not exports:
             return {
                 "status": "error",
-                "message": f"No export.zip found in {self._watch_dir}. Export health data from the Health app.",
+                "message": f"No export*.zip found in {self._watch_dir}. Export health data from the Health app.",
             }
         return {"status": "ok", "message": f"Found {len(exports)} export file(s) in {self._watch_dir}"}
 
@@ -106,34 +138,53 @@ class HealthCollector(BaseCollector):
         except OSError:
             return True  # conservative
 
-    def fetch_workouts(self, since: str | None, activity_type: str | None) -> list[dict]:
-        """Convert the latest Health export and query workouts.
+    # ------------------------------------------------------------------
+    # Cache management
+    # ------------------------------------------------------------------
 
-        Args:
-            since: Optional ISO 8601 timestamp
-            activity_type: Optional activity type filter
+    def _get_export_db(self) -> Path:
+        """Return a path to a valid SQLite cache of the latest export.
 
-        Returns:
-            List of workout dicts matching the API contract
+        The cache is keyed on the export zip's (mtime, size). If the export has
+        not changed since the last build, the existing cache is returned immediately.
+        Otherwise the XML is re-converted (may take 30–120s for large exports).
 
         Raises:
-            RuntimeError: If no export file found or healthkit-to-sqlite fails
+            RuntimeError: If no export zip found or XML parsing fails.
         """
         if not _HAS_HEALTHKIT:
             raise RuntimeError("healthkit-to-sqlite is not installed")
 
-        exports = sorted(self._watch_dir.glob("export*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+        exports = sorted(
+            self._watch_dir.glob("export*.zip"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
         if not exports:
             raise RuntimeError(f"No export.zip found in {self._watch_dir}")
 
         export_zip = exports[0]
+        stat = export_zip.stat()
+        zip_mtime = stat.st_mtime
+        zip_size = stat.st_size
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = Path(tmpdir) / "health.db"
+        with _CACHE_LOCK:
+            # Re-check inside lock — another thread may have just rebuilt it
+            if _CACHE_META.exists() and _CACHE_DB.exists():
+                try:
+                    meta = json.loads(_CACHE_META.read_text())
+                    if meta.get("mtime") == zip_mtime and meta.get("size") == zip_size:
+                        return _CACHE_DB
+                except (json.JSONDecodeError, OSError):
+                    pass  # Fall through to rebuild
 
-            # Convert export to SQLite using internal API.
-            # Replicate healthkit_to_sqlite's XML discovery: find the first .xml
-            # at depth 1 whose content starts with HealthData markers.
+            # Rebuild cache (lock held for the duration — conversions are rare)
+            logger.info("Health: converting export to SQLite — this may take a minute...")
+            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp_db = _CACHE_DIR / "health_cache.db.tmp"
+            if tmp_db.exists():
+                tmp_db.unlink()
+
             with _zipfile.ZipFile(export_zip) as zf:
                 candidates = [
                     zi.filename for zi in zf.filelist
@@ -148,27 +199,56 @@ class HealthCollector(BaseCollector):
                 if export_xml_path is None:
                     raise RuntimeError(f"No valid HealthData XML found in {export_zip.name}")
                 fp = zf.open(export_xml_path)
-                db = sqlite_utils.Database(str(db_path))
+                db = sqlite_utils.Database(str(tmp_db))
                 convert_xml_to_sqlite(fp, db, zipfile=zf)
 
-            since_clause = ""
-            params: list = []
-            if since:
-                since_clause = "AND startDate > ?"
-                params.append(since)
+            tmp_db.replace(_CACHE_DB)
+            _CACHE_META.write_text(json.dumps({"mtime": zip_mtime, "size": zip_size}))
+            logger.info("Health: SQLite cache ready at %s", _CACHE_DB)
+            return _CACHE_DB
 
-            sql = _WORKOUTS_SQL.format(since_clause=since_clause)
+    def _table_exists(self, conn: sqlite3.Connection, table: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", [table]
+        ).fetchone()
+        return row is not None
 
-            with sqlite3.connect(str(db_path)) as conn:
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(sql, params).fetchall()
+    # ------------------------------------------------------------------
+    # Fetch methods
+    # ------------------------------------------------------------------
+
+    def fetch_workouts(self, since: str | None, activity_type: str | None) -> list[dict]:
+        """Return workouts from the latest Health export.
+
+        Args:
+            since: Optional ISO 8601 timestamp — only workouts with startDate > since.
+            activity_type: Optional filter by activity type string.
+
+        Returns:
+            List of workout dicts matching the API contract.
+
+        Raises:
+            RuntimeError: If no export file found or healthkit-to-sqlite is missing.
+        """
+        db_path = self._get_export_db()
+
+        since_clause = ""
+        params: list = []
+        if since:
+            since_clause = "AND startDate > ?"
+            params.append(since)
+
+        sql = _WORKOUTS_SQL.format(since_clause=since_clause)
+
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
 
         workouts = []
         for row in rows:
             w = dict(row)
             if activity_type and w.get("activityType") != activity_type:
                 continue
-            # Normalise duration to seconds regardless of the stored unit
             raw_duration = float(w["duration"]) if w["duration"] else 0.0
             unit = (w.get("durationUnit") or "min").lower()
             if unit in ("min", "minutes"):
@@ -193,3 +273,316 @@ class HealthCollector(BaseCollector):
             })
 
         return workouts
+
+    def fetch_activity(self, since: str | None) -> list[dict]:
+        """Return daily activity summaries from the latest Health export.
+
+        Merges data from the activity_summary table (calories, exercise, stand hours),
+        rStepCount (daily step totals), and rDistanceWalkingRunning (daily distance).
+
+        Args:
+            since: Optional ISO 8601 timestamp — only days with date > since[:10].
+
+        Returns:
+            List of activity dicts sorted descending by date, each with:
+              id, date, steps, activeCalories, totalCalories,
+              exerciseMinutes, standHours, distanceMeters.
+        """
+        db_path = self._get_export_db()
+        since_date = since[:10] if since else None
+
+        by_date: dict[str, dict] = {}
+
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+
+            # Activity summary: calories, exercise minutes, stand hours
+            if self._table_exists(conn, "activity_summary"):
+                sql = (
+                    "SELECT dateComponents AS date,"
+                    " CAST(activeEnergyBurned AS FLOAT) AS activeEnergyBurned,"
+                    " CAST(appleExerciseTime AS FLOAT) AS exerciseMinutes,"
+                    " CAST(appleStandHours AS FLOAT) AS standHours"
+                    " FROM activity_summary"
+                )
+                params: list = []
+                if since_date:
+                    sql += " WHERE dateComponents > ?"
+                    params.append(since_date)
+                sql += " ORDER BY dateComponents DESC"
+                for row in conn.execute(sql, params).fetchall():
+                    d = row["date"]
+                    by_date[d] = {
+                        "id": d,
+                        "date": d,
+                        "steps": None,
+                        "activeCalories": row["activeEnergyBurned"],
+                        "totalCalories": None,
+                        "exerciseMinutes": (
+                            int(row["exerciseMinutes"]) if row["exerciseMinutes"] is not None else None
+                        ),
+                        "standHours": (
+                            int(row["standHours"]) if row["standHours"] is not None else None
+                        ),
+                        "distanceMeters": None,
+                    }
+
+            # Step count: sum per day across all sources
+            if self._table_exists(conn, "rStepCount"):
+                sql = (
+                    "SELECT substr(startDate, 1, 10) AS date,"
+                    " SUM(CAST(value AS FLOAT)) AS total_steps"
+                    " FROM rStepCount"
+                )
+                params = []
+                if since_date:
+                    sql += " WHERE substr(startDate, 1, 10) > ?"
+                    params.append(since_date)
+                sql += " GROUP BY date ORDER BY date DESC"
+                for row in conn.execute(sql, params).fetchall():
+                    d = row["date"]
+                    steps = int(row["total_steps"]) if row["total_steps"] is not None else None
+                    if d in by_date:
+                        by_date[d]["steps"] = steps
+                    else:
+                        by_date[d] = {
+                            "id": d, "date": d, "steps": steps,
+                            "activeCalories": None, "totalCalories": None,
+                            "exerciseMinutes": None, "standHours": None,
+                            "distanceMeters": None,
+                        }
+
+            # Walking/running distance: sum per day, convert to meters
+            if self._table_exists(conn, "rDistanceWalkingRunning"):
+                sql = (
+                    "SELECT substr(startDate, 1, 10) AS date,"
+                    " CAST(value AS FLOAT) AS distance, unit"
+                    " FROM rDistanceWalkingRunning"
+                )
+                params = []
+                if since_date:
+                    sql += " WHERE substr(startDate, 1, 10) > ?"
+                    params.append(since_date)
+                dist_by_date: dict[str, float] = defaultdict(float)
+                for row in conn.execute(sql, params).fetchall():
+                    if row["distance"] is not None:
+                        dist_by_date[row["date"]] += _to_meters(row["distance"], row["unit"] or "m")
+                for d, meters in dist_by_date.items():
+                    if d in by_date:
+                        by_date[d]["distanceMeters"] = round(meters, 2)
+
+        return sorted(by_date.values(), key=lambda x: x["date"], reverse=True)
+
+    def fetch_sleep(self, since: str | None) -> list[dict]:
+        """Return daily sleep summaries from the latest Health export.
+
+        Aggregates HKCategoryTypeIdentifierSleepAnalysis intervals by the date
+        of the bedtime (startDate) into total/deep/REM/light minutes per night.
+
+        Args:
+            since: Optional ISO 8601 timestamp — only nights with date > since[:10].
+
+        Returns:
+            List of sleep summary dicts sorted descending by date, each with:
+              id, date, totalSleepMinutes, deepSleepMinutes, remSleepMinutes,
+              lightSleepMinutes, inBedMinutes.
+        """
+        db_path = self._get_export_db()
+        since_date = since[:10] if since else None
+
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+
+            if not self._table_exists(conn, "rSleepAnalysis"):
+                return []
+
+            sql = (
+                "SELECT substr(startDate, 1, 10) AS date, value,"
+                " (julianday(endDate) - julianday(startDate)) * 1440.0 AS duration_minutes"
+                " FROM rSleepAnalysis"
+            )
+            params: list = []
+            if since_date:
+                sql += " WHERE substr(startDate, 1, 10) > ?"
+                params.append(since_date)
+            sql += " ORDER BY startDate"
+            rows = conn.execute(sql, params).fetchall()
+
+        # Aggregate by date
+        totals: dict[str, dict[str, float]] = defaultdict(
+            lambda: {"total": 0.0, "deep": 0.0, "rem": 0.0, "light": 0.0, "in_bed": 0.0}
+        )
+        for row in rows:
+            d = row["date"]
+            dur = float(row["duration_minutes"] or 0.0)
+            val = row["value"] or ""
+            if val == _SLEEP_DEEP:
+                totals[d]["deep"] += dur
+                totals[d]["total"] += dur
+            elif val == _SLEEP_REM:
+                totals[d]["rem"] += dur
+                totals[d]["total"] += dur
+            elif val == _SLEEP_CORE:
+                totals[d]["light"] += dur
+                totals[d]["total"] += dur
+            elif val in _SLEEP_ASLEEP_UNSPECIFIED:
+                totals[d]["total"] += dur
+            elif val == _SLEEP_IN_BED:
+                totals[d]["in_bed"] += dur
+            # AWAKE segments are not added to any sleep total
+
+        result = []
+        for d, mins in sorted(totals.items(), reverse=True):
+            result.append({
+                "id": d,
+                "date": d,
+                "totalSleepMinutes": int(mins["total"]),
+                "deepSleepMinutes": int(mins["deep"]) if mins["deep"] > 0 else None,
+                "remSleepMinutes": int(mins["rem"]) if mins["rem"] > 0 else None,
+                "lightSleepMinutes": int(mins["light"]) if mins["light"] > 0 else None,
+                "inBedMinutes": int(mins["in_bed"]) if mins["in_bed"] > 0 else None,
+            })
+        return result
+
+    def fetch_heart_rate(self, since: str | None) -> list[dict]:
+        """Return heart rate samples from the latest Health export.
+
+        Each sample is a (timestamp, bpm, source) tuple. The context-library
+        adapter groups these into hourly windows server-side.
+
+        Args:
+            since: Optional ISO 8601 timestamp — only samples with date >= since[:10].
+
+        Returns:
+            List of heart rate sample dicts sorted ascending by timestamp, each with:
+              timestamp, bpm, source.
+        """
+        db_path = self._get_export_db()
+        since_date = since[:10] if since else None
+
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+
+            if not self._table_exists(conn, "rHeartRate"):
+                return []
+
+            sql = (
+                "SELECT startDate AS timestamp,"
+                " CAST(value AS FLOAT) AS bpm,"
+                " sourceName AS source"
+                " FROM rHeartRate"
+            )
+            params: list = []
+            if since_date:
+                sql += " WHERE substr(startDate, 1, 10) > ?"
+                params.append(since_date)
+            sql += " ORDER BY startDate ASC"
+            rows = conn.execute(sql, params).fetchall()
+
+        return [
+            {
+                "timestamp": row["timestamp"],
+                "bpm": row["bpm"],
+                "source": row["source"],
+            }
+            for row in rows
+            if row["bpm"] is not None
+        ]
+
+    def fetch_spo2(self, since: str | None) -> list[dict]:
+        """Return daily SpO2 (blood oxygen) summaries from the latest Health export.
+
+        Averages all HKQuantityTypeIdentifierOxygenSaturation samples per day.
+        Apple Health stores SpO2 with unit "%" and values like 97.0 (percentage).
+
+        Args:
+            since: Optional ISO 8601 timestamp — only days with date > since[:10].
+
+        Returns:
+            List of SpO2 summary dicts sorted descending by date, each with:
+              id, date, avgSpo2 (percentage, e.g. 97.2).
+        """
+        db_path = self._get_export_db()
+        since_date = since[:10] if since else None
+
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+
+            if not self._table_exists(conn, "rOxygenSaturation"):
+                return []
+
+            sql = (
+                "SELECT substr(startDate, 1, 10) AS date,"
+                " AVG(CAST(value AS FLOAT)) AS avg_spo2,"
+                " unit"
+                " FROM rOxygenSaturation"
+            )
+            params: list = []
+            if since_date:
+                sql += " WHERE substr(startDate, 1, 10) > ?"
+                params.append(since_date)
+            sql += " GROUP BY date ORDER BY date DESC"
+            rows = conn.execute(sql, params).fetchall()
+
+        result = []
+        for row in rows:
+            avg = row["avg_spo2"]
+            if avg is None:
+                continue
+            # Apple Health stores SpO2 as a decimal (0.97) with unit "%"
+            # Normalise to percentage (0-100) for the API response
+            if avg <= 1.0:
+                avg = avg * 100.0
+            result.append({
+                "id": row["date"],
+                "date": row["date"],
+                "avgSpo2": round(avg, 2),
+            })
+        return result
+
+    def fetch_mindfulness(self, since: str | None) -> list[dict]:
+        """Return mindfulness/meditation sessions from the latest Health export.
+
+        Args:
+            since: Optional ISO 8601 timestamp — only sessions with date >= since[:10].
+
+        Returns:
+            List of mindfulness session dicts sorted descending by startDate, each with:
+              id, startDate, endDate, durationSeconds, sessionType.
+        """
+        db_path = self._get_export_db()
+        since_date = since[:10] if since else None
+
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+
+            if not self._table_exists(conn, "rMindfulSession"):
+                return []
+
+            sql = (
+                "SELECT startDate, endDate,"
+                " CAST((julianday(endDate) - julianday(startDate)) * 86400.0 AS INTEGER)"
+                " AS duration_seconds"
+                " FROM rMindfulSession"
+            )
+            params: list = []
+            if since_date:
+                sql += " WHERE substr(startDate, 1, 10) > ?"
+                params.append(since_date)
+            sql += " ORDER BY startDate DESC"
+            rows = conn.execute(sql, params).fetchall()
+
+        result = []
+        for row in rows:
+            start = row["startDate"] or ""
+            end = row["endDate"] or ""
+            # Generate a stable ID from start+end
+            session_id = hashlib.sha256(f"{start}:{end}".encode()).hexdigest()[:16]
+            result.append({
+                "id": session_id,
+                "startDate": start,
+                "endDate": end,
+                "durationSeconds": row["duration_seconds"] or 0,
+                "sessionType": "mindful",
+            })
+        return result

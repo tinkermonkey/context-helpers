@@ -65,6 +65,9 @@ class MusicConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
     enabled: bool = False
+    # Kept for config backward-compatibility; the collector queries Music.app
+    # directly via JXA and does not read the library XML file.
+    library_path: str = "~/Music/iTunes/iTunes Library.xml"
 
 
 class FilesystemConfig(BaseSettings):
