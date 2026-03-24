@@ -79,6 +79,7 @@ class FilesystemConfig(BaseSettings):
     max_file_size_mb: float = 1.0       # files larger than this are skipped before reading
     page_size: int = 50                 # max files per paged delivery cycle
     max_response_mb: float = 10.0       # max total content bytes per page
+    failure_skip_threshold: int = 10    # failures before a file is permanently skipped
 
 
 class ObsidianConfig(BaseSettings):

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterator
 
 from context_helpers.collectors.base import PagedCollector
+from context_helpers.collectors.filesystem.failures import FileFailureTracker
 from context_helpers.config import FilesystemConfig
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,8 @@ _KNOWN_BINARY_EXTENSIONS = {
     ".pyc", ".class", ".o", ".a",
 }
 
+_STATE_DIR = Path.home() / ".local" / "share" / "context-helpers"
+
 
 class FilesystemCollector(PagedCollector):
     """Collector that reads files from a local directory and serves them over HTTP."""
@@ -43,6 +46,15 @@ class FilesystemCollector(PagedCollector):
         super().__init__()
         self._config = config
         self._directory = Path(config.directory).expanduser().resolve()
+        self._tracker = FileFailureTracker(
+            threshold=config.failure_skip_threshold,
+            state_dir=_STATE_DIR,
+        )
+        # Max timestamp seen in the last page across all processed files,
+        # including permanently-skipped ones.  Set by fetch_page()/iter_page();
+        # used by consume_stash() and fill_stash() to advance the cursor past
+        # permanently-skipped files so they never block forward progress.
+        self._page_cursor: datetime | None = None
 
     @property
     def name(self) -> str:
@@ -94,6 +106,8 @@ class FilesystemCollector(PagedCollector):
         for path in self._directory.rglob("*"):
             if not path.is_file() or self._should_skip_path(path):
                 continue
+            if self._tracker.is_permanently_skipped(path):
+                continue
             try:
                 stat = path.stat()
                 if stat.st_size > max_bytes:
@@ -106,6 +120,43 @@ class FilesystemCollector(PagedCollector):
 
     def watch_paths(self) -> list[Path]:
         return [self._directory] if self._directory.is_dir() else []
+
+    # ------------------------------------------------------------------
+    # PagedCollector overrides — cursor advancement past skipped files
+    # ------------------------------------------------------------------
+
+    def fill_stash(self, limit: int) -> None:
+        """Pre-load one page into the stash, then advance cursor past any
+        permanently-skipped files whose timestamps trail the page boundary.
+
+        If every candidate in the page is permanently skipped (stash stays
+        empty), the cursor is still advanced here so the next poll cycle
+        does not re-attempt those files.
+        """
+        super().fill_stash(limit)
+        # When the stash is empty (all-skipped edge case) consume_stash() is
+        # never called, so we must advance the cursor now.
+        # Note: _page_cursor is NOT reset here. base.fill_stash() is idempotent
+        # (early-returns if stash is already populated without calling fetch_page()),
+        # so resetting _page_cursor before super() would clobber the value set
+        # by the previous real fill, breaking cursor advancement on consume.
+        # fetch_page() always writes _page_cursor at the end, including None when
+        # there are no candidates, so the value is always fresh after a real fill.
+        if not self.has_pending() and self._page_cursor is not None:
+            current = self.get_cursor()
+            if current is None or self._page_cursor > current:
+                self._save_cursor(self._page_cursor)
+
+    def consume_stash(self) -> list[dict]:
+        """Return stash and advance cursor, including past permanently-skipped files."""
+        items = super().consume_stash()  # advances cursor to max of delivered items
+        # Advance further if any permanently-skipped file had a higher timestamp
+        # than the highest-timestamp delivered item.
+        if self._page_cursor is not None:
+            current = self.get_cursor()
+            if current is None or self._page_cursor > current:
+                self._save_cursor(self._page_cursor)
+        return items
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -189,6 +240,11 @@ class FilesystemCollector(PagedCollector):
 
         Returns:
             (files sorted ASC by modified_at, has_more)
+
+        Side-effect:
+            Sets self._page_cursor to the max modified_at seen across all
+            processed candidates (delivered + permanently-skipped), so the
+            caller can advance the persistent cursor past skipped files.
         """
         candidates = self._collect_candidates(after, extensions, max_size_mb)
         max_content_bytes = int(self._config.max_response_mb * 1024 * 1024)
@@ -196,19 +252,36 @@ class FilesystemCollector(PagedCollector):
         results = []
         content_bytes = 0
         idx = 0
+        page_max_ts: datetime | None = None
+
         while idx < len(candidates) and len(results) < limit and content_bytes < max_content_bytes:
             modified_at, file_path, stat = candidates[idx]
             idx += 1
+
+            if self._tracker.is_permanently_skipped(file_path):
+                if page_max_ts is None or modified_at > page_max_ts:
+                    page_max_ts = modified_at
+                continue
+
             try:
                 content = file_path.read_text(encoding="utf-8")
                 if not content.strip():
                     continue
                 content_bytes += len(content.encode("utf-8"))
                 results.append(self._make_doc(file_path, content, modified_at, stat))
+                if page_max_ts is None or modified_at > page_max_ts:
+                    page_max_ts = modified_at
             except (UnicodeDecodeError, PermissionError, OSError) as e:
-                logger.warning("Skipping %s: %s", file_path, e)
+                self._tracker.record_failure(file_path, e)
+                if self._tracker.is_permanently_skipped(file_path):
+                    # Newly crossed threshold: include ts in cursor advancement
+                    if page_max_ts is None or modified_at > page_max_ts:
+                        page_max_ts = modified_at
+                else:
+                    logger.warning("Skipping %s: %s", file_path, e)
                 continue
 
+        self._page_cursor = page_max_ts
         return results, idx < len(candidates)
 
     def iter_page(
@@ -227,6 +300,10 @@ class FilesystemCollector(PagedCollector):
         Unlike fetch_page(), file content is read one file at a time —
         peak memory is bounded to the size of a single file rather than
         the full page.
+
+        The ``next_cursor`` in the sentinel reflects the max modified_at seen
+        across all processed files, including permanently-skipped ones, so
+        the caller's cursor always advances past skipped files.
         """
         candidates = self._collect_candidates(after, extensions, max_size_mb)
         max_content_bytes = int(self._config.max_response_mb * 1024 * 1024)
@@ -234,11 +311,17 @@ class FilesystemCollector(PagedCollector):
         content_bytes = 0
         count = 0
         idx = 0
-        last_ts: str | None = None
+        max_ts_seen: datetime | None = None
 
         while idx < len(candidates) and count < limit and content_bytes < max_content_bytes:
             modified_at, file_path, stat = candidates[idx]
             idx += 1
+
+            if self._tracker.is_permanently_skipped(file_path):
+                if max_ts_seen is None or modified_at > max_ts_seen:
+                    max_ts_seen = modified_at
+                continue
+
             try:
                 content = file_path.read_text(encoding="utf-8")
                 if not content.strip():
@@ -246,13 +329,20 @@ class FilesystemCollector(PagedCollector):
                 content_bytes += len(content.encode("utf-8"))
                 doc = self._make_doc(file_path, content, modified_at, stat)
                 count += 1
-                last_ts = doc["modified_at"]
+                if max_ts_seen is None or modified_at > max_ts_seen:
+                    max_ts_seen = modified_at
                 yield doc
             except (UnicodeDecodeError, PermissionError, OSError) as e:
-                logger.warning("Skipping %s: %s", file_path, e)
+                self._tracker.record_failure(file_path, e)
+                if self._tracker.is_permanently_skipped(file_path):
+                    if max_ts_seen is None or modified_at > max_ts_seen:
+                        max_ts_seen = modified_at
+                else:
+                    logger.warning("Skipping %s: %s", file_path, e)
                 continue
 
-        yield {"__meta__": True, "has_more": idx < len(candidates), "next_cursor": last_ts}
+        next_cursor = max_ts_seen.isoformat() if max_ts_seen else None
+        yield {"__meta__": True, "has_more": idx < len(candidates), "next_cursor": next_cursor}
 
     # ------------------------------------------------------------------
     # Backward-compatible direct API (GET /documents)
@@ -310,6 +400,9 @@ class FilesystemCollector(PagedCollector):
             elif self._should_skip_path(file_path):
                 continue
 
+            if self._tracker.is_permanently_skipped(file_path):
+                continue
+
             try:
                 stat = file_path.stat()
 
@@ -329,7 +422,9 @@ class FilesystemCollector(PagedCollector):
 
                 results.append(self._make_doc(file_path, content, modified_at, stat))
             except (UnicodeDecodeError, PermissionError, OSError) as e:
-                logger.warning("Skipping %s: %s", file_path, e)
+                self._tracker.record_failure(file_path, e)
+                if not self._tracker.is_permanently_skipped(file_path):
+                    logger.warning("Skipping %s: %s", file_path, e)
                 continue
 
         return results

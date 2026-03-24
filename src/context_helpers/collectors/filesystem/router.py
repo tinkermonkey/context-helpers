@@ -170,11 +170,18 @@ def make_filesystem_router(collector: "FilesystemCollector") -> APIRouter:
                 max_size_mb=body.max_size_mb,
             )
 
-        next_cursor: str | None = None
-        if items:
+        # Use the collector's page_cursor (which includes permanently-skipped file
+        # timestamps) so the adapter's cursor always advances past skipped files,
+        # not just past the last delivered item.
+        page_cur = collector._page_cursor
+        if page_cur is not None:
+            next_cursor: str | None = page_cur.isoformat()
+        elif items:
             next_cursor = max(
                 item["modified_at"] for item in items if item.get("modified_at")
             )
+        else:
+            next_cursor = None
 
         return {
             "normalized_contents": [_to_normalized_content(doc) for doc in items],
