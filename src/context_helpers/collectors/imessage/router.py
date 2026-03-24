@@ -22,6 +22,7 @@ def make_imessage_router(collector: "iMessageCollector") -> APIRouter:
 
         Matches the API contract expected by AppleiMessageAdapter.
         """
-        return collector.fetch_messages(since=collector.resolve_since(since))
+        items = collector.fetch_messages(since=collector.resolve_push_since(since))
+        return collector.apply_push_paging(items, "timestamp")
 
     return router

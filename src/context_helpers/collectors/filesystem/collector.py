@@ -32,6 +32,7 @@ _KNOWN_BINARY_EXTENSIONS = {
     ".mp3", ".mp4", ".m4a", ".flac", ".wav", ".aac", ".mov", ".avi", ".mkv",
     ".db", ".sqlite", ".sqlite3",
     ".pyc", ".class", ".o", ".a",
+    ".ttf", ".otf", ".woff", ".woff2", ".eot",
 }
 
 _STATE_DIR = Path.home() / ".local" / "share" / "context-helpers"

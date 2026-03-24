@@ -116,6 +116,105 @@ class BaseCollector(ABC):
         wm = self.get_watermark()
         return wm.isoformat() if wm else None
 
+    # ------------------------------------------------------------------
+    # Push paging — bounded delivery for non-paged collectors
+    # ------------------------------------------------------------------
+
+    def get_push_cursor(self) -> "datetime | None":
+        """Return the per-collector push cursor, or None if not set."""
+        cursor_path = _CURSORS_DIR / f"{self.name}_push.json"
+        if not cursor_path.exists():
+            return None
+        try:
+            with open(cursor_path) as f:
+                data = json.load(f)
+            ts = data.get("cursor")
+            if not ts:
+                return None
+            dt = datetime.fromisoformat(ts)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except (json.JSONDecodeError, OSError, ValueError):
+            return None
+
+    def _save_push_cursor(self, ts: "datetime") -> None:
+        _CURSORS_DIR.mkdir(parents=True, exist_ok=True)
+        cursor_path = _CURSORS_DIR / f"{self.name}_push.json"
+        tmp = cursor_path.with_suffix(".tmp")
+        try:
+            with open(tmp, "w") as f:
+                json.dump({"cursor": ts.isoformat()}, f)
+                f.write("\n")
+            tmp.replace(cursor_path)
+        except OSError as e:
+            logger.error("BaseCollector: failed to save push cursor for %s: %s", self.name, e)
+
+    def resolve_push_since(self, since: "str | None") -> "str | None":
+        """Like resolve_since(), but also advances past the per-collector push cursor.
+
+        Returns the latest of: the explicit *since* arg, the delivery watermark,
+        and the push cursor.  This ensures each push cycle delivers only items
+        not yet seen by the library, even when the global watermark has not yet
+        advanced past what this collector already delivered.
+        """
+        effective = self.resolve_since(since)
+        push_cur = self.get_push_cursor()
+        if push_cur is None:
+            return effective
+        if effective is None:
+            return push_cur.isoformat()
+        try:
+            dt = datetime.fromisoformat(effective.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(dt, push_cur).isoformat()
+        except ValueError:
+            return push_cur.isoformat()
+
+    def get_push_limit(self) -> int:
+        """Return the effective push page size for this collector."""
+        override = getattr(self, "_push_limit_override", None)
+        if override is not None:
+            return override
+        return getattr(getattr(self, "_config", None), "push_page_size", 200)
+
+    def set_push_limit(self, n: int) -> None:
+        """Override the push page size (used by the push trigger on timeout)."""
+        self._push_limit_override = max(10, n)
+
+    def has_push_more(self) -> bool:
+        """Return True if the last apply_push_paging() call had items beyond the limit."""
+        return getattr(self, "_has_push_more", False)
+
+    def apply_push_paging(self, items: "list[dict]", ts_field: str) -> "list[dict]":
+        """Sort items by ts_field ASC, apply push limit, advance push cursor.
+
+        Mutates the has_push_more flag so the push trigger knows whether to
+        schedule an immediate follow-up delivery cycle.
+
+        Args:
+            items: All matching items returned by the underlying fetch method.
+            ts_field: The dict key that holds each item's ISO 8601 timestamp.
+
+        Returns:
+            The bounded page (at most get_push_limit() items, oldest first).
+        """
+        items.sort(key=lambda x: x.get(ts_field) or "")
+        limit = self.get_push_limit()
+        page = items[:limit]
+        if page:
+            ts_vals = [x[ts_field] for x in page if x.get(ts_field)]
+            if ts_vals:
+                max_ts_str = max(ts_vals)
+                try:
+                    dt = datetime.fromisoformat(max_ts_str.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    self._save_push_cursor(dt)
+                except ValueError:
+                    pass
+        self._has_push_more = len(items) > limit
+        return page
+
 
 _CURSORS_DIR = Path.home() / ".local" / "share" / "context-helpers" / "cursors"
 

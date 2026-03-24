@@ -23,6 +23,7 @@ def make_notes_router(collector: "NotesCollector") -> APIRouter:
 
         Matches the API contract expected by AppleNotesAdapter.
         """
-        return collector.fetch_notes(since=collector.resolve_since(since), folder_filter=folder)
+        items = collector.fetch_notes(since=collector.resolve_push_since(since), folder_filter=folder)
+        return collector.apply_push_paging(items, "modified_at")
 
     return router

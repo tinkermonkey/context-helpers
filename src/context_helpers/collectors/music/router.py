@@ -22,6 +22,7 @@ def make_music_router(collector: "MusicCollector") -> APIRouter:
 
         Matches the API contract expected by AppleMusicAdapter.
         """
-        return collector.fetch_tracks(since=collector.resolve_since(since))
+        items = collector.fetch_tracks(since=collector.resolve_push_since(since))
+        return collector.apply_push_paging(items, "played_at")
 
     return router

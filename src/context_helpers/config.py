@@ -43,6 +43,7 @@ class HealthConfig(BaseSettings):
 
     enabled: bool = False
     export_watch_dir: str = "~/Downloads"
+    push_page_size: int = 100    # max items per endpoint per push cycle
 
 
 class iMessageConfig(BaseSettings):
@@ -50,6 +51,7 @@ class iMessageConfig(BaseSettings):
 
     enabled: bool = False
     db_path: str = "~/Library/Messages/chat.db"
+    push_page_size: int = 200
 
 
 class NotesConfig(BaseSettings):
@@ -59,6 +61,7 @@ class NotesConfig(BaseSettings):
     db_path: str = (
         "~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
     )
+    push_page_size: int = 50
 
 
 class MusicConfig(BaseSettings):
@@ -68,6 +71,7 @@ class MusicConfig(BaseSettings):
     # Kept for config backward-compatibility; the collector queries Music.app
     # directly via JXA and does not read the library XML file.
     library_path: str = "~/Music/iTunes/iTunes Library.xml"
+    push_page_size: int = 200
 
 
 class FilesystemConfig(BaseSettings):
@@ -87,6 +91,7 @@ class ObsidianConfig(BaseSettings):
 
     enabled: bool = False
     vault_path: str = "~/Documents/Obsidian"
+    push_page_size: int = 50
 
 
 class OuraConfig(BaseSettings):
@@ -100,6 +105,7 @@ class OuraConfig(BaseSettings):
     refresh_token: str = ""
     base_url: str = "https://api.ouraring.com/v2"  # overridable for testing
     token_url: str = "https://api.ouraring.com/oauth/token"  # overridable for testing
+    push_page_size: int = 100    # max items per endpoint per push cycle
 
 
 class PushConfig(BaseSettings):

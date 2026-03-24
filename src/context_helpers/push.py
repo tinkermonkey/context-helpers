@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 import threading
 import urllib.error
 import urllib.parse
@@ -77,6 +78,7 @@ class PushTrigger:
         self._pending = threading.Event()   # set by watchdog to wake poll loop early
         self._poll_thread: threading.Thread | None = None
         self._observer = None
+        self._consecutive_timeouts: int = 0
 
     def start(self) -> None:
         """Start background poll thread and optional FSEvents watcher."""
@@ -223,16 +225,25 @@ class PushTrigger:
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 if resp.status == 200:
+                    self._consecutive_timeouts = 0
+                    self._restore_push_limits()
                     now = datetime.now(timezone.utc)
                     self._state.advance_watermark(now)
                     logger.info(
                         "PushTrigger: delivery succeeded, watermark advanced to %s", now.isoformat()
                     )
-                    # Chain next page immediately for paged collectors with more data
+                    # Chain immediately if any collector has more data to deliver
                     for collector in self._collectors:
                         if isinstance(collector, PagedCollector) and collector.has_more():
                             logger.debug(
                                 "PushTrigger: collector '%s' has more pages — scheduling immediate next cycle",
+                                collector.name,
+                            )
+                            self._pending.set()
+                            break
+                        if not isinstance(collector, PagedCollector) and collector.has_push_more():
+                            logger.debug(
+                                "PushTrigger: collector '%s' has more push data — scheduling immediate next cycle",
                                 collector.name,
                             )
                             self._pending.set()
@@ -242,6 +253,42 @@ class PushTrigger:
         except urllib.error.HTTPError as e:
             logger.error("PushTrigger: delivery HTTP %d — %s", e.code, e.reason)
         except urllib.error.URLError as e:
-            logger.error("PushTrigger: delivery failed (server unreachable?): %s", e.reason)
+            is_timeout = isinstance(e.reason, (socket.timeout, TimeoutError))
+            if is_timeout:
+                self._consecutive_timeouts += 1
+                logger.error(
+                    "PushTrigger: delivery timed out (consecutive=%d) — reducing page sizes",
+                    self._consecutive_timeouts,
+                )
+                self._reduce_push_limits()
+            else:
+                logger.error("PushTrigger: delivery failed (server unreachable?): %s", e.reason)
         except Exception as e:
             logger.error("PushTrigger: delivery failed unexpectedly: %s", e, exc_info=True)
+
+    def _reduce_push_limits(self) -> None:
+        """Halve push page sizes for all non-paged collectors after a timeout."""
+        for collector in self._collectors:
+            if not isinstance(collector, PagedCollector):
+                current = collector.get_push_limit()
+                reduced = max(10, current // 2)
+                if reduced != current:
+                    collector.set_push_limit(reduced)
+                    logger.warning(
+                        "PushTrigger: push_page_size for '%s' reduced %d → %d",
+                        collector.name, current, reduced,
+                    )
+
+    def _restore_push_limits(self) -> None:
+        """Gradually restore push page sizes toward configured defaults after success."""
+        for collector in self._collectors:
+            if not isinstance(collector, PagedCollector):
+                current = collector.get_push_limit()
+                default = getattr(getattr(collector, "_config", None), "push_page_size", 200)
+                if current < default:
+                    restored = min(default, current * 2)
+                    collector.set_push_limit(restored)
+                    logger.info(
+                        "PushTrigger: push_page_size for '%s' restored %d → %d",
+                        collector.name, current, restored,
+                    )

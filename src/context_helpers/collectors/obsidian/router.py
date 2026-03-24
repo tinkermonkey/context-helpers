@@ -22,6 +22,7 @@ def make_obsidian_router(collector: "ObsidianCollector") -> APIRouter:
 
         Matches the API contract expected by ObsidianHelperAdapter.
         """
-        return collector.fetch_notes(since=collector.resolve_since(since))
+        items = collector.fetch_notes(since=collector.resolve_push_since(since))
+        return collector.apply_push_paging(items, "modified_at")
 
     return router
