@@ -21,8 +21,10 @@ def make_health_router(collector: "HealthCollector") -> APIRouter:
     ) -> list[dict]:
         """Return workouts from Apple Health export."""
         try:
-            items = collector.fetch_workouts(since=collector.resolve_push_since(since), activity_type=type)
-            return collector.apply_push_paging(items, "startDate")
+            items = collector.fetch_workouts(
+                since=collector.resolve_push_since(since, "health_workouts"), activity_type=type
+            )
+            return collector.apply_push_paging(items, "startDate", "health_workouts")
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
 
@@ -32,8 +34,8 @@ def make_health_router(collector: "HealthCollector") -> APIRouter:
     ) -> list[dict]:
         """Return daily activity summaries (steps, calories, exercise, stand hours) from Apple Health export."""
         try:
-            items = collector.fetch_activity(since=collector.resolve_push_since(since))
-            return collector.apply_push_paging(items, "date")
+            items = collector.fetch_activity(since=collector.resolve_push_since(since, "health_activity"))
+            return collector.apply_push_paging(items, "date", "health_activity")
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
 
@@ -43,8 +45,8 @@ def make_health_router(collector: "HealthCollector") -> APIRouter:
     ) -> list[dict]:
         """Return daily sleep summaries (total, deep, REM, light minutes) from Apple Health export."""
         try:
-            items = collector.fetch_sleep(since=collector.resolve_push_since(since))
-            return collector.apply_push_paging(items, "date")
+            items = collector.fetch_sleep(since=collector.resolve_push_since(since, "health_sleep"))
+            return collector.apply_push_paging(items, "date", "health_sleep")
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
 
@@ -58,8 +60,8 @@ def make_health_router(collector: "HealthCollector") -> APIRouter:
         adapter groups these into hourly windows.
         """
         try:
-            items = collector.fetch_heart_rate(since=collector.resolve_push_since(since))
-            return collector.apply_push_paging(items, "timestamp")
+            items = collector.fetch_heart_rate(since=collector.resolve_push_since(since, "health_heart_rate"))
+            return collector.apply_push_paging(items, "timestamp", "health_heart_rate")
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
 
@@ -69,8 +71,8 @@ def make_health_router(collector: "HealthCollector") -> APIRouter:
     ) -> list[dict]:
         """Return daily SpO2 (blood oxygen) summaries from Apple Health export."""
         try:
-            items = collector.fetch_spo2(since=collector.resolve_push_since(since))
-            return collector.apply_push_paging(items, "date")
+            items = collector.fetch_spo2(since=collector.resolve_push_since(since, "health_spo2"))
+            return collector.apply_push_paging(items, "date", "health_spo2")
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
 
@@ -80,8 +82,8 @@ def make_health_router(collector: "HealthCollector") -> APIRouter:
     ) -> list[dict]:
         """Return mindfulness/meditation sessions from Apple Health export."""
         try:
-            items = collector.fetch_mindfulness(since=collector.resolve_push_since(since))
-            return collector.apply_push_paging(items, "startDate")
+            items = collector.fetch_mindfulness(since=collector.resolve_push_since(since, "health_mindfulness"))
+            return collector.apply_push_paging(items, "startDate", "health_mindfulness")
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
 

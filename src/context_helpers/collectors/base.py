@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_CURSORS_DIR = Path.home() / ".local" / "share" / "context-helpers" / "cursors"
+
 
 class BaseCollector(ABC):
     """Abstract base class for all data source collectors.
@@ -120,9 +122,14 @@ class BaseCollector(ABC):
     # Push paging — bounded delivery for non-paged collectors
     # ------------------------------------------------------------------
 
-    def get_push_cursor(self) -> "datetime | None":
-        """Return the per-collector push cursor, or None if not set."""
-        cursor_path = _CURSORS_DIR / f"{self.name}_push.json"
+    def get_push_cursor(self, cursor_key: "str | None" = None) -> "datetime | None":
+        """Return the push cursor for *cursor_key* (default: collector name).
+
+        Multi-endpoint collectors (health, Oura) should pass a unique key per
+        endpoint so each endpoint tracks its own delivery position independently.
+        """
+        key = cursor_key or self.name
+        cursor_path = _CURSORS_DIR / f"{key}_push.json"
         if not cursor_path.exists():
             return None
         try:
@@ -136,9 +143,10 @@ class BaseCollector(ABC):
         except (json.JSONDecodeError, OSError, ValueError):
             return None
 
-    def _save_push_cursor(self, ts: "datetime") -> None:
+    def _save_push_cursor(self, ts: "datetime", cursor_key: "str | None" = None) -> None:
+        key = cursor_key or self.name
         _CURSORS_DIR.mkdir(parents=True, exist_ok=True)
-        cursor_path = _CURSORS_DIR / f"{self.name}_push.json"
+        cursor_path = _CURSORS_DIR / f"{key}_push.json"
         tmp = cursor_path.with_suffix(".tmp")
         try:
             with open(tmp, "w") as f:
@@ -148,16 +156,19 @@ class BaseCollector(ABC):
         except OSError as e:
             logger.error("BaseCollector: failed to save push cursor for %s: %s", self.name, e)
 
-    def resolve_push_since(self, since: "str | None") -> "str | None":
-        """Like resolve_since(), but also advances past the per-collector push cursor.
+    def resolve_push_since(self, since: "str | None", cursor_key: "str | None" = None) -> "str | None":
+        """Like resolve_since(), but also advances past the per-endpoint push cursor.
 
         Returns the latest of: the explicit *since* arg, the delivery watermark,
-        and the push cursor.  This ensures each push cycle delivers only items
-        not yet seen by the library, even when the global watermark has not yet
-        advanced past what this collector already delivered.
+        and the push cursor for *cursor_key*.
+
+        Multi-endpoint collectors pass a unique *cursor_key* per endpoint so that
+        each endpoint's delivery position is tracked independently — e.g., a slow
+        heart_rate ingest won't be skipped because a fast mindfulness ingest wrote
+        a later timestamp to a shared cursor.
         """
         effective = self.resolve_since(since)
-        push_cur = self.get_push_cursor()
+        push_cur = self.get_push_cursor(cursor_key)
         if push_cur is None:
             return effective
         if effective is None:
@@ -182,18 +193,22 @@ class BaseCollector(ABC):
         self._push_limit_override = max(10, n)
 
     def has_push_more(self) -> bool:
-        """Return True if the last apply_push_paging() call had items beyond the limit."""
-        return getattr(self, "_has_push_more", False)
+        """Return True if any endpoint's last apply_push_paging() call hit the limit."""
+        return any(getattr(self, "_has_push_more_by_key", {}).values())
 
-    def apply_push_paging(self, items: "list[dict]", ts_field: str) -> "list[dict]":
+    def apply_push_paging(
+        self, items: "list[dict]", ts_field: str, cursor_key: "str | None" = None
+    ) -> "list[dict]":
         """Sort items by ts_field ASC, apply push limit, advance push cursor.
 
-        Mutates the has_push_more flag so the push trigger knows whether to
-        schedule an immediate follow-up delivery cycle.
+        Multi-endpoint collectors pass a unique *cursor_key* per endpoint so each
+        endpoint's delivery position is tracked independently (see resolve_push_since).
 
         Args:
             items: All matching items returned by the underlying fetch method.
             ts_field: The dict key that holds each item's ISO 8601 timestamp.
+            cursor_key: Cursor namespace; defaults to self.name.  Pass a unique
+                value for each endpoint when a single collector has multiple routes.
 
         Returns:
             The bounded page (at most get_push_limit() items, oldest first).
@@ -209,14 +224,14 @@ class BaseCollector(ABC):
                     dt = datetime.fromisoformat(max_ts_str.replace("Z", "+00:00"))
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=timezone.utc)
-                    self._save_push_cursor(dt)
+                    self._save_push_cursor(dt, cursor_key)
                 except ValueError:
                     pass
-        self._has_push_more = len(items) > limit
+        effective_key = cursor_key or self.name
+        if not hasattr(self, "_has_push_more_by_key"):
+            self._has_push_more_by_key: dict[str, bool] = {}
+        self._has_push_more_by_key[effective_key] = len(items) > limit
         return page
-
-
-_CURSORS_DIR = Path.home() / ".local" / "share" / "context-helpers" / "cursors"
 
 
 class PagedCollector(BaseCollector):
