@@ -183,13 +183,10 @@ class BaseCollector(ABC):
         if push_cur is not None:
             return push_cur.isoformat()
 
-        # No push cursor: caller's since is the best we have.
-        if since is not None:
-            return since
-
-        # Nothing to go on — return None so the collector's default lookback applies.
-        # Do NOT fall back to the global watermark: it reflects other collectors'
-        # delivery and would skip this endpoint's entire backlog on first delivery.
+        # No push cursor yet — return None so the collector uses its own default lookback.
+        # Do NOT use the caller's since (global watermark): it reflects other collectors'
+        # delivery and would skip this endpoint's entire backlog on first delivery,
+        # locking the collector into an empty-response loop indefinitely.
         return None
 
     def get_push_limit(self) -> int:
