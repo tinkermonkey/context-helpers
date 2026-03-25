@@ -120,8 +120,12 @@ class FilesystemCollector(PagedCollector):
         return False
 
     def has_changes_since(self, watermark: datetime | None) -> bool:
-        if watermark is None:
-            return True
+        # Compare against the collector's own delivery cursor, not the global watermark.
+        # The watermark reflects the last successful push cycle (often today's date), but
+        # the collector cursor tracks delivery position within the file tree — which may
+        # be years behind for a fresh ingest.  Using watermark here would return False for
+        # all historical files and stall the backlog indefinitely.
+        check_after = self.get_cursor()
         max_bytes = int(self._config.max_file_size_mb * 1024 * 1024)
         for path in self._walk_files():
             if self._should_skip_path(path):
@@ -132,7 +136,7 @@ class FilesystemCollector(PagedCollector):
                 stat = path.stat()
                 if stat.st_size > max_bytes:
                     continue
-                if datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc) > watermark:
+                if check_after is None or datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc) > check_after:
                     return True
             except OSError:
                 pass

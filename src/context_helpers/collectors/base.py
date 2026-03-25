@@ -331,6 +331,18 @@ class PagedCollector(BaseCollector):
                 logger.warning("PagedCollector: could not advance cursor for %s: %s", self.name, e)
         return items
 
+    def discard_stash(self) -> None:
+        """Discard any pre-filled stash without advancing the cursor.
+
+        Used when the caller (e.g. the library) drives pagination via its own
+        explicit cursor, making the helper's pre-filled stash irrelevant.
+        Clearing it prevents has_pending() from staying True indefinitely and
+        causing the push trigger to loop without delivering useful data.
+        """
+        with self._stash_lock:
+            self._stash = []
+            self._has_more = False
+
     def has_pending(self) -> bool:
         with self._stash_lock:
             return bool(self._stash)

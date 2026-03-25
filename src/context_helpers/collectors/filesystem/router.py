@@ -36,11 +36,21 @@ def _to_normalized_content(doc: dict) -> dict:
     }
 
 
-def _ndjson_stream(page_iter: Iterator[dict]) -> Iterator[str]:
+def _ndjson_stream(
+    page_iter: Iterator[dict],
+    collector: "FilesystemCollector",
+    fallback_cursor: "datetime | None",
+) -> Iterator[str]:
     """Consume iter_page() output and yield NDJSON lines.
 
     Content items are serialised as NormalizedContent-shaped objects.
     The final ``__meta__`` sentinel becomes the closing meta line.
+
+    After the meta line is yielded the helper cursor is advanced so that
+    restarts resume from the right position.  If iter_page found no files
+    (next_cursor is None), the fallback_cursor (the caller's source_ref) is
+    adopted — this prevents has_changes_since from looping forever when the
+    library is already past everything the helper has on disk.
     """
     for item in page_iter:
         if item.get("__meta__"):
@@ -48,6 +58,22 @@ def _ndjson_stream(page_iter: Iterator[dict]) -> Iterator[str]:
                 "has_more": item["has_more"],
                 "next_cursor": item["next_cursor"],
             }) + "\n"
+            # Advance helper cursor to keep it in sync with the library.
+            cursor_to_write: "datetime | None" = None
+            raw = item.get("next_cursor")
+            if raw:
+                try:
+                    cursor_to_write = datetime.fromisoformat(raw)
+                    if cursor_to_write.tzinfo is None:
+                        cursor_to_write = cursor_to_write.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    pass
+            if cursor_to_write is None:
+                cursor_to_write = fallback_cursor
+            if cursor_to_write is not None:
+                current = collector.get_cursor()
+                if current is None or cursor_to_write > current:
+                    collector._save_cursor(cursor_to_write)
             return
         yield _json.dumps(_to_normalized_content(item)) + "\n"
 
@@ -154,21 +180,42 @@ def make_filesystem_router(collector: "FilesystemCollector") -> APIRouter:
                 max_size_mb=body.max_size_mb,
             )
             return StreamingResponse(
-                _ndjson_stream(page_iter),
+                _ndjson_stream(page_iter, collector, after),
                 media_type="application/x-ndjson",
             )
 
-        # Non-streaming path: serve stash if available, otherwise fetch a new page
-        if collector.has_pending():
+        # Non-streaming path.
+        # If the caller provides an explicit cursor (source_ref), use it directly —
+        # the library is authoritative for its own pagination position, and the stash
+        # (filled by the push trigger from the helper's local cursor) may be at a
+        # different position.  Mixing the two would deliver data from the wrong offset.
+        # Only use the stash when no source_ref is given (push-trigger pre-fill flow).
+        if not body.source_ref and collector.has_pending():
             items = collector.consume_stash()
             has_more = collector.has_more()
         else:
+            # The library is driving with its own cursor — the push trigger's pre-filled
+            # stash (if any) was built from the helper's cursor and is now irrelevant.
+            # Discard it so has_pending() returns False on the next poll cycle and the
+            # push trigger doesn't loop indefinitely serving stale stash data.
+            collector.discard_stash()
             items, has_more = collector.fetch_page(
                 after=after,
                 limit=limit,
                 extensions=body.extensions,
                 max_size_mb=body.max_size_mb,
             )
+            # Persist cursor so the helper and library stay in sync — if the library
+            # resets its cursor, the helper can resume from the right position.
+            # If fetch_page returned nothing but the library supplied a cursor, adopt
+            # that cursor: the library is already past everything we have, and without
+            # writing it the helper cursor stays None → has_changes_since keeps
+            # returning True → push trigger fires forever with no useful work.
+            cursor_to_write = collector._page_cursor or after
+            if cursor_to_write is not None:
+                current = collector.get_cursor()
+                if current is None or cursor_to_write > current:
+                    collector._save_cursor(cursor_to_write)
 
         # Use the collector's page_cursor (which includes permanently-skipped file
         # timestamps) so the adapter's cursor always advances past skipped files,
