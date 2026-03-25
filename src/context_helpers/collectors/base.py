@@ -165,38 +165,31 @@ class BaseCollector(ABC):
         overridden by the watermark, permanently skipping historical data.
 
         Rules:
-        - Explicit *since* provided: max(since, push_cursor) — honour the caller's
-          request but never re-deliver what the push cursor already passed.
-        - No explicit *since*, push cursor exists: use push cursor directly.
-        - No push cursor: return None so the collector uses its own default lookback.
-          The global watermark reflects when OTHER collectors last delivered and must
-          not be used as a starting point for a collector with no delivery history —
-          that would skip all historical data and stall the collector permanently.
+        - Push cursor exists: always return it, regardless of *since*.
+          The push cursor is the authoritative per-endpoint delivery position.
+          Using max(since, push_cursor) would cause the global watermark (which
+          advances when ANY collector delivers) to silently skip backlog for stalled
+          endpoints — since global_watermark > push_cursor for any stalled collector.
+        - No push cursor, *since* provided: return *since* (caller drives).
+        - No push cursor, no *since*: return None so each collector uses its own
+          default lookback rather than a watermark from a different collector.
 
         Multi-endpoint collectors pass a unique *cursor_key* per endpoint so that
         each endpoint's delivery position is tracked independently.
         """
         push_cur = self.get_push_cursor(cursor_key)
 
-        if since is not None:
-            # Explicit since: respect it, but don't go behind the push cursor.
-            if push_cur is None:
-                return since
-            try:
-                dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return max(dt, push_cur).isoformat()
-            except ValueError:
-                return push_cur.isoformat()
-
-        # No explicit since — push cursor is authoritative; watermark is irrelevant.
+        # Push cursor is authoritative — ignore caller's since to clear backlog.
         if push_cur is not None:
             return push_cur.isoformat()
 
-        # No push cursor yet — return None so the collector's default lookback applies.
+        # No push cursor: caller's since is the best we have.
+        if since is not None:
+            return since
+
+        # Nothing to go on — return None so the collector's default lookback applies.
         # Do NOT fall back to the global watermark: it reflects other collectors'
-        # delivery and would skip this collector's entire backlog on first delivery.
+        # delivery and would skip this endpoint's entire backlog on first delivery.
         return None
 
     def get_push_limit(self) -> int:
