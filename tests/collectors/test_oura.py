@@ -344,20 +344,42 @@ class TestGetWith401Retry:
 # ---------------------------------------------------------------------------
 
 class TestHasChangesSince:
-    def test_true_when_watermark_is_none(self):
-        assert make_collector().has_changes_since(None) is True
+    # has_changes_since now checks per-endpoint push cursors independently of the
+    # global watermark. It returns True if any endpoint cursor is missing or from
+    # a previous day; False only when all eight cursors are set to today or later.
 
-    def test_true_when_watermark_is_yesterday(self):
+    def _stub_all_cursors(self, collector, monkeypatch, cursor_dt):
+        """Stub get_push_cursor to return cursor_dt for every key."""
+        monkeypatch.setattr(collector, "get_push_cursor", lambda key=None: cursor_dt)
+
+    def test_true_when_watermark_is_none(self, monkeypatch):
+        c = make_collector()
+        # No push cursors → True regardless of watermark
+        monkeypatch.setattr(c, "get_push_cursor", lambda key=None: None)
+        assert c.has_changes_since(None) is True
+
+    def test_true_when_any_cursor_is_missing(self, monkeypatch):
+        c = make_collector()
+        monkeypatch.setattr(c, "get_push_cursor", lambda key=None: None)
+        assert c.has_changes_since(datetime.now(timezone.utc)) is True
+
+    def test_true_when_any_cursor_is_yesterday(self, monkeypatch):
+        c = make_collector()
         yesterday = datetime.now(timezone.utc) - timedelta(days=1)
-        assert make_collector().has_changes_since(yesterday) is True
+        monkeypatch.setattr(c, "get_push_cursor", lambda key=None: yesterday)
+        assert c.has_changes_since(datetime.now(timezone.utc)) is True
 
-    def test_false_when_watermark_is_today(self):
-        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        assert make_collector().has_changes_since(today) is False
+    def test_false_when_all_cursors_are_today(self, monkeypatch):
+        today = datetime.now(timezone.utc)
+        c = make_collector()
+        self._stub_all_cursors(c, monkeypatch, today)
+        assert c.has_changes_since(today) is False
 
-    def test_false_when_watermark_is_future(self):
+    def test_false_when_all_cursors_are_future(self, monkeypatch):
         future = datetime.now(timezone.utc) + timedelta(days=1)
-        assert make_collector().has_changes_since(future) is False
+        c = make_collector()
+        self._stub_all_cursors(c, monkeypatch, future)
+        assert c.has_changes_since(datetime.now(timezone.utc)) is False
 
 
 # ---------------------------------------------------------------------------

@@ -168,7 +168,10 @@ class BaseCollector(ABC):
         - Explicit *since* provided: max(since, push_cursor) — honour the caller's
           request but never re-deliver what the push cursor already passed.
         - No explicit *since*, push cursor exists: use push cursor directly.
-        - No push cursor: fall back to watermark (via resolve_since).
+        - No push cursor: return None so the collector uses its own default lookback.
+          The global watermark reflects when OTHER collectors last delivered and must
+          not be used as a starting point for a collector with no delivery history —
+          that would skip all historical data and stall the collector permanently.
 
         Multi-endpoint collectors pass a unique *cursor_key* per endpoint so that
         each endpoint's delivery position is tracked independently.
@@ -191,8 +194,10 @@ class BaseCollector(ABC):
         if push_cur is not None:
             return push_cur.isoformat()
 
-        # No push cursor yet — fall back to watermark.
-        return self.resolve_since(None)
+        # No push cursor yet — return None so the collector's default lookback applies.
+        # Do NOT fall back to the global watermark: it reflects other collectors'
+        # delivery and would skip this collector's entire backlog on first delivery.
+        return None
 
     def get_push_limit(self) -> int:
         """Return the effective push page size for this collector."""

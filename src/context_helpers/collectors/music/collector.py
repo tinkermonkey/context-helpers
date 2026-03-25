@@ -114,7 +114,10 @@ class MusicCollector(BaseCollector):
             return ["osascript not available"]
 
     def has_changes_since(self, watermark: datetime | None) -> bool:
-        if watermark is None:
+        # Compare against the push cursor (where we left off delivering music),
+        # not the global watermark (which advances when any other collector delivers).
+        compare_against = self.get_push_cursor() or watermark
+        if compare_against is None:
             return True
         try:
             result = subprocess.run(
@@ -126,7 +129,7 @@ class MusicCollector(BaseCollector):
             max_dt = datetime.fromisoformat(result.stdout.strip().replace("Z", "+00:00"))
             if max_dt.tzinfo is None:
                 max_dt = max_dt.replace(tzinfo=timezone.utc)
-            return max_dt > watermark
+            return max_dt > compare_against
         except Exception:
             return True
 

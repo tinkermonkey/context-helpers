@@ -192,7 +192,10 @@ class RemindersCollector(PagedCollector):
     def has_changes_since(self, watermark: datetime | None) -> bool:
         if self.has_pending() or self.has_more():
             return True
-        if watermark is None:
+        # Compare against the PagedCollector cursor (where we left off delivering
+        # reminders), not the global watermark (which advances from other collectors).
+        compare_against = self.get_cursor() or watermark
+        if compare_against is None:
             return True
         try:
             db = self._get_db()
@@ -200,7 +203,7 @@ class RemindersCollector(PagedCollector):
                 row = conn.execute(_QUERY_MAX_MODIFIED).fetchone()
             if row and row[0]:
                 max_dt = _apple_ts_to_datetime(row[0])
-                return max_dt > watermark
+                return max_dt > compare_against
         except Exception:
             pass
         return True

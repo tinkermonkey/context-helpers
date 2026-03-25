@@ -327,37 +327,51 @@ class TestFetchPage:
 # ---------------------------------------------------------------------------
 
 class TestHasChangesSince:
-    def test_returns_true_when_has_pending(self, tmp_db):
+    # has_changes_since now compares against the PagedCollector cursor (get_cursor()),
+    # not the global watermark.  Tests stub get_cursor() → None so they exercise
+    # the watermark-fallback path without depending on real cursor files on disk.
+
+    def _no_cursor(self, collector, monkeypatch):
+        """Stub the PagedCollector cursor to None for test isolation."""
+        monkeypatch.setattr(collector, "get_cursor", lambda: None)
+
+    def test_returns_true_when_has_pending(self, tmp_db, monkeypatch):
         c = _collector()
         _patch_db(c, tmp_db)
+        self._no_cursor(c, monkeypatch)
         c._stash = [{"id": "x"}]
         assert c.has_changes_since(watermark=None) is True
 
-    def test_returns_true_when_has_more(self, tmp_db):
+    def test_returns_true_when_has_more(self, tmp_db, monkeypatch):
         c = _collector()
         _patch_db(c, tmp_db)
+        self._no_cursor(c, monkeypatch)
         c._has_more = True
         assert c.has_changes_since(watermark=None) is True
 
-    def test_returns_true_when_watermark_is_none(self, tmp_db):
+    def test_returns_true_when_watermark_is_none(self, tmp_db, monkeypatch):
         c = _collector()
         _patch_db(c, tmp_db)
+        self._no_cursor(c, monkeypatch)
         assert c.has_changes_since(watermark=None) is True
 
-    def test_returns_true_when_max_dt_exceeds_watermark(self, tmp_db):
+    def test_returns_true_when_max_dt_exceeds_watermark(self, tmp_db, monkeypatch):
         c = _collector()
         _patch_db(c, tmp_db)
+        self._no_cursor(c, monkeypatch)
         watermark = datetime(2026, 3, 6, tzinfo=timezone.utc)
         assert c.has_changes_since(watermark=watermark) is True
 
-    def test_returns_false_when_watermark_after_all_reminders(self, tmp_db):
+    def test_returns_false_when_watermark_after_all_reminders(self, tmp_db, monkeypatch):
         c = _collector()
         _patch_db(c, tmp_db)
+        self._no_cursor(c, monkeypatch)
         watermark = datetime(2026, 3, 10, tzinfo=timezone.utc)
         assert c.has_changes_since(watermark=watermark) is False
 
-    def test_returns_true_conservatively_on_db_failure(self):
+    def test_returns_true_conservatively_on_db_failure(self, monkeypatch):
         c = _collector()
+        self._no_cursor(c, monkeypatch)
         c._db_path = Path("/nonexistent/Data-FAKE.sqlite")
         watermark = datetime(2026, 3, 10, tzinfo=timezone.utc)
         assert c.has_changes_since(watermark=watermark) is True

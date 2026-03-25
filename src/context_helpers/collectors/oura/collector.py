@@ -101,14 +101,21 @@ class OuraCollector(BaseCollector):
         return []  # No macOS permissions needed
 
     def has_changes_since(self, watermark: datetime | None) -> bool:
-        """Return True if the watermark is from a previous day.
+        """Return True if any Oura endpoint has undelivered data.
 
-        Oura daily summaries update once after the ring syncs (typically morning).
-        No point polling more than once per day.
+        Checks each endpoint's push cursor independently: a missing cursor means
+        that endpoint has never delivered, and a cursor from a previous day means
+        new daily data may be available (Oura syncs once per day).
         """
-        if watermark is None:
-            return True
-        return watermark.date() < date.today()
+        today = date.today()
+        for key in (
+            "oura_sleep", "oura_readiness", "oura_activity", "oura_workouts",
+            "oura_heart_rate", "oura_spo2", "oura_tags", "oura_sessions",
+        ):
+            cursor = self.get_push_cursor(key)
+            if cursor is None or cursor.date() < today:
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Public fetch methods (called by router)

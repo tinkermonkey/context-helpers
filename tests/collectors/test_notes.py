@@ -88,12 +88,15 @@ class TestHasChangesSince:
         watermark = datetime(2000, 1, 1, tzinfo=timezone.utc)
         assert _collector(db).has_changes_since(watermark) is True
 
-    def test_returns_false_when_mtime_older_than_watermark(self, tmp_path):
+    def test_returns_false_when_mtime_older_than_watermark(self, tmp_path, monkeypatch):
         from datetime import datetime, timezone
         db = tmp_path / "NoteStore.sqlite"
         db.touch()
         watermark = datetime(2099, 1, 1, tzinfo=timezone.utc)
-        assert _collector(db).has_changes_since(watermark) is False
+        collector = _collector(db)
+        # Stub push cursor so the test is isolated from any real cursor files on disk.
+        monkeypatch.setattr(collector, "get_push_cursor", lambda key=None: None)
+        assert collector.has_changes_since(watermark) is False
 
 
 class TestFetchNotesErrors:

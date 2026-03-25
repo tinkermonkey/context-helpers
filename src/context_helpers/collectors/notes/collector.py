@@ -75,13 +75,16 @@ class NotesCollector(BaseCollector):
             return ["osascript not available"]
 
     def has_changes_since(self, watermark: datetime | None) -> bool:
-        if watermark is None:
+        # Compare against the push cursor (where we left off delivering notes),
+        # not the global watermark (which advances when any other collector delivers).
+        compare_against = self.get_push_cursor() or watermark
+        if compare_against is None:
             return True
         # NoteStore.sqlite mtime updates whenever a note is created/modified/deleted.
         # os.stat() works without Full Disk Access, so this is a cheap check.
         try:
             mtime = datetime.fromtimestamp(self._db_path.stat().st_mtime, tz=timezone.utc)
-            return mtime > watermark
+            return mtime > compare_against
         except OSError:
             return True  # conservative: can't stat, assume changed
 
