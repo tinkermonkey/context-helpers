@@ -122,6 +122,10 @@ class HealthCollector(BaseCollector):
     def watch_paths(self) -> list[Path]:
         return [self._watch_dir] if self._watch_dir.exists() else []
 
+    def push_cursor_keys(self) -> list[str]:
+        return ["health_workouts", "health_activity", "health_sleep",
+                "health_heart_rate", "health_spo2", "health_mindfulness"]
+
     def has_changes_since(self, watermark: datetime | None) -> bool:
         # Check two conditions independently:
         # 1. A new export file has arrived since the watermark (new data available).

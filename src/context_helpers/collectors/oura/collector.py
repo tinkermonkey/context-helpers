@@ -100,6 +100,10 @@ class OuraCollector(BaseCollector):
     def check_permissions(self) -> list[str]:
         return []  # No macOS permissions needed
 
+    def push_cursor_keys(self) -> list[str]:
+        return ["oura_sleep", "oura_readiness", "oura_activity", "oura_workouts",
+                "oura_heart_rate", "oura_spo2", "oura_tags", "oura_sessions"]
+
     def has_changes_since(self, watermark: datetime | None) -> bool:
         """Return True if any Oura endpoint has undelivered data.
 

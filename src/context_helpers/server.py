@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI
 
 from context_helpers.auth import make_auth_dependency
-from context_helpers.collectors.base import BaseCollector
+from context_helpers.collectors.base import BaseCollector, PagedCollector
 from context_helpers.config import AppConfig
 from context_helpers.state import StateStore
 
@@ -79,5 +79,62 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
 
         overall = "ok" if all(s["status"] == "ok" for s in statuses.values()) else "degraded"
         return {"status": overall, "collectors": statuses}
+
+    @app.get("/status", dependencies=[Depends(auth_dep)])
+    async def status() -> dict:
+        """Return per-collector delivery progress: cursors, backlog, and push state.
+
+        Unlike /health (which tests live connectivity), /status reads only
+        persisted cursor files and in-memory paging state — it is always fast.
+
+        Response shape per collector:
+
+        PagedCollectors (reminders, filesystem):
+            cursor      — page cursor: last item delivered in the current ingest cycle
+            has_pending — stash is loaded and waiting for next delivery
+            has_more    — last page hit the limit; more items remain
+
+        Single-endpoint collectors (imessage, notes, music, obsidian):
+            cursor      — push cursor: timestamp of last item delivered
+            has_more    — last push page hit the limit; more items remain
+
+        Multi-endpoint collectors (health, oura):
+            endpoints   — dict of endpoint name → cursor (null if never delivered)
+        """
+        watermark = state_store.get_watermark()
+
+        collector_statuses = {}
+        for collector in collectors:
+            info: dict = {}
+            cursor_keys = collector.push_cursor_keys()
+
+            if isinstance(collector, PagedCollector):
+                page_cursor = collector.get_cursor()
+                info["cursor"] = page_cursor.isoformat() if page_cursor else None
+                info["has_pending"] = collector.has_pending()
+                info["has_more"] = collector.has_more()
+
+            elif len(cursor_keys) > 1:
+                # Multi-endpoint: strip the collector-name prefix for display
+                prefix = collector.name + "_"
+                info["endpoints"] = {
+                    (k[len(prefix):] if k.startswith(prefix) else k): (
+                        c.isoformat() if (c := collector.get_push_cursor(k)) else None
+                    )
+                    for k in cursor_keys
+                }
+
+            else:
+                push_cursor = collector.get_push_cursor()
+                info["cursor"] = push_cursor.isoformat() if push_cursor else None
+                info["has_more"] = collector.has_push_more()
+
+            collector_statuses[collector.name] = info
+
+        return {
+            "status": "ok",
+            "watermark": watermark.isoformat() if watermark else None,
+            "collectors": collector_statuses,
+        }
 
     return app

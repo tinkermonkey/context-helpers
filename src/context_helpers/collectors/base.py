@@ -189,6 +189,15 @@ class BaseCollector(ABC):
         # locking the collector into an empty-response loop indefinitely.
         return None
 
+    def push_cursor_keys(self) -> "list[str]":
+        """Return the push cursor key(s) used by this collector.
+
+        Single-endpoint collectors return ``[self.name]`` (the default).
+        Multi-endpoint collectors (health, oura) override to return one key
+        per endpoint so each can be tracked and displayed independently.
+        """
+        return [self.name]
+
     def get_push_limit(self) -> int:
         """Return the effective push page size for this collector."""
         override = getattr(self, "_push_limit_override", None)
