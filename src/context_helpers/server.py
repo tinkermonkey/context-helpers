@@ -99,7 +99,9 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
             has_more    — last push page hit the limit; more items remain
 
         Multi-endpoint collectors (health, oura):
-            endpoints   — dict of endpoint name → cursor (null if never delivered)
+            endpoints   — dict of endpoint name →
+                            cursor   — timestamp of last item delivered (null if never)
+                            has_more — last push page for this endpoint hit the limit
         """
         watermark = state_store.get_watermark()
 
@@ -118,9 +120,10 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
                 # Multi-endpoint: strip the collector-name prefix for display
                 prefix = collector.name + "_"
                 info["endpoints"] = {
-                    (k[len(prefix):] if k.startswith(prefix) else k): (
-                        c.isoformat() if (c := collector.get_push_cursor(k)) else None
-                    )
+                    (k[len(prefix):] if k.startswith(prefix) else k): {
+                        "cursor": (c.isoformat() if (c := collector.get_push_cursor(k)) else None),
+                        "has_more": collector.has_push_more(k),
+                    }
                     for k in cursor_keys
                 }
 

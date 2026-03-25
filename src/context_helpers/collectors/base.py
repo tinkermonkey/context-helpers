@@ -210,9 +210,15 @@ class BaseCollector(ABC):
         """Override the push page size (used by the push trigger on timeout)."""
         self._push_limit_override = max(10, n)
 
-    def has_push_more(self) -> bool:
-        """Return True if any endpoint's last apply_push_paging() call hit the limit."""
-        return any(getattr(self, "_has_push_more_by_key", {}).values())
+    def has_push_more(self, cursor_key: "str | None" = None) -> bool:
+        """Return True if the last apply_push_paging() call hit the limit.
+
+        Pass *cursor_key* to check a specific endpoint; omit to check any endpoint.
+        """
+        by_key = getattr(self, "_has_push_more_by_key", {})
+        if cursor_key is not None:
+            return by_key.get(cursor_key, False)
+        return any(by_key.values())
 
     def apply_push_paging(
         self, items: "list[dict]", ts_field: str, cursor_key: "str | None" = None
