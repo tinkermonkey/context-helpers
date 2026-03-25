@@ -49,9 +49,13 @@ def install(config_path: Path | None = None) -> Path:
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     _LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Derive the context-helpers CLI script path from the Python executable.
+    # e.g. /path/to/.venv/bin/python3.12 → /path/to/.venv/bin/context-helpers
+    cli_executable = str(Path(sys.executable).parent / "context-helpers")
+
     template = Template(template_path.read_text())
     rendered = template.render(
-        python_executable=sys.executable,
+        cli_executable=cli_executable,
         log_dir=str(_LOG_DIR),
         config_path=str(config_path or _CONFIG_PATH),
     )
