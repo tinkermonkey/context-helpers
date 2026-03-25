@@ -112,10 +112,7 @@ class OuraCollector(BaseCollector):
         new daily data may be available (Oura syncs once per day).
         """
         today = date.today()
-        for key in (
-            "oura_sleep", "oura_readiness", "oura_activity", "oura_workouts",
-            "oura_heart_rate", "oura_spo2", "oura_tags", "oura_sessions",
-        ):
+        for key in self.push_cursor_keys():
             cursor = self.get_push_cursor(key)
             if cursor is None or cursor.date() < today:
                 return True

@@ -153,10 +153,7 @@ class HealthCollector(BaseCollector):
                 return True
 
             # Condition 2: any push cursor behind today (historical backlog remaining)
-            for key in (
-                "health_workouts", "health_activity", "health_sleep",
-                "health_heart_rate", "health_spo2", "health_mindfulness",
-            ):
+            for key in self.push_cursor_keys():
                 cursor = self.get_push_cursor(key)
                 if cursor is None or cursor.date() < now.date():
                     return True

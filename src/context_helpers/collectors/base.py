@@ -170,9 +170,10 @@ class BaseCollector(ABC):
           Using max(since, push_cursor) would cause the global watermark (which
           advances when ANY collector delivers) to silently skip backlog for stalled
           endpoints — since global_watermark > push_cursor for any stalled collector.
-        - No push cursor, *since* provided: return *since* (caller drives).
-        - No push cursor, no *since*: return None so each collector uses its own
-          default lookback rather than a watermark from a different collector.
+        - No push cursor: return None so each collector uses its own default lookback.
+          Do NOT return the caller's *since* (the global watermark): it reflects other
+          collectors' delivery and would skip this endpoint's entire backlog on first
+          delivery, locking it into an empty-response loop indefinitely.
 
         Multi-endpoint collectors pass a unique *cursor_key* per endpoint so that
         each endpoint's delivery position is tracked independently.
