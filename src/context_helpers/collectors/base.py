@@ -157,29 +157,42 @@ class BaseCollector(ABC):
             logger.error("BaseCollector: failed to save push cursor for %s: %s", self.name, e)
 
     def resolve_push_since(self, since: "str | None", cursor_key: "str | None" = None) -> "str | None":
-        """Like resolve_since(), but also advances past the per-endpoint push cursor.
+        """Return the lower-bound timestamp for a push-trigger delivery.
 
-        Returns the latest of: the explicit *since* arg, the delivery watermark,
-        and the push cursor for *cursor_key*.
+        The push cursor is the authoritative delivery position for each endpoint.
+        The global watermark reflects when OTHER collectors last delivered — using
+        max(watermark, push_cursor) would cause a behind push cursor to be
+        overridden by the watermark, permanently skipping historical data.
+
+        Rules:
+        - Explicit *since* provided: max(since, push_cursor) — honour the caller's
+          request but never re-deliver what the push cursor already passed.
+        - No explicit *since*, push cursor exists: use push cursor directly.
+        - No push cursor: fall back to watermark (via resolve_since).
 
         Multi-endpoint collectors pass a unique *cursor_key* per endpoint so that
-        each endpoint's delivery position is tracked independently — e.g., a slow
-        heart_rate ingest won't be skipped because a fast mindfulness ingest wrote
-        a later timestamp to a shared cursor.
+        each endpoint's delivery position is tracked independently.
         """
-        effective = self.resolve_since(since)
         push_cur = self.get_push_cursor(cursor_key)
-        if push_cur is None:
-            return effective
-        if effective is None:
+
+        if since is not None:
+            # Explicit since: respect it, but don't go behind the push cursor.
+            if push_cur is None:
+                return since
+            try:
+                dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return max(dt, push_cur).isoformat()
+            except ValueError:
+                return push_cur.isoformat()
+
+        # No explicit since — push cursor is authoritative; watermark is irrelevant.
+        if push_cur is not None:
             return push_cur.isoformat()
-        try:
-            dt = datetime.fromisoformat(effective.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return max(dt, push_cur).isoformat()
-        except ValueError:
-            return push_cur.isoformat()
+
+        # No push cursor yet — fall back to watermark.
+        return self.resolve_since(None)
 
     def get_push_limit(self) -> int:
         """Return the effective push page size for this collector."""

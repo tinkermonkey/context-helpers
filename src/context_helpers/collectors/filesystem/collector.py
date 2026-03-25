@@ -34,6 +34,13 @@ _KNOWN_BINARY_EXTENSIONS = {
     ".db", ".sqlite", ".sqlite3",
     ".pyc", ".class", ".o", ".a",
     ".ttf", ".otf", ".woff", ".woff2", ".eot",
+    # CAD / 3D / design source formats
+    ".dwg", ".dxf", ".blend", ".blend1", ".blend2", ".fbx", ".obj", ".stl",
+    ".sketch", ".fig", ".xd", ".psd", ".ai", ".indd",
+    # Font source formats
+    ".vfb", ".vfbak", ".ufo", ".glyphs", ".sfd",
+    # Backup / scratch files
+    ".bak", ".bak2", ".tmp", ".swp", ".swo", ".orig",
 }
 
 _STATE_DIR = Path.home() / ".local" / "share" / "context-helpers"

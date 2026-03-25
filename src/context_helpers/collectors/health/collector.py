@@ -123,8 +123,15 @@ class HealthCollector(BaseCollector):
         return [self._watch_dir] if self._watch_dir.exists() else []
 
     def has_changes_since(self, watermark: datetime | None) -> bool:
-        if watermark is None:
-            return True
+        # Check two conditions independently:
+        # 1. A new export file has arrived since the watermark (new data available).
+        # 2. Any per-endpoint push cursor is behind today — backlog not yet delivered.
+        #    Push cursors start at the date of first delivered item and advance with
+        #    each page; if any is behind today the historical data hasn't been fully
+        #    ingested yet.  We use today's date as a rough "end of data" proxy rather
+        #    than parsing the export, which is expensive.
+        now = datetime.now(timezone.utc)
+
         try:
             exports = sorted(
                 self._watch_dir.glob("export*.zip"),
@@ -133,10 +140,27 @@ class HealthCollector(BaseCollector):
             )
             if not exports:
                 return False
+
+            # Condition 1: new export
+            if watermark is None:
+                return True
             mtime = datetime.fromtimestamp(exports[0].stat().st_mtime, tz=timezone.utc)
-            return mtime > watermark
+            if mtime > watermark:
+                return True
+
+            # Condition 2: any push cursor behind today (historical backlog remaining)
+            for key in (
+                "health_workouts", "health_activity", "health_sleep",
+                "health_heart_rate", "health_spo2", "health_mindfulness",
+            ):
+                cursor = self.get_push_cursor(key)
+                if cursor is None or cursor.date() < now.date():
+                    return True
+
         except OSError:
             return True  # conservative
+
+        return False
 
     # ------------------------------------------------------------------
     # Cache management
