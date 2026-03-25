@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,6 +90,24 @@ class FilesystemCollector(PagedCollector):
             return [f"Read permission required for: {self._directory}"]
         return []
 
+    def _walk_files(self) -> Iterator[Path]:
+        """Yield all file paths under the configured directory.
+
+        Uses os.walk() with in-place directory pruning so skip-dirs and
+        hidden directories are never descended into — far faster than
+        rglob("*") on large trees (e.g. ~/Documents with 400K+ files in
+        hidden subdirectories).
+        """
+        for dirpath, dirnames, filenames in os.walk(self._directory):
+            # Prune in-place: os.walk will not descend into removed entries
+            dirnames[:] = [
+                d for d in dirnames
+                if not (d.startswith(".") or d in _SKIP_DIRS)
+            ]
+            dir_path = Path(dirpath)
+            for filename in filenames:
+                yield dir_path / filename
+
     def _should_skip_path(self, path: Path) -> bool:
         """Return True if this path should be excluded from scanning."""
         if any(part.startswith(".") or part in _SKIP_DIRS for part in path.parts):
@@ -104,8 +123,8 @@ class FilesystemCollector(PagedCollector):
         if watermark is None:
             return True
         max_bytes = int(self._config.max_file_size_mb * 1024 * 1024)
-        for path in self._directory.rglob("*"):
-            if not path.is_file() or self._should_skip_path(path):
+        for path in self._walk_files():
+            if self._should_skip_path(path):
                 continue
             if self._tracker.is_permanently_skipped(path):
                 continue
@@ -178,9 +197,7 @@ class FilesystemCollector(PagedCollector):
         override_exts = {e.lower() for e in extensions} if extensions else None
 
         candidates = []
-        for file_path in self._directory.rglob("*"):
-            if not file_path.is_file():
-                continue
+        for file_path in self._walk_files():
             ext = file_path.suffix.lower()
             if override_exts is not None:
                 if ext not in override_exts:
@@ -390,10 +407,7 @@ class FilesystemCollector(PagedCollector):
         max_bytes = int(effective_max_mb * 1024 * 1024)
         results = []
 
-        for file_path in self._directory.rglob("*"):
-            if not file_path.is_file():
-                continue
-
+        for file_path in self._walk_files():
             ext = file_path.suffix.lower()
             if override_exts is not None:
                 if ext not in override_exts:
