@@ -194,6 +194,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             filesystem=FilesystemConfig(**collectors_raw.get("filesystem", {})),
             obsidian=ObsidianConfig(**collectors_raw.get("obsidian", {})),
             oura=OuraConfig(**collectors_raw.get("oura", {})),
+            contacts=ContactsConfig(**collectors_raw.get("contacts", {})),
         ),
         push=PushConfig(**push_raw),
     )
