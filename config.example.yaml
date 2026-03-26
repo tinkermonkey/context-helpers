@@ -46,8 +46,14 @@ collectors:
     client_secret: ""
     access_token: ""   # initial access token (seed only)
     refresh_token: ""  # initial refresh token (seed only)
+    # initial_lookback_days: 365   # how far back to fetch on first delivery (no push cursor)
     # base_url: "https://api.ouraring.com/v2"      # override for testing only
     # token_url: "https://api.ouraring.com/oauth/token"  # override for testing only
+
+  contacts:
+    enabled: false
+    # No extra dependencies required — uses JXA (osascript) and Automation permission for Contacts.app.
+    # push_page_size: 200
 
 push:
   enabled: false

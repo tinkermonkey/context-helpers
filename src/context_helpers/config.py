@@ -106,6 +106,14 @@ class OuraConfig(BaseSettings):
     base_url: str = "https://api.ouraring.com/v2"  # overridable for testing
     token_url: str = "https://api.ouraring.com/oauth/token"  # overridable for testing
     push_page_size: int = 100    # max items per endpoint per push cycle
+    initial_lookback_days: int = 365  # how far back to fetch on first delivery (no push cursor)
+
+
+class ContactsConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    push_page_size: int = 200
 
 
 class PushConfig(BaseSettings):
@@ -128,6 +136,7 @@ class CollectorsConfig(BaseSettings):
     filesystem: FilesystemConfig = FilesystemConfig()
     obsidian: ObsidianConfig = ObsidianConfig()
     oura: OuraConfig = OuraConfig()
+    contacts: ContactsConfig = ContactsConfig()
 
 
 class AppConfig(BaseSettings):
