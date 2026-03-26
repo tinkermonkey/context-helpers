@@ -18,7 +18,7 @@ from context_helpers.config import OuraConfig
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_LOOKBACK_DAYS = 30
+_DEFAULT_LOOKBACK_DAYS = 365  # fallback only; config.initial_lookback_days takes precedence
 _TOKEN_STORE_PATH = Path.home() / ".local" / "share" / "context-helpers" / "oura_tokens.json"
 # Refresh when less than this many minutes remain on the access token.
 _EXPIRY_BUFFER_MINUTES = 5
@@ -297,7 +297,8 @@ class OuraCollector(BaseCollector):
             dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
             start = dt.strftime("%Y-%m-%dT%H:%M:%S")
         else:
-            start = (datetime.now(timezone.utc) - timedelta(days=_DEFAULT_LOOKBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+            lookback = getattr(self._config, "initial_lookback_days", _DEFAULT_LOOKBACK_DAYS)
+            start = (datetime.now(timezone.utc) - timedelta(days=lookback)).strftime("%Y-%m-%dT%H:%M:%S")
         return start, end
 
     def _date_range(self, since: str | None) -> tuple[str, str]:
@@ -307,7 +308,8 @@ class OuraCollector(BaseCollector):
             dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
             start = dt.date().isoformat()
         else:
-            start = (date.today() - timedelta(days=_DEFAULT_LOOKBACK_DAYS)).isoformat()
+            lookback = getattr(self._config, "initial_lookback_days", _DEFAULT_LOOKBACK_DAYS)
+            start = (date.today() - timedelta(days=lookback)).isoformat()
         return start, end
 
     # ------------------------------------------------------------------
