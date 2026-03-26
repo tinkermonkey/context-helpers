@@ -367,9 +367,11 @@ class OuraCollector(BaseCollector):
     @staticmethod
     def _format_spo2(item: dict) -> dict:
         spo2 = item.get("spo2_percentage") or {}
+        day = item.get("day")
         return {
             "id": item.get("id"),
-            "day": item.get("day"),
+            "day": day,
+            "timestamp": day,  # daily_spo2 has no full timestamp; use day as cursor field
             "average": spo2.get("average"),
             "breathing_disturbance_index": item.get("breathing_disturbance_index"),
         }
