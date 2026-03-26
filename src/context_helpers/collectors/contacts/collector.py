@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,29 +20,37 @@ logger = logging.getLogger(__name__)
 # Does not require Full Disk Access; stat() works with Automation permission.
 _ADDRESSBOOK_DIR = Path.home() / "Library" / "Application Support" / "AddressBook"
 
-# JXA script that fetches all contacts in a single osascript call.
-# Each person is wrapped in try/catch so a single bad record doesn't abort the run.
-# The `note` field may be empty/restricted on macOS 13+ — returns null gracefully.
+# Bulk-fetch scalar properties up front using JXA array-specifier form
+# (app.people.name(), etc.) — one Apple Events round-trip per property,
+# 8 total regardless of contact count. Emails/phones still need per-person
+# access (nested arrays), but use bulk .value() within each person.
 _JXA_FETCH_ALL = """\
 var app = Application('Contacts');
-var people = app.people();
-var results = [];
-for (var i = 0; i < people.length; i++) {
+var ids      = app.people.id();
+var names    = app.people.name();
+var firsts   = app.people.firstName();
+var lasts    = app.people.lastName();
+var orgs     = app.people.organization();
+var titles   = app.people.jobTitle();
+var notes    = app.people.note();
+var modDates = app.people.modificationDate();
+var results  = [];
+for (var i = 0; i < ids.length; i++) {
     try {
-        var p = people[i];
-        var emails = p.emails().map(function(e) { return e.value(); });
-        var phones = p.phones().map(function(ph) { return ph.value(); });
-        var modDate = p.modificationDate();
+        var person = app.people[i];
+        var emails = person.emails.value();
+        var phones = person.phones.value();
+        var modDate = modDates[i];
         results.push({
-            id: p.id(),
-            displayName: p.name() || '',
-            givenName: p.firstName() || null,
-            familyName: p.lastName() || null,
-            emails: emails,
-            phones: phones,
-            organization: p.organization() || null,
-            jobTitle: p.jobTitle() || null,
-            notes: p.note() || null,
+            id: ids[i] || '',
+            displayName: names[i] || '',
+            givenName: firsts[i] || null,
+            familyName: lasts[i] || null,
+            emails: emails || [],
+            phones: phones || [],
+            organization: orgs[i] || null,
+            jobTitle: titles[i] || null,
+            notes: notes[i] || null,
             modifiedAt: modDate ? modDate.toISOString() : null
         });
     } catch(e) {}
@@ -55,16 +64,22 @@ _JXA_COUNT = "JSON.stringify(Application('Contacts').people.length);"
 class ContactsCollector(BaseCollector):
     """Collects Apple Contacts via JXA (osascript).
 
-    Reads from Contacts.app using a single JXA subprocess call that returns
-    all contacts as JSON. Requires only Automation permission for Contacts.app
-    (granted on first use via macOS dialog) — no Full Disk Access needed.
+    Reads from Contacts.app using bulk JXA array-specifier calls — 8 Apple
+    Events round-trips total regardless of contact count, then per-person
+    only for nested email/phone arrays. Requires only Automation permission
+    for Contacts.app — no Full Disk Access needed.
 
-    Change detection uses os.stat() on the AddressBook directory, which updates
-    on any create/modify/delete without requiring additional permissions.
+    Results are cached in memory keyed on the AddressBook directory mtime.
+    Cache hits serve filtered results with zero JXA overhead. The cache is
+    invalidated automatically whenever a contact is created, modified, or
+    deleted (AddressBook mtime advances).
     """
 
     def __init__(self, config: ContactsConfig) -> None:
         self._config = config
+        self._cache: list[dict] = []
+        self._cache_mtime: float | None = None
+        self._cache_lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -123,14 +138,15 @@ class ContactsCollector(BaseCollector):
         """Watch AddressBook directory for FSEvents sub-second change detection."""
         return [_ADDRESSBOOK_DIR] if _ADDRESSBOOK_DIR.exists() else []
 
-    def fetch_contacts(self, since: str | None) -> list[dict]:
-        """Read all contacts from Contacts.app via JXA, filtered by modifiedAt.
+    def _current_mtime(self) -> float | None:
+        """Return AddressBook directory mtime, or None if inaccessible."""
+        try:
+            return _ADDRESSBOOK_DIR.stat().st_mtime
+        except OSError:
+            return None
 
-        Args:
-            since: Optional ISO 8601 timestamp; return only contacts modified after this
-
-        Returns:
-            List of contact dicts matching the API contract
+    def _fetch_all_jxa(self) -> list[dict]:
+        """Run the JXA script and return the raw contacts list.
 
         Raises:
             RuntimeError: If osascript fails or returns invalid JSON
@@ -141,14 +157,41 @@ class ContactsCollector(BaseCollector):
         )
         if result.returncode != 0:
             raise RuntimeError(f"JXA contacts fetch failed: {result.stderr.strip()}")
-
         try:
             contacts = json.loads(result.stdout.strip())
         except json.JSONDecodeError as e:
             raise RuntimeError(f"JXA returned invalid JSON: {e}") from e
-
         if not isinstance(contacts, list):
             raise RuntimeError(f"JXA returned unexpected type: {type(contacts).__name__}")
+        return contacts
+
+    def _get_cached(self) -> list[dict]:
+        """Return cached contacts, refreshing if AddressBook mtime has advanced."""
+        current_mtime = self._current_mtime()
+        with self._cache_lock:
+            if self._cache_mtime is not None and current_mtime == self._cache_mtime:
+                return self._cache
+        # Cache miss — fetch outside the lock to avoid blocking other threads
+        contacts = self._fetch_all_jxa()
+        with self._cache_lock:
+            self._cache = contacts
+            self._cache_mtime = current_mtime
+        logger.debug("ContactsCollector: cache refreshed (%d contacts)", len(contacts))
+        return contacts
+
+    def fetch_contacts(self, since: str | None) -> list[dict]:
+        """Return contacts from cache, filtered by modifiedAt > since.
+
+        Args:
+            since: Optional ISO 8601 timestamp; return only contacts modified after this
+
+        Returns:
+            List of contact dicts matching the API contract
+
+        Raises:
+            RuntimeError: If osascript fails or returns invalid JSON
+        """
+        contacts = self._get_cached()
 
         if since is None:
             return contacts

@@ -73,8 +73,10 @@ class TestCheckPermissions:
 # ---------------------------------------------------------------------------
 
 class TestHasChangesSince:
-    def test_returns_true_when_watermark_is_none(self):
-        assert _collector().has_changes_since(None) is True
+    def test_returns_true_when_watermark_is_none(self, monkeypatch):
+        collector = _collector()
+        monkeypatch.setattr(collector, "get_push_cursor", lambda key=None: None)
+        assert collector.has_changes_since(None) is True
 
     def test_returns_true_when_addressbook_dir_missing(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
@@ -138,38 +140,97 @@ SAMPLE_CONTACTS = [
 
 
 class TestFetchContacts:
-    def test_returns_all_contacts_when_no_since(self):
+    def test_returns_all_contacts_when_no_since(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
+        )
         with patch("subprocess.run", return_value=_osascript_ok(json.dumps(SAMPLE_CONTACTS))):
             results = _collector().fetch_contacts(since=None)
         assert len(results) == 2
 
-    def test_filters_by_since(self):
+    def test_filters_by_since(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
+        )
         with patch("subprocess.run", return_value=_osascript_ok(json.dumps(SAMPLE_CONTACTS))):
             # Only alice is after 2026-01-01
             results = _collector().fetch_contacts(since="2026-01-01T00:00:00Z")
         assert len(results) == 1
         assert results[0]["id"] == "abc-123"
 
-    def test_includes_contacts_with_null_modified_at(self):
+    def test_includes_contacts_with_null_modified_at(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
+        )
         contacts = [{"id": "x", "displayName": "X", "modifiedAt": None, "emails": [], "phones": []}]
         with patch("subprocess.run", return_value=_osascript_ok(json.dumps(contacts))):
             results = _collector().fetch_contacts(since="2026-01-01T00:00:00Z")
         assert len(results) == 1
 
-    def test_raises_on_osascript_failure(self):
+    def test_raises_on_osascript_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
+        )
         with patch("subprocess.run", return_value=_osascript_fail("JXA crash")):
             with pytest.raises(RuntimeError, match="JXA contacts fetch failed"):
                 _collector().fetch_contacts(since=None)
 
-    def test_raises_on_invalid_json(self):
+    def test_raises_on_invalid_json(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
+        )
         with patch("subprocess.run", return_value=_osascript_ok("not json")):
             with pytest.raises(RuntimeError, match="invalid JSON"):
                 _collector().fetch_contacts(since=None)
 
-    def test_raises_when_response_is_not_list(self):
+    def test_raises_when_response_is_not_list(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
+        )
         with patch("subprocess.run", return_value=_osascript_ok('{"key": "value"}')):
             with pytest.raises(RuntimeError, match="unexpected type"):
                 _collector().fetch_contacts(since=None)
+
+
+# ---------------------------------------------------------------------------
+# Cache behaviour
+# ---------------------------------------------------------------------------
+
+class TestCache:
+    def test_second_call_with_same_mtime_does_not_re_run_jxa(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
+        )
+        collector = _collector()
+        with patch("subprocess.run", return_value=_osascript_ok(json.dumps(SAMPLE_CONTACTS))) as mock_run:
+            collector.fetch_contacts(since=None)
+            collector.fetch_contacts(since=None)
+        # JXA should only have been called once (one cache miss, one cache hit)
+        assert mock_run.call_count == 1
+
+    def test_cache_invalidated_when_mtime_changes(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
+        )
+        collector = _collector()
+        with patch("subprocess.run", return_value=_osascript_ok(json.dumps(SAMPLE_CONTACTS))) as mock_run:
+            collector.fetch_contacts(since=None)
+            # Simulate mtime advancing by updating the directory
+            tmp_path.touch()
+            collector.fetch_contacts(since=None)
+        assert mock_run.call_count == 2
+
+    def test_cache_miss_when_addressbook_dir_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR",
+            tmp_path / "nonexistent",
+        )
+        collector = _collector()
+        with patch("subprocess.run", return_value=_osascript_ok(json.dumps(SAMPLE_CONTACTS))) as mock_run:
+            collector.fetch_contacts(since=None)
+            collector.fetch_contacts(since=None)
+        # mtime is always None (dir missing) so cache never warms — re-fetches each time
+        assert mock_run.call_count == 2
 
 
 # ---------------------------------------------------------------------------
