@@ -80,6 +80,14 @@ def _skip_if_unhealthy(collector_health: dict, collector_name: str) -> None:
         pytest.skip(f"{collector_name} not healthy: {msg}")
 
 
+def _skip_if_push_cursor_exists(collector_name: str) -> None:
+    """Skip a test that assumes no push cursor, since the cursor overrides 'since' filters."""
+    from pathlib import Path
+    cursor_path = Path.home() / ".local" / "share" / "context-helpers" / "cursors" / f"{collector_name}_push.json"
+    if cursor_path.exists():
+        pytest.skip(f"{collector_name} push cursor exists — 'since' is overridden by cursor position")
+
+
 def _assert_list_response(resp) -> list:
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
     data = resp.json()
@@ -190,6 +198,7 @@ class TestiMessage:
         _assert_fields(items[0], ["id", "text", "is_from_me", "timestamp", "thread_id", "recipients"])
 
     def test_since_far_future_returns_empty(self, client, auth):
+        _skip_if_push_cursor_exists("imessage")
         resp = client.get("/imessage/messages", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
         assert _assert_list_response(resp) == []
 
@@ -223,6 +232,7 @@ class TestNotes:
         _assert_fields(items[0], ["id", "title", "body_markdown", "folder", "modified_at"])
 
     def test_since_far_future_returns_empty(self, client, auth):
+        _skip_if_push_cursor_exists("notes")
         resp = client.get("/notes/notes", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
         assert _assert_list_response(resp) == []
 
@@ -257,6 +267,7 @@ class TestHealth_Workouts:
         _assert_fields(items[0], ["id", "activityType", "startDate", "endDate", "durationSeconds"])
 
     def test_since_far_future_returns_empty(self, client, auth):
+        _skip_if_push_cursor_exists("health_workouts")
         resp = client.get("/health/workouts", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
         assert _assert_list_response(resp) == []
 
@@ -291,6 +302,7 @@ class TestMusic:
         _assert_fields(items[0], ["id", "title", "played_at", "play_count"])
 
     def test_since_far_future_returns_empty(self, client, auth):
+        _skip_if_push_cursor_exists("music")
         resp = client.get("/music/tracks", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
         assert _assert_list_response(resp) == []
 
@@ -358,6 +370,7 @@ class TestObsidian:
         _assert_fields(items[0], ["source_id", "markdown", "modified_at", "tags", "wikilinks"])
 
     def test_since_far_future_returns_empty(self, client, auth):
+        _skip_if_push_cursor_exists("obsidian")
         resp = client.get("/obsidian/vault-notes", headers=auth, params={"since": "2099-01-01T00:00:00Z"})
         assert _assert_list_response(resp) == []
 

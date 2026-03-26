@@ -165,22 +165,30 @@ class BaseCollector(ABC):
         overridden by the watermark, permanently skipping historical data.
 
         Rules:
-        - Push cursor exists: always return it, regardless of *since*.
+        - since is absent/empty (direct API call or forced full export): return None
+          so the caller gets all data regardless of any existing push cursor.
+          Push-trigger calls always supply a non-empty since (the global watermark),
+          so this branch is only reached for explicit full-export requests.
+        - since is non-empty + push cursor exists: return push cursor.
           The push cursor is the authoritative per-endpoint delivery position.
           Using max(since, push_cursor) would cause the global watermark (which
           advances when ANY collector delivers) to silently skip backlog for stalled
           endpoints — since global_watermark > push_cursor for any stalled collector.
-        - No push cursor: return None so each collector uses its own default lookback.
-          Do NOT return the caller's *since* (the global watermark): it reflects other
-          collectors' delivery and would skip this endpoint's entire backlog on first
-          delivery, locking it into an empty-response loop indefinitely.
+        - since is non-empty + no push cursor: return None so each collector uses
+          its own default lookback.  Do NOT return the caller's since (the global
+          watermark): it reflects other collectors' delivery and would skip this
+          endpoint's entire backlog on first delivery.
 
         Multi-endpoint collectors pass a unique *cursor_key* per endpoint so that
         each endpoint's delivery position is tracked independently.
         """
+        # No since → caller wants a full export; honour it unconditionally.
+        if not since:
+            return None
+
         push_cur = self.get_push_cursor(cursor_key)
 
-        # Push cursor is authoritative — ignore caller's since to clear backlog.
+        # Push cursor is authoritative when caller provides a since (push-trigger path).
         if push_cur is not None:
             return push_cur.isoformat()
 
