@@ -114,4 +114,13 @@ def build_collector_registry(config: AppConfig) -> list[BaseCollector]:
         except ImportError as e:
             logger.warning("Skipping youtube collector (import error): %s", e)
 
+    if config.collectors.calendar.enabled:
+        try:
+            from context_helpers.collectors.calendar.collector import CalendarCollector
+
+            collectors.append(CalendarCollector(config.collectors.calendar))
+            logger.info("Registered collector: calendar")
+        except ImportError as e:
+            logger.warning("Skipping calendar collector (import error): %s", e)
+
     return collectors

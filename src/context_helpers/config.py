@@ -124,6 +124,16 @@ class YouTubeConfig(BaseSettings):
     push_page_size: int = 50    # max videos returned per push-trigger cycle
 
 
+class CalendarConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    db_path: str = "~/Library/Calendars/Calendar Cache"
+    past_days: int = 90     # initial-load lookback window
+    future_days: int = 60   # initial-load lookahead window
+    push_page_size: int = 200
+
+
 class PushConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
@@ -146,6 +156,7 @@ class CollectorsConfig(BaseSettings):
     oura: OuraConfig = OuraConfig()
     contacts: ContactsConfig = ContactsConfig()
     youtube: YouTubeConfig = YouTubeConfig()
+    calendar: CalendarConfig = CalendarConfig()
 
 
 class AppConfig(BaseSettings):
@@ -205,6 +216,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             oura=OuraConfig(**collectors_raw.get("oura", {})),
             contacts=ContactsConfig(**collectors_raw.get("contacts", {})),
             youtube=YouTubeConfig(**collectors_raw.get("youtube", {})),
+            calendar=CalendarConfig(**collectors_raw.get("calendar", {})),
         ),
         push=PushConfig(**push_raw),
     )
