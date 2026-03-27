@@ -72,6 +72,16 @@ def _apple_ts_to_date(ts: float | None) -> str | None:
     return _apple_ts_to_datetime(ts).date().isoformat()
 
 
+def _since_to_apple_ts(since: str | None) -> float | None:
+    """Parse an ISO 8601 since string to an Apple epoch float, or None."""
+    if not since:
+        return None
+    dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return _datetime_to_apple_ts(dt)
+
+
 # ---------------------------------------------------------------------------
 # SQL
 # ---------------------------------------------------------------------------
@@ -142,16 +152,29 @@ def _find_transcript_file(transcripts_dir: Path, identifier: str) -> Path | None
 
     Looks for <identifier>.json directly and one level deep in subdirectories.
     Returns the first match, or None.
+
+    Only returns paths that resolve within transcripts_dir to prevent any
+    path traversal if the database identifier contains ``../`` sequences.
     """
+    root = transcripts_dir.resolve()
+
+    def _safe(candidate: Path) -> Path | None:
+        try:
+            if candidate.resolve().is_relative_to(root) and candidate.exists():
+                return candidate
+        except OSError:
+            pass
+        return None
+
     direct = transcripts_dir / f"{identifier}.json"
-    if direct.exists():
+    if _safe(direct):
         return direct
     # Search one level of subdirectories (Apple may organise by show UUID)
     try:
         for sub in transcripts_dir.iterdir():
             if sub.is_dir():
                 candidate = sub / f"{identifier}.json"
-                if candidate.exists():
+                if _safe(candidate):
                     return candidate
     except OSError:
         pass
@@ -259,6 +282,11 @@ def _transcript_from_row(
     except OSError:
         created_at = datetime.now(tz=timezone.utc).isoformat()
 
+    # playStateTs mirrors the SQL filter column (ZPLAYSTATELASTMODIFIEDDATE) so
+    # the push cursor and the WHERE clause operate in the same time domain.
+    play_state_ts = row["play_state_ts"]
+    play_state_at = _apple_ts_to_iso(play_state_ts) if play_state_ts else created_at
+
     return {
         "id": row["episode_id"] or str(row["pk"]),
         "source": "podcasts",
@@ -269,6 +297,7 @@ def _transcript_from_row(
         "transcript": text,
         "transcriptSource": "apple",
         "transcriptCreatedAt": created_at,
+        "playStateTs": play_state_at,
         "durationSeconds": int(float(row["duration"] or 0)),
     }
 
@@ -395,12 +424,7 @@ class PodcastsCollector(BaseCollector):
         since=None  → all played episodes (full export).
         since=<ISO> → episodes whose play state changed after since.
         """
-        after_ts: float | None = None
-        if since:
-            dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            after_ts = _datetime_to_apple_ts(dt)
+        after_ts = _since_to_apple_ts(since)
 
         with self._open() as conn:
             conn.row_factory = sqlite3.Row
@@ -424,12 +448,7 @@ class PodcastsCollector(BaseCollector):
         since=None  → all available transcripts.
         since=<ISO> → transcripts for episodes whose play state changed after since.
         """
-        after_ts: float | None = None
-        if since:
-            dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            after_ts = _datetime_to_apple_ts(dt)
+        after_ts = _since_to_apple_ts(since)
 
         with self._open() as conn:
             conn.row_factory = sqlite3.Row

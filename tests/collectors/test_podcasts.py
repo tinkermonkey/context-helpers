@@ -397,7 +397,7 @@ class TestTranscriptContract:
         for field in (
             "id", "source", "showTitle", "episodeTitle", "episodeGuid",
             "publishedDate", "transcript", "transcriptSource",
-            "transcriptCreatedAt", "durationSeconds",
+            "transcriptCreatedAt", "playStateTs", "durationSeconds",
         ):
             assert field in item, f"Missing field: {field}"
 
@@ -475,6 +475,13 @@ class TestTranscriptHelpers:
         f = tmp_path / "t.json"
         f.write_text(json.dumps({"segments": []}))
         assert _parse_transcript_file(f) is None
+
+    def test_find_transcript_file_path_traversal_blocked(self, tmp_path):
+        # An identifier containing ../ must not escape the transcripts_dir.
+        outside = tmp_path.parent / "secret.json"
+        outside.write_text("{}")
+        result = _find_transcript_file(tmp_path, "../secret")
+        assert result is None
 
 
 # ---------------------------------------------------------------------------

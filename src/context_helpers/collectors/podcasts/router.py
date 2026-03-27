@@ -52,7 +52,7 @@ def make_podcasts_router(collector: "PodcastsCollector") -> APIRouter:
             since=collector.resolve_push_since(since, "podcasts_transcripts")
         )
         return collector.apply_push_paging(
-            items, "transcriptCreatedAt", "podcasts_transcripts"
+            items, "playStateTs", "podcasts_transcripts"
         )
 
     return router
