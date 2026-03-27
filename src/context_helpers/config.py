@@ -124,6 +124,25 @@ class YouTubeConfig(BaseSettings):
     push_page_size: int = 50    # max videos returned per push-trigger cycle
 
 
+class PodcastsConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    db_path: str = (
+        "~/Library/Group Containers/"
+        "243LU875E5.groups.com.apple.podcasts/Documents/MTLibrary.sqlite"
+    )
+    min_played_fraction: float = 0.9   # fraction of duration → completed
+    push_page_size: int = 200
+    # Transcript support
+    transcripts_dir: str = (
+        "~/Library/Group Containers/"
+        "243LU875E5.groups.com.apple.podcasts/Library/Caches"
+    )
+    auto_transcribe: bool = False   # future: trigger whisper.cpp on completed episodes
+    whisper_model: str = "base.en"  # future: whisper model name
+
+
 class CalendarConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
@@ -157,6 +176,7 @@ class CollectorsConfig(BaseSettings):
     contacts: ContactsConfig = ContactsConfig()
     youtube: YouTubeConfig = YouTubeConfig()
     calendar: CalendarConfig = CalendarConfig()
+    podcasts: PodcastsConfig = PodcastsConfig()
 
 
 class AppConfig(BaseSettings):
@@ -217,6 +237,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             contacts=ContactsConfig(**collectors_raw.get("contacts", {})),
             youtube=YouTubeConfig(**collectors_raw.get("youtube", {})),
             calendar=CalendarConfig(**collectors_raw.get("calendar", {})),
+            podcasts=PodcastsConfig(**collectors_raw.get("podcasts", {})),
         ),
         push=PushConfig(**push_raw),
     )
