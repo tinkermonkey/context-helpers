@@ -174,6 +174,19 @@ class BrowserHistoryConfig(BaseSettings):
     blocklist_domains: list[str] = []
 
 
+class LocationConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    knowledgec_db_path: str = "/private/var/db/CoreDuet/Knowledge/knowledgeC.db"
+    # Path where an external CLLocationManager helper writes the current location.
+    current_location_path: str = (
+        "~/.local/share/context-helpers/location_current.json"
+    )
+    lookback_days: int = 90     # initial-load lookback window (no push cursor)
+    push_page_size: int = 200
+
+
 class PushConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
@@ -199,6 +212,7 @@ class CollectorsConfig(BaseSettings):
     calendar: CalendarConfig = CalendarConfig()
     podcasts: PodcastsConfig = PodcastsConfig()
     browser_history: BrowserHistoryConfig = BrowserHistoryConfig()
+    location: LocationConfig = LocationConfig()
 
 
 class AppConfig(BaseSettings):
@@ -263,6 +277,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             browser_history=BrowserHistoryConfig(
                 **collectors_raw.get("browser_history", {})
             ),
+            location=LocationConfig(**collectors_raw.get("location", {})),
         ),
         push=PushConfig(**push_raw),
     )

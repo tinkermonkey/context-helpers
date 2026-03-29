@@ -145,4 +145,13 @@ def build_collector_registry(config: AppConfig) -> list[BaseCollector]:
         except ImportError as e:
             logger.warning("Skipping browser_history collector (import error): %s", e)
 
+    if config.collectors.location.enabled:
+        try:
+            from context_helpers.collectors.location.collector import LocationCollector
+
+            collectors.append(LocationCollector(config.collectors.location))
+            logger.info("Registered collector: location")
+        except ImportError as e:
+            logger.warning("Skipping location collector (import error): %s", e)
+
     return collectors
