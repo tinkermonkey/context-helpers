@@ -11,13 +11,18 @@ import pytest
 from context_helpers.collectors.podcasts.collector import (
     PodcastsCollector,
     _APPLE_EPOCH_OFFSET,
+    _MLX_WHISPER_AVAILABLE,
     _apple_ts_to_datetime,
     _apple_ts_to_date,
     _apple_ts_to_iso,
     _datetime_to_apple_ts,
     _find_transcript_file,
     _listen_event_from_row,
+    _mlx_repo_for_model,
     _parse_transcript_file,
+    _resolve_asset_url,
+    _transcribe_audio_file,
+    _write_whisper_transcript,
 )
 from context_helpers.config import PodcastsConfig
 
@@ -30,6 +35,10 @@ def _collector(**kwargs) -> PodcastsCollector:
     defaults = dict(enabled=True, push_page_size=200, min_played_fraction=0.9)
     defaults.update(kwargs)
     return PodcastsCollector(PodcastsConfig(**defaults))
+
+
+def _patch_whisper_dir(collector: PodcastsCollector, path: Path) -> None:
+    collector._whisper_transcripts_dir = path
 
 
 def _to_apple_ts(iso: str) -> float:
@@ -81,6 +90,11 @@ def tmp_db(tmp_path) -> Path:
                 ZTRANSCRIPTIDENTIFIER       VARCHAR,
                 ZENTITLEDTRANSCRIPTIDENTIFIER VARCHAR,
                 ZFREETRANSCRIPTIDENTIFIER   VARCHAR
+            );
+            CREATE TABLE ZMTASSET (
+                Z_PK      INTEGER PRIMARY KEY,
+                ZEPISODE  INTEGER,
+                ZASSETURL VARCHAR
             );
         """)
 
@@ -137,6 +151,11 @@ def tmp_db(tmp_path) -> Path:
             "NULL,?,0,0,?,NULL,NULL,NULL,'transcript-ghi')",
             (_to_apple_ts(_TS_MOD1), _to_apple_ts(_TS_PUB)),
         )
+
+        # ZMTASSET: ep-1 and ep-3 have downloaded audio; ep-2 does not.
+        # ep-5 has an Apple transcript so it should NOT be a whisper candidate.
+        conn.execute("INSERT INTO ZMTASSET VALUES (1, 1, '/fake/ep1.mp3')")
+        conn.execute("INSERT INTO ZMTASSET VALUES (2, 3, '/fake/ep3.mp3')")
 
         conn.commit()
 
@@ -672,3 +691,451 @@ class TestRouter:
         )
         assert resp.status_code == 200
         assert resp.json() == []
+
+# ---------------------------------------------------------------------------
+# Whisper pipeline: helpers
+# ---------------------------------------------------------------------------
+
+class TestWhisperHelpers:
+    def test_mlx_repo_known_model(self):
+        assert _mlx_repo_for_model("base.en") == "mlx-community/whisper-base.en-mlx"
+
+    def test_mlx_repo_large_v3(self):
+        assert _mlx_repo_for_model("large-v3") == "mlx-community/whisper-large-v3-mlx"
+
+    def test_mlx_repo_turbo_alias(self):
+        assert _mlx_repo_for_model("turbo") == "mlx-community/whisper-large-v3-turbo"
+
+    def test_mlx_repo_unknown_passthrough(self):
+        full = "mlx-community/whisper-custom-model"
+        assert _mlx_repo_for_model(full) == full
+
+    def test_resolve_asset_url_absolute_exists(self, tmp_path):
+        audio = tmp_path / "ep.mp3"
+        audio.write_bytes(b"fake")
+        assert _resolve_asset_url(str(audio), tmp_path) == audio
+
+    def test_resolve_asset_url_absolute_missing(self, tmp_path):
+        assert _resolve_asset_url(str(tmp_path / "nope.mp3"), tmp_path) is None
+
+    def test_resolve_asset_url_relative(self, tmp_path):
+        audio = tmp_path / "sub" / "ep.mp3"
+        audio.parent.mkdir()
+        audio.write_bytes(b"fake")
+        assert _resolve_asset_url("sub/ep.mp3", tmp_path) == audio
+
+    def test_resolve_asset_url_file_uri(self, tmp_path):
+        audio = tmp_path / "ep.mp3"
+        audio.write_bytes(b"fake")
+        uri = audio.as_uri()  # file:///...
+        assert _resolve_asset_url(uri, tmp_path) == audio
+
+    def test_resolve_asset_url_empty(self, tmp_path):
+        assert _resolve_asset_url("", tmp_path) is None
+
+    def test_transcribe_returns_none_when_unavailable(self, tmp_path):
+        audio = tmp_path / "ep.mp3"
+        audio.write_bytes(b"fake")
+        if _MLX_WHISPER_AVAILABLE:
+            pytest.skip("mlx-whisper is installed; skipping unavailable path")
+        result = _transcribe_audio_file(audio, "base.en")
+        assert result is None
+
+    def test_write_whisper_transcript_creates_file(self, tmp_path):
+        metadata = {
+            "id": "ep-guid",
+            "source": "podcasts",
+            "showTitle": "My Show",
+            "episodeTitle": "Episode 1",
+            "episodeGuid": "ep-guid",
+            "publishedDate": "2026-03-01",
+            "playStateTs": "2026-03-20T10:00:00+00:00",
+            "durationSeconds": 3600,
+        }
+        out = _write_whisper_transcript(tmp_path, "ep-guid", metadata, "Hello world.", "base.en")
+        assert out.exists()
+        data = json.loads(out.read_text())
+        assert data["transcript"] == "Hello world."
+        assert data["transcriptSource"] == "whisper"
+        assert data["whisperModel"] == "base.en"
+        assert data["showTitle"] == "My Show"
+
+    def test_write_whisper_transcript_atomic(self, tmp_path):
+        """No .tmp file left behind after a successful write."""
+        _write_whisper_transcript(tmp_path, "ep-x", {}, "text", "base.en")
+        assert not (tmp_path / "ep-x.tmp").exists()
+        assert (tmp_path / "ep-x.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Whisper pipeline: fetch_pending_rows
+# ---------------------------------------------------------------------------
+
+class TestFetchPendingRows:
+    def test_returns_completed_episodes_with_asset(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        rows = c._fetch_pending_rows(10)
+        ids = {r["episode_id"] for r in rows}
+        # ep-1 (ZHASBEENPLAYED=1, has asset) and ep-3 (above threshold, has asset)
+        assert "guid-1" in ids
+        assert "guid-3" in ids
+
+    def test_excludes_episodes_with_apple_transcript(self, tmp_db):
+        # ep-5 has ZTRANSCRIPTIDENTIFIER set — must be excluded
+        c = _collector()
+        _patch_db(c, tmp_db)
+        rows = c._fetch_pending_rows(10)
+        ids = {r["episode_id"] for r in rows}
+        assert "guid-5" not in ids
+
+    def test_excludes_episodes_without_asset(self, tmp_db):
+        # ep-2 has no ZMTASSET row
+        c = _collector()
+        _patch_db(c, tmp_db)
+        rows = c._fetch_pending_rows(10)
+        ids = {r["episode_id"] for r in rows}
+        assert "guid-2" not in ids
+
+    def test_respects_limit(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        rows = c._fetch_pending_rows(1)
+        assert len(rows) <= 1
+
+    def test_returns_empty_when_zmtasset_missing(self, tmp_path):
+        """Graceful degradation if the DB has no ZMTASSET table."""
+        db_path = tmp_path / "no_asset.sqlite"
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.executescript("""
+                CREATE TABLE ZMTPODCAST (Z_PK INTEGER PRIMARY KEY, ZTITLE VARCHAR, ZFEEDURL VARCHAR, ZUUID VARCHAR);
+                CREATE TABLE ZMTEPISODE (Z_PK INTEGER PRIMARY KEY, ZGUID VARCHAR, ZUUID VARCHAR,
+                    ZTITLE VARCHAR, ZPODCAST INTEGER, ZPLAYCOUNT INTEGER DEFAULT 0,
+                    ZPLAYHEAD FLOAT DEFAULT 0, ZDURATION FLOAT DEFAULT 0,
+                    ZLASTDATEPLAYED FLOAT, ZPLAYSTATELASTMODIFIEDDATE FLOAT,
+                    ZHASBEENPLAYED INTEGER DEFAULT 0, ZMARKASPLAYED INTEGER DEFAULT 0,
+                    ZPUBDATE FLOAT, ZENCLOSUREURL VARCHAR,
+                    ZTRANSCRIPTIDENTIFIER VARCHAR, ZENTITLEDTRANSCRIPTIDENTIFIER VARCHAR,
+                    ZFREETRANSCRIPTIDENTIFIER VARCHAR);
+            """)
+            conn.execute("INSERT INTO ZMTPODCAST VALUES (1,'Show','http://f.example','u1')")
+            conn.execute(
+                "INSERT INTO ZMTEPISODE VALUES (1,'g1','u1','Ep1',1,1,0,100,0,0,1,0,0,NULL,NULL,NULL,NULL)"
+            )
+        c = _collector()
+        _patch_db(c, db_path)
+        rows = c._fetch_pending_rows(10)
+        assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# Whisper pipeline: transcribe_pending
+# ---------------------------------------------------------------------------
+
+class TestTranscribePending:
+    def test_returns_zero_when_auto_transcribe_disabled(self, tmp_db, tmp_path):
+        c = _collector(auto_transcribe=False)
+        _patch_db(c, tmp_db)
+        _patch_whisper_dir(c, tmp_path / "whisper")
+        assert c.transcribe_pending() == 0
+
+    def test_returns_zero_when_mlx_unavailable(self, tmp_db, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._MLX_WHISPER_AVAILABLE", False
+        )
+        c = _collector(auto_transcribe=True)
+        _patch_db(c, tmp_db)
+        _patch_whisper_dir(c, tmp_path / "whisper")
+        assert c.transcribe_pending() == 0
+
+    def test_transcribes_eligible_episodes(self, tmp_db, tmp_path, monkeypatch):
+        # Mock the audio files to exist and mlx_whisper to return text
+        audio1 = tmp_path / "ep1.mp3"
+        audio1.write_bytes(b"fake-audio")
+        audio3 = tmp_path / "ep3.mp3"
+        audio3.write_bytes(b"fake-audio")
+
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._MLX_WHISPER_AVAILABLE", True
+        )
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._transcribe_audio_file",
+            lambda path, model: f"Transcript for {path.name}",
+        )
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._resolve_asset_url",
+            lambda url, base=None: audio1 if "ep1" in url else audio3,
+        )
+
+        whisper_dir = tmp_path / "whisper"
+        c = _collector(auto_transcribe=True)
+        _patch_db(c, tmp_db)
+        _patch_whisper_dir(c, whisper_dir)
+
+        count = c.transcribe_pending()
+        assert count == 2
+        assert (whisper_dir / "guid-1.json").exists()
+        assert (whisper_dir / "guid-3.json").exists()
+
+    def test_skips_already_transcribed(self, tmp_db, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._MLX_WHISPER_AVAILABLE", True
+        )
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._transcribe_audio_file",
+            lambda path, model: "Some text",
+        )
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._resolve_asset_url",
+            lambda url, base=None: tmp_path / "ep.mp3",
+        )
+        (tmp_path / "ep.mp3").write_bytes(b"audio")
+
+        whisper_dir = tmp_path / "whisper"
+        whisper_dir.mkdir()
+        # Pre-create transcript for guid-1
+        (whisper_dir / "guid-1.json").write_text('{"id":"guid-1"}')
+
+        c = _collector(auto_transcribe=True)
+        _patch_db(c, tmp_db)
+        _patch_whisper_dir(c, whisper_dir)
+
+        count = c.transcribe_pending()
+        # guid-1 skipped (exists), guid-3 transcribed
+        assert count == 1
+
+    def test_skips_when_audio_file_missing(self, tmp_db, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._MLX_WHISPER_AVAILABLE", True
+        )
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._resolve_asset_url",
+            lambda url, base=None: None,  # file not found
+        )
+
+        whisper_dir = tmp_path / "whisper"
+        c = _collector(auto_transcribe=True)
+        _patch_db(c, tmp_db)
+        _patch_whisper_dir(c, whisper_dir)
+
+        assert c.transcribe_pending() == 0
+
+    def test_respects_whisper_batch_size(self, tmp_db, tmp_path, monkeypatch):
+        audio = tmp_path / "ep.mp3"
+        audio.write_bytes(b"audio")
+
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._MLX_WHISPER_AVAILABLE", True
+        )
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._transcribe_audio_file",
+            lambda path, model: "text",
+        )
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._resolve_asset_url",
+            lambda url, base=None: audio,
+        )
+
+        whisper_dir = tmp_path / "whisper"
+        c = _collector(auto_transcribe=True, whisper_batch_size=1)
+        _patch_db(c, tmp_db)
+        _patch_whisper_dir(c, whisper_dir)
+
+        count = c.transcribe_pending()
+        assert count == 1
+
+    def test_written_file_has_correct_fields(self, tmp_db, tmp_path, monkeypatch):
+        audio = tmp_path / "ep.mp3"
+        audio.write_bytes(b"audio")
+
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._MLX_WHISPER_AVAILABLE", True
+        )
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._transcribe_audio_file",
+            lambda path, model: "Hello from whisper.",
+        )
+        monkeypatch.setattr(
+            "context_helpers.collectors.podcasts.collector._resolve_asset_url",
+            lambda url, base=None: audio,  # all episodes resolve to audio
+        )
+
+        whisper_dir = tmp_path / "whisper"
+        c = _collector(auto_transcribe=True, whisper_batch_size=1)
+        _patch_db(c, tmp_db)
+        _patch_whisper_dir(c, whisper_dir)
+
+        c.transcribe_pending()
+
+        # Find the written file (guid-1 or guid-3, whichever the DB returned first)
+        written = list(whisper_dir.glob("*.json"))
+        assert written
+        data = json.loads(written[0].read_text())
+
+        for field in ("id", "source", "showTitle", "episodeTitle", "episodeGuid",
+                      "publishedDate", "transcript", "transcriptSource",
+                      "transcriptCreatedAt", "playStateTs", "durationSeconds",
+                      "whisperModel"):
+            assert field in data, f"Missing field: {field}"
+
+        assert data["transcriptSource"] == "whisper"
+        assert data["transcript"] == "Hello from whisper."
+
+
+# ---------------------------------------------------------------------------
+# Whisper pipeline: fetch_transcripts merge
+# ---------------------------------------------------------------------------
+
+class TestFetchTranscriptsMerge:
+    def _make_whisper_file(self, directory: Path, episode_id: str, play_state_ts: str) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "id": episode_id,
+            "source": "podcasts",
+            "showTitle": "Whisper Show",
+            "episodeTitle": f"Episode {episode_id}",
+            "episodeGuid": episode_id,
+            "publishedDate": "2026-03-01",
+            "transcript": f"Whisper transcript for {episode_id}",
+            "transcriptSource": "whisper",
+            "transcriptCreatedAt": "2026-03-27T08:00:00+00:00",
+            "playStateTs": play_state_ts,
+            "durationSeconds": 3600,
+            "whisperModel": "base.en",
+        }
+        (directory / f"{episode_id}.json").write_text(json.dumps(payload))
+
+    def test_whisper_transcripts_included(self, tmp_db, transcripts_dir, tmp_path):
+        whisper_dir = tmp_path / "whisper"
+        # ep-8 is a whisper-only episode (not in Apple transcripts)
+        self._make_whisper_file(whisper_dir, "guid-8", _TS_MOD2)
+
+        c = _collector()
+        _patch_db(c, tmp_db)
+        c._transcripts_dir = transcripts_dir
+        _patch_whisper_dir(c, whisper_dir)
+
+        items = c.fetch_transcripts(since=None)
+        ids = {i["id"] for i in items}
+        assert "guid-8" in ids
+
+    def test_apple_wins_over_whisper_for_same_episode(self, tmp_db, transcripts_dir, tmp_path):
+        whisper_dir = tmp_path / "whisper"
+        # Also write a whisper file for guid-5 (which has an Apple transcript)
+        self._make_whisper_file(whisper_dir, "guid-5", _TS_MOD3)
+
+        c = _collector()
+        _patch_db(c, tmp_db)
+        c._transcripts_dir = transcripts_dir
+        _patch_whisper_dir(c, whisper_dir)
+
+        items = c.fetch_transcripts(since=None)
+        ep5 = next((i for i in items if i["id"] == "guid-5"), None)
+        assert ep5 is not None
+        assert ep5["transcriptSource"] == "apple"
+
+    def test_whisper_since_filter(self, tmp_db, transcripts_dir, tmp_path):
+        whisper_dir = tmp_path / "whisper"
+        # Old whisper transcript (before cutoff) and new one (after)
+        self._make_whisper_file(whisper_dir, "guid-old", _TS_MOD1)
+        self._make_whisper_file(whisper_dir, "guid-new", _TS_MOD3)
+
+        c = _collector()
+        _patch_db(c, tmp_db)
+        c._transcripts_dir = transcripts_dir
+        _patch_whisper_dir(c, whisper_dir)
+
+        items = c.fetch_transcripts(since=_TS_MOD2)
+        ids = {i["id"] for i in items}
+        assert "guid-old" not in ids
+        assert "guid-new" in ids
+
+    def test_no_whisper_dir_returns_apple_only(self, tmp_db, transcripts_dir, tmp_path):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        c._transcripts_dir = transcripts_dir
+        _patch_whisper_dir(c, tmp_path / "nonexistent_whisper")
+
+        items = c.fetch_transcripts(since=None)
+        assert all(i["transcriptSource"] == "apple" for i in items)
+
+    def test_merged_results_sorted_by_play_state_ts(self, tmp_db, transcripts_dir, tmp_path):
+        whisper_dir = tmp_path / "whisper"
+        self._make_whisper_file(whisper_dir, "guid-early", _TS_MOD1)
+
+        c = _collector()
+        _patch_db(c, tmp_db)
+        c._transcripts_dir = transcripts_dir
+        _patch_whisper_dir(c, whisper_dir)
+
+        items = c.fetch_transcripts(since=None)
+        play_states = [i["playStateTs"] for i in items]
+        assert play_states == sorted(play_states)
+
+
+# ---------------------------------------------------------------------------
+# Whisper pipeline: background thread
+# ---------------------------------------------------------------------------
+
+class TestStartTranscriptionBg:
+    def test_starts_thread_when_auto_transcribe_enabled(self, tmp_db, tmp_path, monkeypatch):
+        started = []
+
+        def fake_run():
+            started.append(True)
+
+        c = _collector(auto_transcribe=True)
+        _patch_db(c, tmp_db)
+        _patch_whisper_dir(c, tmp_path / "whisper")
+        monkeypatch.setattr(c, "_run_transcription_backfill", fake_run)
+
+        c._start_transcription_bg()
+        # Give thread time to start
+        if c._transcription_thread:
+            c._transcription_thread.join(timeout=2)
+        assert started
+
+    def test_does_not_start_second_thread_while_running(self, tmp_db, tmp_path):
+        import threading as _threading
+
+        barrier = _threading.Event()
+        stop = _threading.Event()
+
+        def slow_run():
+            barrier.set()
+            stop.wait(timeout=5)
+
+        c = _collector(auto_transcribe=True)
+        _patch_db(c, tmp_db)
+        _patch_whisper_dir(c, tmp_path / "whisper")
+        c._run_transcription_backfill = slow_run  # type: ignore[method-assign]
+
+        c._start_transcription_bg()
+        barrier.wait(timeout=2)  # first thread is running
+        first_thread = c._transcription_thread
+
+        c._start_transcription_bg()  # should be a no-op
+        assert c._transcription_thread is first_thread
+
+        stop.set()
+        if first_thread:
+            first_thread.join(timeout=2)
+
+
+# ---------------------------------------------------------------------------
+# has_changes_since with whisper dir
+# ---------------------------------------------------------------------------
+
+class TestHasChangesSinceWhisper:
+    def test_true_when_whisper_dir_mtime_newer(self, tmp_db, tmp_path, monkeypatch):
+        whisper_dir = tmp_path / "whisper"
+        whisper_dir.mkdir()
+
+        c = _collector()
+        _patch_db(c, tmp_db)
+        _patch_whisper_dir(c, whisper_dir)
+        # Cursor in the past so mtime check passes
+        old = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        monkeypatch.setattr(c, "get_push_cursor", lambda key=None: old)
+
+        assert c.has_changes_since(watermark=None) is True

@@ -21,8 +21,12 @@ Two sub-resources, each with an independent push cursor:
       be found in the configured transcripts_dir.  The text from all
       transcript segments is joined into a single string.
 
-      Whisper-based auto-transcription is scaffolded via config fields
-      (auto_transcribe, whisper_model) but not yet implemented.
+      When auto_transcribe=True and mlx-whisper is installed, completed
+      episodes with a local audio file but no Apple transcript are
+      transcribed using mlx-whisper in a background thread.  Results are
+      written to whisper_transcripts_dir as <episode_id>.json and merged
+      into the /podcasts/transcripts response with transcriptSource: "whisper".
+      Requires the `whisper` extra: pip install 'context-helpers[whisper]'.
 """
 
 from __future__ import annotations
@@ -31,6 +35,8 @@ import json
 import logging
 import os
 import sqlite3
+import threading
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +47,20 @@ from context_helpers.config import PodcastsConfig
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Optional mlx-whisper import (Mac Silicon only)
+# ---------------------------------------------------------------------------
+
+try:
+    import mlx_whisper as _mlx_whisper  # type: ignore[import-untyped]
+    _MLX_WHISPER_AVAILABLE = True
+except ImportError:
+    _MLX_WHISPER_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 _APPLE_EPOCH_OFFSET = 978307200  # seconds: 2001-01-01T00:00:00Z
 
 _PODCASTS_DIR = (
@@ -50,6 +70,29 @@ _PODCASTS_DIR = (
     / "243LU875E5.groups.com.apple.podcasts"
 )
 
+# mlx-community HuggingFace repos for common whisper model names.
+# Pass a full repo string (e.g. "mlx-community/whisper-large-v3-mlx") to
+# use a model not listed here.
+_MLX_REPO_MAP: dict[str, str] = {
+    "tiny":           "mlx-community/whisper-tiny-mlx",
+    "tiny.en":        "mlx-community/whisper-tiny.en-mlx",
+    "base":           "mlx-community/whisper-base-mlx",
+    "base.en":        "mlx-community/whisper-base.en-mlx",
+    "small":          "mlx-community/whisper-small-mlx",
+    "small.en":       "mlx-community/whisper-small.en-mlx",
+    "medium":         "mlx-community/whisper-medium-mlx",
+    "medium.en":      "mlx-community/whisper-medium.en-mlx",
+    "large":          "mlx-community/whisper-large-v2-mlx",
+    "large-v2":       "mlx-community/whisper-large-v2-mlx",
+    "large-v3":       "mlx-community/whisper-large-v3-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+    "turbo":          "mlx-community/whisper-large-v3-turbo",
+}
+
+
+# ---------------------------------------------------------------------------
+# Timestamp helpers
+# ---------------------------------------------------------------------------
 
 def _apple_ts_to_datetime(ts: float) -> datetime:
     return datetime.fromtimestamp(ts + _APPLE_EPOCH_OFFSET, tz=timezone.utc)
@@ -138,6 +181,38 @@ ORDER BY e.ZPLAYSTATELASTMODIFIEDDATE ASC
 LIMIT ?
 """
 
+# Completed episodes with a downloaded audio file but no Apple transcript.
+# These are candidates for whisper auto-transcription.
+_QUERY_PENDING_TRANSCRIPTION = """
+SELECT
+    e.Z_PK                        AS pk,
+    COALESCE(e.ZGUID, e.ZUUID)    AS episode_id,
+    e.ZGUID                       AS episode_guid,
+    e.ZTITLE                      AS episode_title,
+    e.ZDURATION                   AS duration,
+    e.ZPUBDATE                    AS pub_date_ts,
+    e.ZPLAYSTATELASTMODIFIEDDATE  AS play_state_ts,
+    e.ZPLAYHEAD                   AS play_head,
+    e.ZHASBEENPLAYED              AS has_been_played,
+    e.ZMARKASPLAYED               AS mark_as_played,
+    a.ZASSETURL                   AS asset_url,
+    p.ZTITLE                      AS show_title
+FROM ZMTEPISODE e
+JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
+JOIN ZMTASSET a ON a.ZEPISODE = e.Z_PK
+WHERE (
+    e.ZHASBEENPLAYED = 1
+    OR e.ZMARKASPLAYED = 1
+    OR (e.ZDURATION > 0 AND e.ZPLAYHEAD >= e.ZDURATION * ?)
+)
+  AND e.ZTRANSCRIPTIDENTIFIER IS NULL
+  AND e.ZENTITLEDTRANSCRIPTIDENTIFIER IS NULL
+  AND e.ZFREETRANSCRIPTIDENTIFIER IS NULL
+  AND a.ZASSETURL IS NOT NULL
+ORDER BY e.ZPLAYSTATELASTMODIFIEDDATE DESC
+LIMIT ?
+"""
+
 _QUERY_MAX_PLAY_STATE_TS = (
     "SELECT MAX(ZPLAYSTATELASTMODIFIEDDATE) FROM ZMTEPISODE"
 )
@@ -213,6 +288,99 @@ def _parse_transcript_file(path: Path) -> str | None:
     # Flat string fallback
     flat = data.get("transcript") or data.get("text")
     return str(flat).strip() if flat else None
+
+
+# ---------------------------------------------------------------------------
+# Whisper helpers
+# ---------------------------------------------------------------------------
+
+def _mlx_repo_for_model(model_name: str) -> str:
+    """Return the mlx-community HuggingFace repo for a short model name.
+
+    If model_name is not in the known map it is used as-is, allowing callers
+    to specify any full HuggingFace repo string (e.g.
+    "mlx-community/whisper-large-v3-mlx").
+    """
+    return _MLX_REPO_MAP.get(model_name, model_name)
+
+
+def _resolve_asset_url(asset_url: str, podcasts_dir: Path = _PODCASTS_DIR) -> Path | None:
+    """Resolve a ZMTASSET.ZASSETURL value to an absolute filesystem Path.
+
+    ZASSETURL can be:
+    - An absolute path       e.g. /Users/alice/Library/Group Containers/.../ep.mp3
+    - A file:// URI          e.g. file:///Users/alice/Library/...
+    - A relative path        e.g. Library/Cache/<uuid>/ep.mp3  (relative to podcasts_dir)
+
+    Returns None if the resolved path does not exist.
+    """
+    if not asset_url:
+        return None
+    if asset_url.startswith("file://"):
+        path = Path(urllib.parse.unquote(asset_url[len("file://"):]))
+    else:
+        path = Path(asset_url)
+
+    if path.is_absolute():
+        return path if path.exists() else None
+
+    # Relative: resolve against the Podcasts group container
+    candidate = podcasts_dir / path
+    return candidate if candidate.exists() else None
+
+
+def _transcribe_audio_file(audio_path: Path, model_name: str) -> str | None:
+    """Transcribe an audio file using mlx-whisper and return the full text.
+
+    Returns None if mlx-whisper is unavailable, the file is unreadable, or
+    transcription produces no text.
+    """
+    if not _MLX_WHISPER_AVAILABLE:
+        logger.warning(
+            "PodcastsCollector: auto_transcribe=True but mlx-whisper is not installed. "
+            "Install it with: pip install 'context-helpers[whisper]'"
+        )
+        return None
+
+    repo = _mlx_repo_for_model(model_name)
+    logger.debug("PodcastsCollector: transcribing %s with %s", audio_path.name, repo)
+    try:
+        result = _mlx_whisper.transcribe(str(audio_path), path_or_hf_repo=repo)
+        text = (result.get("text") or "").strip()
+        return text or None
+    except Exception as e:
+        logger.warning(
+            "PodcastsCollector: transcription failed for %s: %s", audio_path.name, e
+        )
+        return None
+
+
+def _write_whisper_transcript(
+    output_dir: Path,
+    episode_id: str,
+    metadata: dict,
+    text: str,
+    model_name: str,
+) -> Path:
+    """Write a whisper transcript JSON to output_dir/<episode_id>.json atomically.
+
+    The file format is compatible with the existing transcript contract so
+    fetch_transcripts() can serve it without conversion.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f"{episode_id}.json"
+    tmp_path = out_path.with_suffix(".tmp")
+    payload = {
+        **metadata,
+        "transcript": text,
+        "transcriptSource": "whisper",
+        "transcriptCreatedAt": datetime.now(tz=timezone.utc).isoformat(),
+        "whisperModel": model_name,
+    }
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    tmp_path.replace(out_path)
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -311,12 +479,21 @@ class PodcastsCollector(BaseCollector):
 
     Reads MTLibrary.sqlite from the Podcasts.app Group Container.
     No special permissions required.
+
+    When auto_transcribe=True (and mlx-whisper is installed), completed episodes
+    with a local audio file but no Apple transcript are transcribed in a
+    background thread (whisper_batch_size episodes per push cycle).
     """
 
     def __init__(self, config: PodcastsConfig) -> None:
         self._config = config
         self._db_path = Path(os.path.expanduser(config.db_path))
         self._transcripts_dir = Path(os.path.expanduser(config.transcripts_dir))
+        self._whisper_transcripts_dir = Path(
+            os.path.expanduser(config.whisper_transcripts_dir)
+        )
+        self._transcription_lock = threading.Lock()
+        self._transcription_thread: threading.Thread | None = None
 
     @property
     def name(self) -> str:
@@ -347,10 +524,13 @@ class PodcastsCollector(BaseCollector):
                     "SELECT COUNT(*) FROM ZMTEPISODE WHERE ZPLAYCOUNT > 0 OR ZHASBEENPLAYED = 1"
                 ).fetchone()
                 played = row2[0]
-            return {
-                "status": "ok",
-                "message": f"Podcasts accessible ({shows} shows, {played:,} played episodes)",
-            }
+            whisper_count = sum(
+                1 for _ in self._whisper_transcripts_dir.glob("*.json")
+            ) if self._whisper_transcripts_dir.exists() else 0
+            msg = f"Podcasts accessible ({shows} shows, {played:,} played episodes)"
+            if self._config.auto_transcribe:
+                msg += f"; {whisper_count} whisper transcripts"
+            return {"status": "ok", "message": msg}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
@@ -376,9 +556,15 @@ class PodcastsCollector(BaseCollector):
             paths.append(db_dir)
         if self._transcripts_dir.exists():
             paths.append(self._transcripts_dir)
+        if self._whisper_transcripts_dir.exists():
+            paths.append(self._whisper_transcripts_dir)
         return paths
 
     def has_changes_since(self, watermark: datetime | None) -> bool:
+        # Kick off background transcription whenever we poll and auto_transcribe is on.
+        if self._config.auto_transcribe:
+            self._start_transcription_bg()
+
         if self.has_push_more():
             return True
 
@@ -403,9 +589,23 @@ class PodcastsCollector(BaseCollector):
             mtime = datetime.fromtimestamp(
                 self._db_path.stat().st_mtime, tz=timezone.utc
             )
-            return mtime > compare_against
+            if mtime > compare_against:
+                return True
         except OSError:
             return True
+
+        # Also check the whisper transcripts dir for newly written files.
+        if self._whisper_transcripts_dir.exists():
+            try:
+                wt_mtime = datetime.fromtimestamp(
+                    self._whisper_transcripts_dir.stat().st_mtime, tz=timezone.utc
+                )
+                if wt_mtime > compare_against:
+                    return True
+            except OSError:
+                pass
+
+        return False
 
     # ------------------------------------------------------------------
     # Internal
@@ -439,15 +639,35 @@ class PodcastsCollector(BaseCollector):
         ]
 
     def fetch_transcripts(self, since: str | None) -> list[dict]:
-        """Return episode transcripts for Apple-provided transcript files.
+        """Return episode transcripts from Apple-provided files and whisper output.
 
-        Only episodes whose transcript file exists in transcripts_dir are
-        returned; episodes with a transcript identifier but no local file are
-        silently skipped.
+        Apple transcripts: episodes with a transcript identifier and a matching
+        JSON file in transcripts_dir.
+
+        Whisper transcripts: JSON files written to whisper_transcripts_dir by
+        transcribe_pending(). Only included when auto_transcribe=True or the
+        directory already exists with content.
+
+        When both sources have a transcript for the same episode, the Apple
+        transcript takes priority.
 
         since=None  → all available transcripts.
         since=<ISO> → transcripts for episodes whose play state changed after since.
         """
+        apple_items = self._fetch_apple_transcripts(since)
+        whisper_items = self._fetch_whisper_transcripts(since)
+
+        if not whisper_items:
+            return apple_items
+
+        # Merge: Apple takes priority for the same episode ID.
+        apple_ids = {i["id"] for i in apple_items}
+        merged = apple_items + [i for i in whisper_items if i["id"] not in apple_ids]
+        merged.sort(key=lambda x: x.get("playStateTs") or "")
+        return merged
+
+    def _fetch_apple_transcripts(self, since: str | None) -> list[dict]:
+        """Return Apple-provided transcript items filtered by since."""
         after_ts = _since_to_apple_ts(since)
 
         with self._open() as conn:
@@ -463,3 +683,167 @@ class PodcastsCollector(BaseCollector):
             if doc is not None:
                 results.append(doc)
         return results
+
+    def _fetch_whisper_transcripts(self, since: str | None) -> list[dict]:
+        """Return whisper transcript dicts from whisper_transcripts_dir.
+
+        Filters by playStateTs > since (ISO 8601 string comparison, safe because
+        both sides are always UTC ISO 8601 from the same source).
+        """
+        if not self._whisper_transcripts_dir.exists():
+            return []
+
+        after_iso = since or ""
+        results = []
+
+        try:
+            paths = list(self._whisper_transcripts_dir.glob("*.json"))
+        except OSError:
+            return []
+
+        for path in paths:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, json.JSONDecodeError) as e:
+                logger.debug("PodcastsCollector: failed to read whisper transcript %s: %s", path, e)
+                continue
+
+            play_state = data.get("playStateTs", "")
+            if after_iso and play_state and play_state <= after_iso:
+                continue
+
+            results.append(data)
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Whisper transcription pipeline
+    # ------------------------------------------------------------------
+
+    def transcribe_pending(self, max_episodes: int | None = None) -> int:
+        """Find and transcribe completed episodes that have no transcript yet.
+
+        Queries for completed episodes with a local audio file and no Apple
+        transcript.  Skips episodes already present in whisper_transcripts_dir.
+        Transcribes up to max_episodes (defaults to whisper_batch_size config).
+
+        Returns the count of episodes successfully transcribed.
+
+        This method is safe to call from any thread.  It is synchronous —
+        call _start_transcription_bg() for non-blocking execution.
+        """
+        if not self._config.auto_transcribe:
+            return 0
+
+        if not _MLX_WHISPER_AVAILABLE:
+            logger.warning(
+                "PodcastsCollector: auto_transcribe=True but mlx-whisper is not installed. "
+                "Run: pip install 'context-helpers[whisper]'"
+            )
+            return 0
+
+        limit = max_episodes if max_episodes is not None else self._config.whisper_batch_size
+        rows = self._fetch_pending_rows(limit)
+        if not rows:
+            return 0
+
+        model = self._config.whisper_model
+        count = 0
+
+        for row in rows:
+            episode_id = row["episode_id"] or str(row["pk"])
+
+            # Skip if already transcribed.
+            out_path = self._whisper_transcripts_dir / f"{episode_id}.json"
+            if out_path.exists():
+                continue
+
+            audio_path = _resolve_asset_url(str(row["asset_url"]), _PODCASTS_DIR)
+            if audio_path is None:
+                logger.debug(
+                    "PodcastsCollector: audio file not found for episode %s: %s",
+                    episode_id, row["asset_url"],
+                )
+                continue
+
+            logger.info(
+                "PodcastsCollector: transcribing '%s' (%s)",
+                row["episode_title"], audio_path.name,
+            )
+
+            text = _transcribe_audio_file(audio_path, model)
+            if not text:
+                continue
+
+            play_state_ts = row["play_state_ts"]
+            play_state_at = (
+                _apple_ts_to_iso(play_state_ts)
+                if play_state_ts
+                else datetime.now(tz=timezone.utc).isoformat()
+            )
+
+            metadata = {
+                "id": episode_id,
+                "source": "podcasts",
+                "showTitle": row["show_title"] or "",
+                "episodeTitle": row["episode_title"] or "",
+                "episodeGuid": row["episode_guid"] or "",
+                "publishedDate": _apple_ts_to_date(row["pub_date_ts"]),
+                "playStateTs": play_state_at,
+                "durationSeconds": int(float(row["duration"] or 0)),
+            }
+
+            _write_whisper_transcript(
+                self._whisper_transcripts_dir, episode_id, metadata, text, model
+            )
+            logger.info(
+                "PodcastsCollector: wrote whisper transcript for %s (%d chars)",
+                episode_id, len(text),
+            )
+            count += 1
+
+        return count
+
+    def _fetch_pending_rows(self, limit: int) -> list[sqlite3.Row]:
+        """Query for completed episodes eligible for whisper transcription."""
+        with self._open() as conn:
+            conn.row_factory = sqlite3.Row
+            try:
+                return conn.execute(
+                    _QUERY_PENDING_TRANSCRIPTION,
+                    (self._config.min_played_fraction, limit),
+                ).fetchall()
+            except sqlite3.OperationalError as e:
+                logger.warning(
+                    "PodcastsCollector: pending transcription query failed "
+                    "(ZMTASSET may not exist in this Podcasts version): %s", e
+                )
+                return []
+
+    def _start_transcription_bg(self) -> None:
+        """Start a background transcription thread if one is not already running."""
+        with self._transcription_lock:
+            if (
+                self._transcription_thread is not None
+                and self._transcription_thread.is_alive()
+            ):
+                return
+            t = threading.Thread(
+                target=self._run_transcription_backfill,
+                daemon=True,
+                name="podcasts-transcription",
+            )
+            self._transcription_thread = t
+            t.start()
+
+    def _run_transcription_backfill(self) -> None:
+        """Background thread: transcribe one batch of pending episodes."""
+        try:
+            count = self.transcribe_pending()
+            if count:
+                logger.info(
+                    "PodcastsCollector: background transcription finished, %d episodes", count
+                )
+        except Exception as e:
+            logger.error("PodcastsCollector: background transcription error: %s", e)

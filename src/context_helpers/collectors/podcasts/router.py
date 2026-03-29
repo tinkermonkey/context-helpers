@@ -39,14 +39,14 @@ def make_podcasts_router(collector: "PodcastsCollector") -> APIRouter:
             description="ISO 8601 timestamp; return transcripts for episodes modified after this",
         ),
     ) -> list[dict]:
-        """Return Apple-provided podcast episode transcripts.
+        """Return podcast episode transcripts from Apple and whisper sources.
 
-        Only episodes for which a transcript JSON file exists in the configured
-        transcripts_dir are returned.  Episodes with a transcript identifier but
-        no local file are silently skipped.
+        Apple transcripts: episodes with a transcript identifier and a matching
+        JSON file in transcripts_dir.
 
-        Whisper-based auto-transcription is not yet implemented; set
-        auto_transcribe: true in config to opt in when available.
+        Whisper transcripts: episodes transcribed by the background mlx-whisper
+        pipeline (requires auto_transcribe: true and the whisper extra).
+        Apple transcripts take priority when both exist for the same episode.
         """
         items = collector.fetch_transcripts(
             since=collector.resolve_push_since(since, "podcasts_transcripts")

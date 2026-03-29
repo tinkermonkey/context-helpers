@@ -22,9 +22,10 @@ obsidian  = ["obsidiantools", "python-frontmatter"]
 oura      = []          # stdlib only: urllib
 push      = ["watchdog"]
 youtube   = ["yt-dlp"]  # requires yt-dlp CLI on PATH; pip install yt-dlp
+whisper   = ["mlx-whisper"]  # Mac Silicon only; enables auto-transcription of podcast episodes
 
 # Convenience bundle
-all = ["healthkit-to-sqlite", "apple-notes-to-sqlite", "obsidiantools", "python-frontmatter", "watchdog", "yt-dlp"]
+all = ["healthkit-to-sqlite", "apple-notes-to-sqlite", "obsidiantools", "python-frontmatter", "watchdog", "yt-dlp", "mlx-whisper"]
 
 dev = [
     "pytest",

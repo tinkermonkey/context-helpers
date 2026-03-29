@@ -134,13 +134,18 @@ class PodcastsConfig(BaseSettings):
     )
     min_played_fraction: float = 0.9   # fraction of duration → completed
     push_page_size: int = 200
-    # Transcript support
+    # Transcript support — Apple-provided transcripts
     transcripts_dir: str = (
         "~/Library/Group Containers/"
         "243LU875E5.groups.com.apple.podcasts/Library/Caches"
     )
-    auto_transcribe: bool = False   # future: trigger whisper.cpp on completed episodes
-    whisper_model: str = "base.en"  # future: whisper model name
+    # Whisper auto-transcription (requires mlx-whisper extra)
+    auto_transcribe: bool = False
+    whisper_model: str = "base.en"   # short name or full mlx-community HuggingFace repo
+    whisper_transcripts_dir: str = (
+        "~/.local/share/context-helpers/podcast_transcripts"
+    )
+    whisper_batch_size: int = 5      # max episodes transcribed per push cycle
 
 
 class CalendarConfig(BaseSettings):
