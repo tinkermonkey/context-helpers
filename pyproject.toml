@@ -41,6 +41,7 @@ dev = [
     "obsidiantools",
     "python-frontmatter",
     "watchdog",
+    "yt-dlp",
 ]
 
 [project.scripts]

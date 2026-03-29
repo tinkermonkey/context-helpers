@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic_settings import BaseSettings
@@ -120,7 +120,7 @@ class YouTubeConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
     enabled: bool = False
-    browser: str = "safari"     # safari | chrome | firefox | chromium
+    browser: Literal["safari", "chrome", "firefox", "chromium", "brave", "opera", "edge"] = "safari"
     push_page_size: int = 50    # max videos returned per push-trigger cycle
 
 

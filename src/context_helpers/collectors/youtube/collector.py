@@ -134,7 +134,16 @@ class YouTubeCollector(BaseCollector):
                 continue
 
             watched_at = self._seen.get(vid, now_iso)
-            watched_dt = datetime.fromisoformat(watched_at.replace("Z", "+00:00"))
+            try:
+                watched_dt = datetime.fromisoformat(watched_at.replace("Z", "+00:00"))
+            except ValueError:
+                logger.warning(
+                    "Seen-cache has invalid timestamp for video %s (%r); resetting to now",
+                    vid, watched_at,
+                )
+                self._seen[vid] = now_iso
+                watched_at = now_iso
+                watched_dt = datetime.fromisoformat(now_iso)
             if watched_dt.tzinfo is None:
                 watched_dt = watched_dt.replace(tzinfo=timezone.utc)
             if since_dt is not None and watched_dt <= since_dt:
