@@ -179,6 +179,15 @@ class BrowserHistoryConfig(BaseSettings):
     blocklist_domains: list[str] = []
 
 
+class ScreenTimeConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    knowledgec_db_path: str = "/private/var/db/CoreDuet/Knowledge/knowledgeC.db"
+    lookback_days: int = 30    # initial-load lookback window
+    push_page_size: int = 200
+
+
 class LocationConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
@@ -217,6 +226,7 @@ class CollectorsConfig(BaseSettings):
     calendar: CalendarConfig = CalendarConfig()
     podcasts: PodcastsConfig = PodcastsConfig()
     browser_history: BrowserHistoryConfig = BrowserHistoryConfig()
+    screentime: ScreenTimeConfig = ScreenTimeConfig()
     location: LocationConfig = LocationConfig()
 
 
@@ -282,6 +292,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             browser_history=BrowserHistoryConfig(
                 **collectors_raw.get("browser_history", {})
             ),
+            screentime=ScreenTimeConfig(**collectors_raw.get("screentime", {})),
             location=LocationConfig(**collectors_raw.get("location", {})),
         ),
         push=PushConfig(**push_raw),

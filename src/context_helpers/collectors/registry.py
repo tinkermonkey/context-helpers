@@ -145,6 +145,15 @@ def build_collector_registry(config: AppConfig) -> list[BaseCollector]:
         except ImportError as e:
             logger.warning("Skipping browser_history collector (import error): %s", e)
 
+    if config.collectors.screentime.enabled:
+        try:
+            from context_helpers.collectors.screentime.collector import ScreenTimeCollector
+
+            collectors.append(ScreenTimeCollector(config.collectors.screentime))
+            logger.info("Registered collector: screentime")
+        except ImportError as e:
+            logger.warning("Skipping screentime collector (import error): %s", e)
+
     if config.collectors.location.enabled:
         try:
             from context_helpers.collectors.location.collector import LocationCollector
