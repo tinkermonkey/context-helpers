@@ -766,6 +766,26 @@ class TestWhisperHelpers:
         assert not (tmp_path / "ep-x.tmp").exists()
         assert (tmp_path / "ep-x.json").exists()
 
+    def test_write_whisper_transcript_path_traversal_sanitized(self, tmp_path):
+        """episode_id with path traversal sequences must not escape output_dir."""
+        evil_id = "../../etc/passwd"
+        out = _write_whisper_transcript(tmp_path, evil_id, {}, "text", "base.en")
+        # File must land inside tmp_path, not outside it.
+        assert out.parent == tmp_path
+        assert out.name.endswith(".json")
+        assert ".." not in out.name
+
+    def test_write_whisper_transcript_tmp_cleaned_on_failure(self, tmp_path):
+        """If json.dump raises, the .tmp file is removed."""
+        import unittest.mock as mock
+
+        with mock.patch("json.dump", side_effect=OSError("disk full")):
+            with pytest.raises(OSError, match="disk full"):
+                _write_whisper_transcript(tmp_path, "ep-fail", {}, "text", "base.en")
+
+        # No .tmp left behind.
+        assert not list(tmp_path.glob("*.tmp"))
+
 
 # ---------------------------------------------------------------------------
 # Whisper pipeline: fetch_pending_rows

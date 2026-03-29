@@ -368,7 +368,9 @@ def _write_whisper_transcript(
     fetch_transcripts() can serve it without conversion.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"{episode_id}.json"
+    # Sanitize episode_id to prevent path traversal (DB value used as filename).
+    safe_id = Path(episode_id).name.replace("..", "")
+    out_path = output_dir / f"{safe_id}.json"
     tmp_path = out_path.with_suffix(".tmp")
     payload = {
         **metadata,
@@ -377,9 +379,13 @@ def _write_whisper_transcript(
         "transcriptCreatedAt": datetime.now(tz=timezone.utc).isoformat(),
         "whisperModel": model_name,
     }
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
-    tmp_path.replace(out_path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        tmp_path.replace(out_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return out_path
 
 
@@ -530,6 +536,13 @@ class PodcastsCollector(BaseCollector):
             msg = f"Podcasts accessible ({shows} shows, {played:,} played episodes)"
             if self._config.auto_transcribe:
                 msg += f"; {whisper_count} whisper transcripts"
+                if self._whisper_transcripts_dir.exists() and not os.access(
+                    self._whisper_transcripts_dir, os.W_OK
+                ):
+                    return {
+                        "status": "error",
+                        "message": f"whisper_transcripts_dir is not writable: {self._whisper_transcripts_dir}",
+                    }
             return {"status": "ok", "message": msg}
         except Exception as e:
             return {"status": "error", "message": str(e)}
