@@ -153,6 +153,27 @@ class CalendarConfig(BaseSettings):
     push_page_size: int = 200
 
 
+class BrowserHistoryConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    safari_enabled: bool = True
+    firefox_enabled: bool = True
+    chrome_enabled: bool = True
+    push_page_size: int = 200
+    # Optional explicit DB paths; defaults cover standard install locations.
+    # For Chromium-based alternatives (Brave, Chromium, Edge) override
+    # chrome_history_path with the appropriate profile History file.
+    safari_db_path: str = "~/Library/Safari/History.db"
+    firefox_profile_path: str = ""  # auto-detected from profiles.ini when empty
+    chrome_history_path: str = (
+        "~/Library/Application Support/Google/Chrome/Default/History"
+    )
+    # Domains to exclude (e.g. ["localhost", "internal.company.com"]).
+    # URL schemes for internal browser pages are always blocked regardless.
+    blocklist_domains: list[str] = []
+
+
 class PushConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
@@ -177,6 +198,7 @@ class CollectorsConfig(BaseSettings):
     youtube: YouTubeConfig = YouTubeConfig()
     calendar: CalendarConfig = CalendarConfig()
     podcasts: PodcastsConfig = PodcastsConfig()
+    browser_history: BrowserHistoryConfig = BrowserHistoryConfig()
 
 
 class AppConfig(BaseSettings):
@@ -238,6 +260,9 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             youtube=YouTubeConfig(**collectors_raw.get("youtube", {})),
             calendar=CalendarConfig(**collectors_raw.get("calendar", {})),
             podcasts=PodcastsConfig(**collectors_raw.get("podcasts", {})),
+            browser_history=BrowserHistoryConfig(
+                **collectors_raw.get("browser_history", {})
+            ),
         ),
         push=PushConfig(**push_raw),
     )

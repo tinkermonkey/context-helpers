@@ -132,4 +132,17 @@ def build_collector_registry(config: AppConfig) -> list[BaseCollector]:
         except ImportError as e:
             logger.warning("Skipping calendar collector (import error): %s", e)
 
+    if config.collectors.browser_history.enabled:
+        try:
+            from context_helpers.collectors.browser_history.collector import (
+                BrowserHistoryCollector,
+            )
+
+            collectors.append(
+                BrowserHistoryCollector(config.collectors.browser_history)
+            )
+            logger.info("Registered collector: browser_history")
+        except ImportError as e:
+            logger.warning("Skipping browser_history collector (import error): %s", e)
+
     return collectors
