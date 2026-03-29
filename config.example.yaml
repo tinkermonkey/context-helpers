@@ -55,6 +55,11 @@ collectors:
     # No extra dependencies required — uses JXA (osascript) and Automation permission for Contacts.app.
     # push_page_size: 200
 
+  youtube:
+    enabled: false
+    browser: safari             # Browser whose cookies yt-dlp reads: safari | chrome | firefox | chromium
+    # push_page_size: 50        # Max videos returned per push-trigger cycle
+
 push:
   enabled: false
   library_url: "http://server-ip:8000"  # URL of context-library server

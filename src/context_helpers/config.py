@@ -116,6 +116,14 @@ class ContactsConfig(BaseSettings):
     push_page_size: int = 200
 
 
+class YouTubeConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    browser: str = "safari"     # safari | chrome | firefox | chromium
+    push_page_size: int = 50    # max videos returned per push-trigger cycle
+
+
 class PushConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
@@ -137,6 +145,7 @@ class CollectorsConfig(BaseSettings):
     obsidian: ObsidianConfig = ObsidianConfig()
     oura: OuraConfig = OuraConfig()
     contacts: ContactsConfig = ContactsConfig()
+    youtube: YouTubeConfig = YouTubeConfig()
 
 
 class AppConfig(BaseSettings):
@@ -195,6 +204,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             obsidian=ObsidianConfig(**collectors_raw.get("obsidian", {})),
             oura=OuraConfig(**collectors_raw.get("oura", {})),
             contacts=ContactsConfig(**collectors_raw.get("contacts", {})),
+            youtube=YouTubeConfig(**collectors_raw.get("youtube", {})),
         ),
         push=PushConfig(**push_raw),
     )

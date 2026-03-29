@@ -105,4 +105,13 @@ def build_collector_registry(config: AppConfig) -> list[BaseCollector]:
         except ImportError as e:
             logger.warning("Skipping contacts collector (import error): %s", e)
 
+    if config.collectors.youtube.enabled:
+        try:
+            from context_helpers.collectors.youtube.collector import YouTubeCollector
+
+            collectors.append(YouTubeCollector(config.collectors.youtube))
+            logger.info("Registered collector: youtube")
+        except ImportError as e:
+            logger.warning("Skipping youtube collector (import error): %s", e)
+
     return collectors
