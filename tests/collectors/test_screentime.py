@@ -151,7 +151,7 @@ class TestFetchAppUsageInitialLoad:
                 hour=9, minute=0, second=0, microsecond=0
             ).timestamp() - _APPLE_EPOCH_OFFSET
             conn.execute(
-                "INSERT INTO ZOBJECT VALUES (1,'u','/ app/usage',?,?,?,NULL)",
+                "INSERT INTO ZOBJECT VALUES (1,'u','/app/usage',?,?,?,NULL)",
                 (today_ts, today_ts + 600, "com.apple.Safari"),
             )
         c = _collector()
@@ -328,6 +328,49 @@ class TestFetchFocusEvents:
         _patch_db(c, db_path)
         items = c.fetch_focus_events(since=None)
         assert items == []
+
+    def test_excludes_null_zvalueinteger_rows(self, tmp_path):
+        """Rows with NULL ZVALUEINTEGER must be excluded — they are not valid lock events."""
+        db_path = tmp_path / "kc_null.db"
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.executescript("""
+                CREATE TABLE ZOBJECT (
+                    Z_PK INTEGER PRIMARY KEY, ZUUID VARCHAR, ZSTREAMNAME VARCHAR,
+                    ZSTARTDATE REAL, ZENDDATE REAL, ZVALUESTRING VARCHAR,
+                    ZVALUEINTEGER INTEGER
+                );
+            """)
+            ts = _to_apple_ts(_TS_MINUS_1)
+            conn.execute(
+                "INSERT INTO ZOBJECT VALUES (1,'u','/device/isLocked',?,NULL,NULL,NULL)",
+                (ts,),
+            )
+        c = _collector()
+        _patch_db(c, db_path)
+        items = c.fetch_focus_events(since=None)
+        assert items == []
+
+
+class TestSinceDateConversion:
+    """Verify _since_to_date_str normalises non-UTC offsets to UTC date."""
+
+    def test_utc_midnight_roundtrips(self):
+        c = _collector()
+        assert c._since_to_date_str("2026-03-27T00:00:00+00:00") == "2026-03-27"
+
+    def test_positive_offset_normalised_to_utc(self):
+        # 2026-03-27T01:00:00+05:00 = 2026-03-26T20:00:00Z → UTC date is 2026-03-26
+        c = _collector()
+        assert c._since_to_date_str("2026-03-27T01:00:00+05:00") == "2026-03-26"
+
+    def test_negative_offset_normalised_to_utc(self):
+        # 2026-03-27T23:00:00-05:00 = 2026-03-28T04:00:00Z → UTC date is 2026-03-28
+        c = _collector()
+        assert c._since_to_date_str("2026-03-27T23:00:00-05:00") == "2026-03-28"
+
+    def test_z_suffix_accepted(self):
+        c = _collector()
+        assert c._since_to_date_str("2026-03-27T12:00:00Z") == "2026-03-27"
 
 
 # ---------------------------------------------------------------------------

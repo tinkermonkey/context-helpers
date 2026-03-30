@@ -6,11 +6,13 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Query
 
+from context_helpers.collectors.screentime.collector import (
+    _CURSOR_APP_USAGE,
+    _CURSOR_FOCUS,
+)
+
 if TYPE_CHECKING:
     from context_helpers.collectors.screentime.collector import ScreenTimeCollector
-
-_CURSOR_APP_USAGE = "screentime_app_usage"
-_CURSOR_FOCUS = "screentime_focus"
 
 
 def make_screentime_router(collector: "ScreenTimeCollector") -> APIRouter:

@@ -105,6 +105,7 @@ SELECT
     ZVALUEINTEGER AS locked
 FROM ZOBJECT
 WHERE ZSTREAMNAME = '/device/isLocked'
+  AND ZVALUEINTEGER IS NOT NULL
   AND ZSTARTDATE > ?
 ORDER BY ZSTARTDATE ASC
 LIMIT ?
@@ -116,6 +117,7 @@ SELECT
     ZVALUEINTEGER AS locked
 FROM ZOBJECT
 WHERE ZSTREAMNAME = '/device/isLocked'
+  AND ZVALUEINTEGER IS NOT NULL
   AND ZSTARTDATE >= ?
 ORDER BY ZSTARTDATE ASC
 LIMIT ?
@@ -268,7 +270,7 @@ class ScreenTimeCollector(BaseCollector):
         dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.date().isoformat()
+        return dt.astimezone(timezone.utc).date().isoformat()
 
     def _since_to_apple_ts(self, since: str) -> float:
         dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
