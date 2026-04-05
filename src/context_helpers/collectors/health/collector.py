@@ -72,6 +72,14 @@ def _to_meters(value: float, unit: str) -> float:
         return value  # assume meters
 
 
+def _to_kcal(value: float, unit: str) -> float:
+    """Convert an energy value to kilocalories based on unit string."""
+    unit_lower = (unit or "").lower().strip()
+    if unit_lower in ("kj", "kilojoules"):
+        return value / 4.184
+    return value  # assume kcal (Cal, kcal, etc.)
+
+
 class HealthCollector(BaseCollector):
     """Collects Apple Health data from exported Health.zip files.
 
@@ -269,6 +277,95 @@ class HealthCollector(BaseCollector):
             conn.row_factory = sqlite3.Row
             rows = conn.execute(sql, params).fetchall()
 
+            # Build per-workout lookups for energy, distance, and heart rate.
+            energy_kcal: dict[str, float] = {}
+            distance_m: dict[str, float] = {}
+            avg_hr: dict[str, float] = {}
+
+            fetched_ids = [dict(r)["id"] for r in rows]
+
+            if self._table_exists(conn, "workout_statistics") and fetched_ids:
+                placeholders = ",".join("?" * len(fetched_ids))
+                for sr in conn.execute(
+                    f"""
+                    SELECT workout_id, type, sum, average, unit
+                    FROM workout_statistics
+                    WHERE type IN (
+                        'HKQuantityTypeIdentifierActiveEnergyBurned',
+                        'HKQuantityTypeIdentifierDistanceWalkingRunning',
+                        'HKQuantityTypeIdentifierHeartRate'
+                    )
+                    AND workout_id IN ({placeholders})
+                    """,
+                    fetched_ids,
+                ).fetchall():
+                    wid = sr["workout_id"]
+                    t = sr["type"]
+                    if t == "HKQuantityTypeIdentifierActiveEnergyBurned" and sr["sum"] is not None:
+                        energy_kcal[wid] = round(_to_kcal(float(sr["sum"]), sr["unit"] or "Cal"), 2)
+                    elif t == "HKQuantityTypeIdentifierDistanceWalkingRunning" and sr["sum"] is not None:
+                        distance_m[wid] = round(_to_meters(float(sr["sum"]), sr["unit"] or "m"), 2)
+                    elif t == "HKQuantityTypeIdentifierHeartRate" and sr["average"] is not None:
+                        avg_hr[wid] = round(float(sr["average"]), 1)
+            else:
+                # Fallback: correlate time-series tables by workout time window.
+                # Aggregate per-sample in Python to handle mixed units correctly.
+                if self._table_exists(conn, "rActiveEnergyBurned"):
+                    raw_energy: dict[str, float] = defaultdict(float)
+                    for er in conn.execute(
+                        """
+                        SELECT w.id AS workout_id,
+                               CAST(e.value AS FLOAT) AS value,
+                               e.unit
+                        FROM workouts w
+                        JOIN rActiveEnergyBurned e
+                          ON e.startDate >= w.startDate AND e.startDate <= w.endDate
+                        """
+                    ).fetchall():
+                        if er["value"] is not None:
+                            raw_energy[er["workout_id"]] += _to_kcal(
+                                float(er["value"]), er["unit"] or "Cal"
+                            )
+                    for wid, total in raw_energy.items():
+                        energy_kcal[wid] = round(total, 2)
+
+                if self._table_exists(conn, "rDistanceWalkingRunning"):
+                    raw_dist: dict[str, float] = defaultdict(float)
+                    for dr in conn.execute(
+                        """
+                        SELECT w.id AS workout_id,
+                               CAST(d.value AS FLOAT) AS value,
+                               d.unit
+                        FROM workouts w
+                        JOIN rDistanceWalkingRunning d
+                          ON d.startDate >= w.startDate AND d.startDate <= w.endDate
+                        """
+                    ).fetchall():
+                        if dr["value"] is not None:
+                            raw_dist[dr["workout_id"]] += _to_meters(
+                                float(dr["value"]), dr["unit"] or "m"
+                            )
+                    for wid, total in raw_dist.items():
+                        distance_m[wid] = round(total, 2)
+
+                if self._table_exists(conn, "rHeartRate"):
+                    hr_sum: dict[str, float] = defaultdict(float)
+                    hr_count: dict[str, int] = defaultdict(int)
+                    for hr in conn.execute(
+                        """
+                        SELECT w.id AS workout_id,
+                               CAST(h.value AS FLOAT) AS value
+                        FROM workouts w
+                        JOIN rHeartRate h
+                          ON h.startDate >= w.startDate AND h.startDate <= w.endDate
+                        """
+                    ).fetchall():
+                        if hr["value"] is not None:
+                            hr_sum[hr["workout_id"]] += float(hr["value"])
+                            hr_count[hr["workout_id"]] += 1
+                    for wid, total in hr_sum.items():
+                        avg_hr[wid] = round(total / hr_count[wid], 1)
+
         workouts = []
         for row in rows:
             w = dict(row)
@@ -285,15 +382,16 @@ class HealthCollector(BaseCollector):
             else:
                 duration_seconds = int(raw_duration * 60)  # assume minutes
 
+            wid = w["id"]
             workouts.append({
-                "id": w["id"],
+                "id": wid,
                 "activityType": w["activityType"],
                 "startDate": w["startDate"],
                 "endDate": w["endDate"],
                 "durationSeconds": duration_seconds,
-                "totalEnergyBurned": None,
-                "totalDistance": None,
-                "averageHeartRate": None,
+                "totalEnergyBurned": energy_kcal.get(wid),
+                "totalDistance": distance_m.get(wid),
+                "averageHeartRate": avg_hr.get(wid),
                 "notes": None,
             })
 
