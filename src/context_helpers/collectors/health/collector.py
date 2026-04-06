@@ -278,11 +278,16 @@ class HealthCollector(BaseCollector):
             rows = conn.execute(sql, params).fetchall()
 
             # Build per-workout lookups for energy, distance, and heart rate.
+            # Limit stats computation to the delivery batch (oldest push_page_size
+            # items, ASC, matching apply_push_paging's sort order) so the queries
+            # don't scan the full time-series history when rows spans many years.
             energy_kcal: dict[str, float] = {}
             distance_m: dict[str, float] = {}
             avg_hr: dict[str, float] = {}
 
-            fetched_ids = [dict(r)["id"] for r in rows]
+            sorted_rows = sorted(rows, key=lambda r: dict(r)["startDate"])
+            stats_batch = sorted_rows[: self.get_push_limit()]
+            fetched_ids = [dict(r)["id"] for r in stats_batch]
 
             if self._table_exists(conn, "workout_statistics") and fetched_ids:
                 placeholders = ",".join("?" * len(fetched_ids))
