@@ -307,20 +307,41 @@ class HealthCollector(BaseCollector):
                         distance_m[wid] = round(_to_meters(float(sr["sum"]), sr["unit"] or "m"), 2)
                     elif t == "HKQuantityTypeIdentifierHeartRate" and sr["average"] is not None:
                         avg_hr[wid] = round(float(sr["average"]), 1)
-            else:
+            elif fetched_ids:
                 # Fallback: correlate time-series tables by workout time window.
                 # Aggregate per-sample in Python to handle mixed units correctly.
+                #
+                # Performance: create indexes on startDate for each time-series
+                # table we query (persisted in the cache DB, rebuilt only when
+                # the export changes).  Also scope the JOIN to the date range
+                # of the fetched workouts to avoid full-table scans.
+                workout_dates = [(dict(r)["startDate"], dict(r)["endDate"]) for r in rows]
+                range_start = min(sd for sd, _ in workout_dates)
+                range_end = max(ed for _, ed in workout_dates)
+                wid_placeholders = ",".join("?" * len(fetched_ids))
+
+                for ts_table in ("rActiveEnergyBurned", "rDistanceWalkingRunning", "rHeartRate"):
+                    if self._table_exists(conn, ts_table):
+                        idx = f"idx_{ts_table}_startDate"
+                        conn.execute(
+                            f"CREATE INDEX IF NOT EXISTS {idx} ON {ts_table}(startDate)"
+                        )
+                conn.commit()
+
                 if self._table_exists(conn, "rActiveEnergyBurned"):
                     raw_energy: dict[str, float] = defaultdict(float)
                     for er in conn.execute(
-                        """
+                        f"""
                         SELECT w.id AS workout_id,
                                CAST(e.value AS FLOAT) AS value,
                                e.unit
                         FROM workouts w
                         JOIN rActiveEnergyBurned e
                           ON e.startDate >= w.startDate AND e.startDate <= w.endDate
-                        """
+                        WHERE w.id IN ({wid_placeholders})
+                          AND e.startDate >= ? AND e.startDate <= ?
+                        """,
+                        [*fetched_ids, range_start, range_end],
                     ).fetchall():
                         if er["value"] is not None:
                             raw_energy[er["workout_id"]] += _to_kcal(
@@ -332,14 +353,17 @@ class HealthCollector(BaseCollector):
                 if self._table_exists(conn, "rDistanceWalkingRunning"):
                     raw_dist: dict[str, float] = defaultdict(float)
                     for dr in conn.execute(
-                        """
+                        f"""
                         SELECT w.id AS workout_id,
                                CAST(d.value AS FLOAT) AS value,
                                d.unit
                         FROM workouts w
                         JOIN rDistanceWalkingRunning d
                           ON d.startDate >= w.startDate AND d.startDate <= w.endDate
-                        """
+                        WHERE w.id IN ({wid_placeholders})
+                          AND d.startDate >= ? AND d.startDate <= ?
+                        """,
+                        [*fetched_ids, range_start, range_end],
                     ).fetchall():
                         if dr["value"] is not None:
                             raw_dist[dr["workout_id"]] += _to_meters(
@@ -352,13 +376,16 @@ class HealthCollector(BaseCollector):
                     hr_sum: dict[str, float] = defaultdict(float)
                     hr_count: dict[str, int] = defaultdict(int)
                     for hr in conn.execute(
-                        """
+                        f"""
                         SELECT w.id AS workout_id,
                                CAST(h.value AS FLOAT) AS value
                         FROM workouts w
                         JOIN rHeartRate h
                           ON h.startDate >= w.startDate AND h.startDate <= w.endDate
-                        """
+                        WHERE w.id IN ({wid_placeholders})
+                          AND h.startDate >= ? AND h.startDate <= ?
+                        """,
+                        [*fetched_ids, range_start, range_end],
                     ).fetchall():
                         if hr["value"] is not None:
                             hr_sum[hr["workout_id"]] += float(hr["value"])
