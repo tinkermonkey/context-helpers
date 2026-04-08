@@ -19,6 +19,7 @@ from context_helpers.config import OuraConfig
 logger = logging.getLogger(__name__)
 
 _DEFAULT_LOOKBACK_DAYS = 365  # fallback only; config.initial_lookback_days takes precedence
+_HEARTRATE_MAX_LOOKBACK_DAYS = 30  # Oura heartrate API rejects ranges > ~30 days (HTTP 400)
 _TOKEN_STORE_PATH = Path.home() / ".local" / "share" / "context-helpers" / "oura_tokens.json"
 # Refresh when less than this many minutes remain on the access token.
 _EXPIRY_BUFFER_MINUTES = 5
@@ -143,7 +144,7 @@ class OuraCollector(BaseCollector):
         return [self._format_workout(item) for item in items]
 
     def fetch_heart_rate(self, since: str | None) -> list[dict]:
-        start, end = self._datetime_range(since)
+        start, end = self._datetime_range(since, max_days=_HEARTRATE_MAX_LOOKBACK_DAYS)
         params: dict = {"start_datetime": start, "end_datetime": end}
         items: list[dict] = []
         while True:
@@ -290,7 +291,7 @@ class OuraCollector(BaseCollector):
     # Date helpers
     # ------------------------------------------------------------------
 
-    def _datetime_range(self, since: str | None) -> tuple[str, str]:
+    def _datetime_range(self, since: str | None, max_days: int | None = None) -> tuple[str, str]:
         """Convert ISO since timestamp to (start_datetime, end_datetime) ISO 8601 strings."""
         end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
         if since:
@@ -298,6 +299,8 @@ class OuraCollector(BaseCollector):
             start = dt.strftime("%Y-%m-%dT%H:%M:%S")
         else:
             lookback = getattr(self._config, "initial_lookback_days", _DEFAULT_LOOKBACK_DAYS)
+            if max_days is not None:
+                lookback = min(lookback, max_days)
             start = (datetime.now(timezone.utc) - timedelta(days=lookback)).strftime("%Y-%m-%dT%H:%M:%S")
         return start, end
 
