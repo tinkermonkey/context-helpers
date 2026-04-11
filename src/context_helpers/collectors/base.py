@@ -265,6 +265,36 @@ class BaseCollector(ABC):
         self._has_push_more_by_key[effective_key] = len(items) > limit
         return page
 
+    def reset_state(self) -> "list[str]":
+        """Clear all delivery cursors and in-memory push state for this collector.
+
+        Returns a list of human-readable strings describing what was cleared.
+        Subclasses with additional persistent state should call super().reset_state()
+        and extend the returned list.
+        """
+        cleared = []
+
+        for key in self.push_cursor_keys():
+            cursor_path = _CURSORS_DIR / f"{key}_push.json"
+            if cursor_path.exists():
+                cursor_path.unlink()
+                cleared.append(f"push_cursor:{key}")
+
+        # Also clean up the bare {name}_push.json in case the collector was
+        # previously a single-endpoint collector and stale cursors remain after
+        # a refactor that added push_cursor_keys() overrides.
+        bare_push = _CURSORS_DIR / f"{self.name}_push.json"
+        if bare_push.exists():
+            bare_push.unlink()
+            if f"push_cursor:{self.name}" not in cleared:
+                cleared.append(f"push_cursor:{self.name}")
+
+        if hasattr(self, "_has_push_more_by_key"):
+            self._has_push_more_by_key.clear()
+        cleared.append("in_memory_push_state")
+
+        return cleared
+
 
 class PagedCollector(BaseCollector):
     """BaseCollector extension for collectors that page through large datasets.
@@ -386,3 +416,16 @@ class PagedCollector(BaseCollector):
     def has_changes_since(self, watermark: "datetime | None") -> bool:
         """Default uses per-collector cursor. Subclasses should override with cheap check."""
         return True
+
+    def reset_state(self) -> "list[str]":
+        """Also clears the page cursor and in-memory stash."""
+        cleared = super().reset_state()
+
+        if self._cursor_path.exists():
+            self._cursor_path.unlink()
+            cleared.append(f"page_cursor:{self.name}")
+
+        self.discard_stash()
+        cleared.append("stash")
+
+        return cleared

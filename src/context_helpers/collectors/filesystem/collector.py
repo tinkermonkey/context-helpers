@@ -97,6 +97,11 @@ class FilesystemCollector(PagedCollector):
             return [f"Read permission required for: {self._directory}"]
         return []
 
+    def reset_state(self) -> list[str]:
+        cleared = super().reset_state()
+        cleared.extend(self._tracker.reset())
+        return cleared
+
     def _walk_files(self) -> Iterator[Path]:
         """Yield all file paths under the configured directory.
 

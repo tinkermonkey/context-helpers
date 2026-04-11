@@ -73,6 +73,15 @@ class FileFailureTracker:
     # Persistence
     # ------------------------------------------------------------------
 
+    def reset(self) -> list[str]:
+        """Clear all tracked failures (in-memory and on disk)."""
+        self._data = {}
+        if self._state_path.exists():
+            self._state_path.unlink()
+        if self._report_path.exists():
+            self._report_path.unlink()
+        return ["failure_tracker"]
+
     def _load(self) -> None:
         if not self._state_path.exists():
             return

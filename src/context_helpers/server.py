@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 from context_helpers.auth import make_auth_dependency
 from context_helpers.collectors.base import BaseCollector, PagedCollector
@@ -31,6 +32,9 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
     state_store = StateStore()
     for collector in collectors:
         collector.set_state_store(state_store)
+
+    # O(1) name lookup for per-collector endpoints
+    collector_index: dict[str, BaseCollector] = {c.name: c for c in collectors}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -139,5 +143,26 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
             "watermark": watermark.isoformat() if watermark else None,
             "collectors": collector_statuses,
         }
+
+    @app.post("/collectors/{name}/reset", dependencies=[Depends(auth_dep)])
+    async def reset_collector(name: str) -> dict:
+        """Reset delivery state for a single collector.
+
+        Clears all cursors, in-memory state, and any collector-specific
+        persistent state (e.g. failure trackers). Safe to call multiple times.
+        """
+        collector = collector_index.get(name)
+        if collector is None:
+            raise HTTPException(status_code=404, detail=f"No collector named '{name}'")
+        try:
+            cleared = collector.reset_state()
+            logger.info("collector %s: reset state — cleared: %s", name, cleared)
+            return {"ok": True, "collector": name, "cleared": cleared, "errors": []}
+        except Exception as e:
+            logger.error("collector %s: reset_state() failed: %s", name, e)
+            return JSONResponse(
+                status_code=500,
+                content={"ok": False, "collector": name, "cleared": [], "errors": [str(e)]},
+            )
 
     return app
