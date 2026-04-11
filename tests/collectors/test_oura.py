@@ -502,6 +502,7 @@ class TestFetchSleep:
         assert item["day"] == "2026-03-13"
         assert item["score"] == 85
         assert item["contributors"] == {"deep_sleep": 90}
+        assert item["timestamp"] == "2026-03-13T08:00:00Z"
 
     def test_since_is_passed_through(self):
         c = make_collector()
@@ -554,6 +555,10 @@ class TestFetchWorkouts:
         assert item["activity"] == "running"
         assert item["duration_seconds"] == 2100  # 35 minutes
         assert item["distance"] == 5000.0
+        # timestamp must be present (= normalised start_datetime)
+        assert item["timestamp"] == "2026-03-13T07:00:00Z"
+        assert item["start_datetime"] == "2026-03-13T07:00:00Z"
+        assert item["end_datetime"] == "2026-03-13T07:35:00Z"
 
 
 class TestFetchHeartRate:
@@ -565,7 +570,8 @@ class TestFetchHeartRate:
         item = results[0]
         assert item["bpm"] == 62
         assert item["source"] == "awake"
-        assert item["timestamp"] == "2026-03-13T07:00:00.000Z"
+        # Timestamp is normalised to UTC Z format (milliseconds dropped)
+        assert item["timestamp"] == "2026-03-13T07:00:00Z"
 
     def test_uses_datetime_params(self):
         c = make_collector()
@@ -589,9 +595,27 @@ class TestFetchHeartRate:
             captured.append(params)
             return {"data": [], "next_token": None}
 
+        # Use a recent since value (well within the 30-day cap)
+        recent_since = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
         with patch.object(c, "_get", side_effect=fake_get):
-            c.fetch_heart_rate(since="2026-03-10T00:00:00Z")
-        assert captured[0]["start_datetime"] == "2026-03-10T00:00:00"
+            c.fetch_heart_rate(since=f"{recent_since}Z")
+        assert captured[0]["start_datetime"] == recent_since
+
+    def test_since_older_than_max_days_is_capped(self):
+        c = make_collector()
+        captured = []
+
+        def fake_get(path, params=None):
+            captured.append(params)
+            return {"data": [], "next_token": None}
+
+        # A since value 60 days ago should be capped to ~30 days ago
+        old_since = (datetime.now(timezone.utc) - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S")
+        with patch.object(c, "_get", side_effect=fake_get):
+            c.fetch_heart_rate(since=f"{old_since}Z")
+        start = datetime.fromisoformat(captured[0]["start_datetime"])
+        age = datetime.now(timezone.utc).replace(tzinfo=None) - start
+        assert age.days <= 30
 
 
 class TestFetchSpo2:
@@ -605,6 +629,8 @@ class TestFetchSpo2:
         assert item["day"] == "2026-03-13"
         assert item["average"] == 96.5
         assert item["breathing_disturbance_index"] == 2
+        # timestamp must be a full datetime, not just a date string
+        assert item["timestamp"] == "2026-03-13T00:00:00Z"
 
     def test_handles_missing_spo2_percentage(self):
         item = {**_SPO2_ITEM, "spo2_percentage": None}
@@ -641,6 +667,10 @@ class TestFetchSessions:
         assert item["mood"] == "good"
         assert item["health_tags"] == ["stress_low"]
         assert item["title"] == "Morning breathwork"
+        # timestamp must be present and equal to start_datetime (normalised)
+        assert item["timestamp"] == "2026-03-13T07:00:00Z"
+        assert item["start_datetime"] == "2026-03-13T07:00:00Z"
+        assert item["end_datetime"] == "2026-03-13T07:20:00Z"
 
     def test_empty_health_tags_defaults_to_list(self):
         item = {**_SESSION_ITEM, "health_tags": None}
@@ -708,11 +738,15 @@ class TestWorkoutDurationCalculation:
         }
         result = OuraCollector._format_workout(item)
         assert result["duration_seconds"] == 3600
+        assert result["timestamp"] == "2026-03-13T07:00:00Z"
+        assert result["start_datetime"] == "2026-03-13T07:00:00Z"
+        assert result["end_datetime"] == "2026-03-13T08:00:00Z"
 
     def test_duration_none_when_start_missing(self):
         item = {**_WORKOUT_ITEM, "start_datetime": None}
         result = OuraCollector._format_workout(item)
         assert result["duration_seconds"] is None
+        assert result["timestamp"] is None
 
     def test_duration_none_when_end_missing(self):
         item = {**_WORKOUT_ITEM, "end_datetime": None}
@@ -732,3 +766,29 @@ class TestWorkoutDurationCalculation:
         }
         result = OuraCollector._format_workout(item)
         assert result["duration_seconds"] == 1800
+        assert result["timestamp"] == "2026-03-13T07:00:00Z"
+
+
+class TestToUtcTimestamp:
+    def test_plus_offset_converted_to_z(self):
+        result = OuraCollector._to_utc_timestamp("2026-03-13T08:00:00+00:00")
+        assert result == "2026-03-13T08:00:00Z"
+
+    def test_z_suffix_unchanged(self):
+        result = OuraCollector._to_utc_timestamp("2026-03-13T07:00:00Z")
+        assert result == "2026-03-13T07:00:00Z"
+
+    def test_non_utc_offset_converted_to_utc(self):
+        # +09:00 → UTC should subtract 9 hours
+        result = OuraCollector._to_utc_timestamp("2026-03-13T09:00:00+09:00")
+        assert result == "2026-03-13T00:00:00Z"
+
+    def test_milliseconds_stripped(self):
+        result = OuraCollector._to_utc_timestamp("2026-03-13T07:00:00.000Z")
+        assert result == "2026-03-13T07:00:00Z"
+
+    def test_none_returns_none(self):
+        assert OuraCollector._to_utc_timestamp(None) is None
+
+    def test_unparseable_string_returned_unchanged(self):
+        assert OuraCollector._to_utc_timestamp("not-a-date") == "not-a-date"

@@ -293,15 +293,19 @@ class OuraCollector(BaseCollector):
 
     def _datetime_range(self, since: str | None, max_days: int | None = None) -> tuple[str, str]:
         """Convert ISO since timestamp to (start_datetime, end_datetime) ISO 8601 strings."""
-        end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        now = datetime.now(timezone.utc)
+        end = now.strftime("%Y-%m-%dT%H:%M:%S")
         if since:
             dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            if max_days is not None:
+                floor = now - timedelta(days=max_days)
+                dt = max(dt, floor)
             start = dt.strftime("%Y-%m-%dT%H:%M:%S")
         else:
             lookback = getattr(self._config, "initial_lookback_days", _DEFAULT_LOOKBACK_DAYS)
             if max_days is not None:
                 lookback = min(lookback, max_days)
-            start = (datetime.now(timezone.utc) - timedelta(days=lookback)).strftime("%Y-%m-%dT%H:%M:%S")
+            start = (now - timedelta(days=lookback)).strftime("%Y-%m-%dT%H:%M:%S")
         return start, end
 
     def _date_range(self, since: str | None) -> tuple[str, str]:
@@ -320,13 +324,33 @@ class OuraCollector(BaseCollector):
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _to_utc_timestamp(ts: str | None) -> str | None:
+        """Normalise an ISO 8601 timestamp to UTC with Z suffix.
+
+        Handles: Z suffix, +00:00, other UTC offsets, and naive datetimes
+        (assumed UTC).  Returns None for None input; returns the original
+        string unchanged if parsing fails so callers never lose data.
+        """
+        if ts is None:
+            return None
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (ValueError, AttributeError):
+            return ts
+
+    @staticmethod
     def _format_sleep(item: dict) -> dict:
         return {
             "id": item.get("id"),
             "day": item.get("day"),
             "score": item.get("score"),
             "contributors": item.get("contributors", {}),
-            "timestamp": item.get("timestamp"),
+            "timestamp": OuraCollector._to_utc_timestamp(item.get("timestamp")),
         }
 
     @staticmethod
@@ -338,7 +362,7 @@ class OuraCollector(BaseCollector):
             "temperature_deviation": item.get("temperature_deviation"),
             "temperature_trend_deviation": item.get("temperature_trend_deviation"),
             "contributors": item.get("contributors", {}),
-            "timestamp": item.get("timestamp"),
+            "timestamp": OuraCollector._to_utc_timestamp(item.get("timestamp")),
         }
 
     @staticmethod
@@ -356,13 +380,13 @@ class OuraCollector(BaseCollector):
             "low_activity_time": item.get("low_activity_time"),
             "sedentary_time": item.get("sedentary_time"),
             "resting_time": item.get("resting_time"),
-            "timestamp": item.get("timestamp"),
+            "timestamp": OuraCollector._to_utc_timestamp(item.get("timestamp")),
         }
 
     @staticmethod
     def _format_heart_rate(item: dict) -> dict:
         return {
-            "timestamp": item.get("timestamp"),
+            "timestamp": OuraCollector._to_utc_timestamp(item.get("timestamp")),
             "bpm": item.get("bpm"),
             "source": item.get("source"),
         }
@@ -371,10 +395,12 @@ class OuraCollector(BaseCollector):
     def _format_spo2(item: dict) -> dict:
         spo2 = item.get("spo2_percentage") or {}
         day = item.get("day")
+        # daily_spo2 has no full timestamp field; synthesise midnight UTC from day
+        timestamp = f"{day}T00:00:00Z" if day else None
         return {
             "id": item.get("id"),
             "day": day,
-            "timestamp": day,  # daily_spo2 has no full timestamp; use day as cursor field
+            "timestamp": timestamp,
             "average": spo2.get("average"),
             "breathing_disturbance_index": item.get("breathing_disturbance_index"),
         }
@@ -384,18 +410,20 @@ class OuraCollector(BaseCollector):
         return {
             "id": item.get("id"),
             "day": item.get("day"),
-            "timestamp": item.get("timestamp"),
+            "timestamp": OuraCollector._to_utc_timestamp(item.get("timestamp")),
             "text": item.get("text"),
             "tags": item.get("tags") or [],
         }
 
     @staticmethod
     def _format_session(item: dict) -> dict:
+        norm_start = OuraCollector._to_utc_timestamp(item.get("start_datetime"))
         return {
             "id": item.get("id"),
             "day": item.get("day"),
-            "start_datetime": item.get("start_datetime"),
-            "end_datetime": item.get("end_datetime"),
+            "timestamp": norm_start,
+            "start_datetime": norm_start,
+            "end_datetime": OuraCollector._to_utc_timestamp(item.get("end_datetime")),
             "type": item.get("type"),
             "mood": item.get("mood"),
             "health_tags": item.get("health_tags") or [],
@@ -414,9 +442,11 @@ class OuraCollector(BaseCollector):
                 duration = int((e - s).total_seconds())
             except (ValueError, TypeError):
                 pass
+        norm_start = OuraCollector._to_utc_timestamp(start)
         return {
             "id": item.get("id"),
             "day": item.get("day"),
+            "timestamp": norm_start,
             "activity": item.get("activity"),
             "calories": item.get("calories"),
             "distance": item.get("distance"),
@@ -424,6 +454,6 @@ class OuraCollector(BaseCollector):
             "intensity": item.get("intensity"),
             "label": item.get("label"),
             "source": item.get("source"),
-            "start_datetime": start,
-            "end_datetime": end,
+            "start_datetime": norm_start,
+            "end_datetime": OuraCollector._to_utc_timestamp(end),
         }
