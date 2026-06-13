@@ -2,8 +2,11 @@
 
 Tracks read errors per file path. Once a file's failure count reaches the
 configured threshold it is permanently skipped — no further read attempts
-are made and no warnings are logged. State is persisted atomically to disk;
-a human-readable Markdown report is regenerated after every recorded failure.
+are made and no warnings are logged. A file that has already failed and has
+not changed since (mtime <= last attempt) is also skipped without a read, so a
+scan never re-reads known-bad files. State is accumulated in memory and
+persisted atomically in bulk via flush(); a human-readable Markdown report is
+regenerated on flush, not on every failure.
 """
 
 from __future__ import annotations
@@ -26,12 +29,24 @@ class FileFailureTracker:
         state_dir: Directory for the JSON state file and Markdown report.
     """
 
+    # Auto-flush after this many unpersisted failures, so a long-running scan
+    # that never calls flush() still bounds how much state can be lost on crash.
+    _AUTO_FLUSH_EVERY = 500
+
     def __init__(self, threshold: int = 10, state_dir: Path = _STATE_DIR) -> None:
         self._threshold = threshold
         self._state_path = state_dir / "filesystem_failures.json"
         self._report_path = state_dir / "filesystem_failures_report.md"
         # {abs_path_str: {"count": int, "last_error": str, "last_attempted": iso_str}}
         self._data: dict[str, dict] = {}
+        # Failures accumulate in memory and are persisted in bulk via flush().
+        # Writing the (multi-MB) JSON + Markdown report on *every* failure made a
+        # full scan of a large tree pathologically slow (gigabytes of I/O), which
+        # caused the streaming /filesystem/fetch endpoint to time out before
+        # delivering a single file.  _dirty marks a pending flush; _unsaved counts
+        # failures since the last flush for the auto-flush safety net.
+        self._dirty = False
+        self._unsaved = 0
         self._load()
 
     # ------------------------------------------------------------------
@@ -43,8 +58,40 @@ class FileFailureTracker:
         entry = self._data.get(str(path))
         return entry is not None and entry.get("count", 0) >= self._threshold
 
+    def should_skip(self, path: Path, mtime: datetime) -> bool:
+        """Return True if *path* should not be read on this scan.
+
+        A file is skipped without a read attempt when it is either:
+          - permanently skipped (failure count >= threshold), or
+          - previously failed and unchanged since the last attempt.
+
+        UTF-8 decode failures are deterministic for given file bytes, so a file
+        that failed to read keeps failing until its content changes.  We compare
+        the file's *mtime* against ``last_attempted``: if the file has not been
+        modified since we last tried (and failed), re-reading it is wasted work.
+        A newer mtime means the bytes may have changed, so we retry.
+        """
+        entry = self._data.get(str(path))
+        if entry is None:
+            return False
+        if entry.get("count", 0) >= self._threshold:
+            return True
+        last = entry.get("last_attempted")
+        if not last:
+            return False
+        try:
+            last_dt = datetime.fromisoformat(last)
+        except (ValueError, TypeError):
+            return False
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        return mtime <= last_dt
+
     def record_failure(self, path: Path, error: Exception) -> bool:
         """Record a read failure for *path*.
+
+        The new state is held in memory and marked dirty; call :meth:`flush` to
+        persist it (the collector flushes once per page/scan).
 
         Returns:
             True if this failure pushed the file over the permanent-skip
@@ -59,8 +106,10 @@ class FileFailureTracker:
         entry["last_error"] = str(error)
         entry["last_attempted"] = now
         newly_skipped = entry["count"] == self._threshold
-        self._save()
-        self._write_report()
+        self._dirty = True
+        self._unsaved += 1
+        if self._unsaved >= self._AUTO_FLUSH_EVERY:
+            self.flush()
         if newly_skipped:
             logger.info(
                 "filesystem: %s permanently skipped after %d cumulative failures",
@@ -69,6 +118,19 @@ class FileFailureTracker:
             )
         return newly_skipped
 
+    def flush(self) -> None:
+        """Persist accumulated failures to disk if anything changed.
+
+        Writes the JSON state and regenerates the Markdown report at most once
+        per call instead of once per failure.  No-op when nothing is dirty.
+        """
+        if not self._dirty:
+            return
+        self._save()
+        self._write_report()
+        self._dirty = False
+        self._unsaved = 0
+
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
@@ -76,6 +138,8 @@ class FileFailureTracker:
     def reset(self) -> list[str]:
         """Clear all tracked failures (in-memory and on disk)."""
         self._data = {}
+        self._dirty = False
+        self._unsaved = 0
         if self._state_path.exists():
             self._state_path.unlink()
         if self._report_path.exists():
