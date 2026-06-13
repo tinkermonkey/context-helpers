@@ -5,15 +5,34 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from context_helpers.auth import make_auth_dependency
-from context_helpers.collectors.base import BaseCollector, PagedCollector
+from context_helpers.collectors.base import BaseCollector, PagedCollector, push_ack_mode
 from context_helpers.config import AppConfig
 from context_helpers.state import StateStore
 
 logger = logging.getLogger(__name__)
+
+
+async def _set_ack_mode(
+    ack: bool = Query(
+        default=False,
+        description="Commit-ack mode: stage delivery cursors until the consumer "
+        "confirms via POST /collectors/{name}/ack, so an uncommitted page is "
+        "re-served rather than skipped.",
+    ),
+) -> None:
+    """Request dependency that records whether the caller wants commit-ack delivery.
+
+    Must be async: a sync dependency runs in its own threadpool context copy, so a
+    contextvar set there would not reach the sync route handler (which runs in a
+    separate threadpool copy of the *request task* context). An async dependency
+    sets the var in the request task context, which run_in_threadpool then copies
+    into the handler.
+    """
+    push_ack_mode.set(ack)
 
 
 def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
@@ -65,10 +84,12 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
 
     auth_dep = make_auth_dependency(config.server.api_key)
 
-    # Mount each collector's router with auth dependency applied globally
+    # Mount each collector's router with auth + ack-mode dependencies applied globally.
+    # _set_ack_mode records the ?ack= flag so apply_push_paging knows whether to stage
+    # cursors (commit-ack) or persist them immediately.
     for collector in collectors:
         router = collector.get_router()
-        app.include_router(router, dependencies=[Depends(auth_dep)])
+        app.include_router(router, dependencies=[Depends(auth_dep), Depends(_set_ack_mode)])
         logger.info("Mounted routes for collector: %s", collector.name)
 
     @app.get("/health", dependencies=[Depends(auth_dep)])
@@ -160,9 +181,35 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
             return {"ok": True, "collector": name, "cleared": cleared, "errors": []}
         except Exception as e:
             logger.error("collector %s: reset_state() failed: %s", name, e)
-            return JSONResponse(
+            return JSONResponse(  # type: ignore[return-value]
                 status_code=500,
                 content={"ok": False, "collector": name, "cleared": [], "errors": [str(e)]},
+            )
+
+    @app.post("/collectors/{name}/ack", dependencies=[Depends(auth_dep)])
+    async def ack_collector(name: str) -> dict:
+        """Commit a collector's staged push cursors (commit-ack confirmation).
+
+        When a consumer pulls with ``?ack=true`` the collector *stages* its new
+        delivery position instead of persisting it (see apply_push_paging's
+        defer_commit). The consumer calls this endpoint after it has durably
+        committed the served page(s); only then does the cursor advance. A page
+        whose ingestion fails is therefore re-served on the next pull rather than
+        being silently skipped. Safe to call when nothing is staged (no-op).
+        """
+        collector = collector_index.get(name)
+        if collector is None:
+            raise HTTPException(status_code=404, detail=f"No collector named '{name}'")
+        try:
+            committed = collector.commit_push_cursors()
+            if committed:
+                logger.info("collector %s: ack committed push cursors: %s", name, committed)
+            return {"ok": True, "collector": name, "committed": committed, "errors": []}
+        except Exception as e:
+            logger.error("collector %s: commit_push_cursors() failed: %s", name, e)
+            return JSONResponse(  # type: ignore[return-value]
+                status_code=500,
+                content={"ok": False, "collector": name, "committed": [], "errors": [str(e)]},
             )
 
     return app
