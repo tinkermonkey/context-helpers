@@ -142,13 +142,16 @@ class FilesystemCollector(PagedCollector):
         for path in self._walk_files():
             if self._should_skip_path(path):
                 continue
-            if self._tracker.is_permanently_skipped(path):
-                continue
             try:
                 stat = path.stat()
                 if stat.st_size > max_bytes:
                     continue
-                if check_after is None or datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc) > check_after:
+                mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                # Known-bad (and unchanged) files would only fail to read again —
+                # don't report them as "changes" or the push trigger fires forever.
+                if self._tracker.should_skip(path, mtime):
+                    continue
+                if check_after is None or mtime > check_after:
                     return True
             except OSError:
                 pass
@@ -292,7 +295,10 @@ class FilesystemCollector(PagedCollector):
             modified_at, file_path, stat = candidates[idx]
             idx += 1
 
-            if self._tracker.is_permanently_skipped(file_path):
+            # Skip permanently-skipped files and files that already failed and
+            # haven't changed — but advance the cursor past them so they never
+            # block forward progress.
+            if self._tracker.should_skip(file_path, modified_at):
                 if page_max_ts is None or modified_at > page_max_ts:
                     page_max_ts = modified_at
                 continue
@@ -315,6 +321,7 @@ class FilesystemCollector(PagedCollector):
                     logger.warning("Skipping %s: %s", file_path, e)
                 continue
 
+        self._tracker.flush()
         self._page_cursor = page_max_ts
         return results, idx < len(candidates)
 
@@ -351,7 +358,9 @@ class FilesystemCollector(PagedCollector):
             modified_at, file_path, stat = candidates[idx]
             idx += 1
 
-            if self._tracker.is_permanently_skipped(file_path):
+            # Skip permanently-skipped files and files that already failed and
+            # haven't changed — but advance the cursor past them.
+            if self._tracker.should_skip(file_path, modified_at):
                 if max_ts_seen is None or modified_at > max_ts_seen:
                     max_ts_seen = modified_at
                 continue
@@ -375,6 +384,7 @@ class FilesystemCollector(PagedCollector):
                     logger.warning("Skipping %s: %s", file_path, e)
                 continue
 
+        self._tracker.flush()
         next_cursor = max_ts_seen.isoformat() if max_ts_seen else None
         yield {"__meta__": True, "has_more": idx < len(candidates), "next_cursor": next_cursor}
 
@@ -431,9 +441,6 @@ class FilesystemCollector(PagedCollector):
             elif self._should_skip_path(file_path):
                 continue
 
-            if self._tracker.is_permanently_skipped(file_path):
-                continue
-
             try:
                 stat = file_path.stat()
 
@@ -443,6 +450,11 @@ class FilesystemCollector(PagedCollector):
                     continue
 
                 modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+
+                # Skip known-bad files (permanent or unchanged-since-last-failure)
+                # without a read attempt.
+                if self._tracker.should_skip(file_path, modified_at):
+                    continue
 
                 if since_dt and modified_at < since_dt:
                     continue
@@ -458,4 +470,5 @@ class FilesystemCollector(PagedCollector):
                     logger.warning("Skipping %s: %s", file_path, e)
                 continue
 
+        self._tracker.flush()
         return results

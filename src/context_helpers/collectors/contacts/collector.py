@@ -20,10 +20,14 @@ logger = logging.getLogger(__name__)
 # Does not require Full Disk Access; stat() works with Automation permission.
 _ADDRESSBOOK_DIR = Path.home() / "Library" / "Application Support" / "AddressBook"
 
-# Bulk-fetch scalar properties up front using JXA array-specifier form
-# (app.people.name(), etc.) — one Apple Events round-trip per property,
-# 8 total regardless of contact count. Emails/phones still need per-person
-# access (nested arrays), but use bulk .value() within each person.
+# Bulk-fetch every property up front using JXA array-specifier form
+# (app.people.name(), etc.) — one Apple Events round-trip per property regardless
+# of contact count.  Crucially this includes emails/phones: app.people.emails.value()
+# returns an array whose i-th element is person i's emails, so the whole address
+# book costs ~10 round-trips instead of 2 *per contact*.  Per-contact access
+# (person.emails.value() in a loop) is what made a full export time out at 120s on
+# large address books.  A per-person fallback covers the case where the bulk
+# multi-value specifier is unavailable or returns an unexpected length.
 _JXA_FETCH_ALL = """\
 var app = Application('Contacts');
 var ids      = app.people.id();
@@ -34,12 +38,34 @@ var orgs     = app.people.organization();
 var titles   = app.people.jobTitle();
 var notes    = app.people.note();
 var modDates = app.people.modificationDate();
+
+// Fast path: pull all emails and phones in two bulk round-trips.
+var emailsAll = null, phonesAll = null;
+try {
+    var ea = app.people.emails.value();
+    var pa = app.people.phones.value();
+    if (ea && pa && ea.length === ids.length && pa.length === ids.length) {
+        emailsAll = ea;
+        phonesAll = pa;
+    }
+} catch (e) {
+    emailsAll = null;
+    phonesAll = null;
+}
+
 var results  = [];
 for (var i = 0; i < ids.length; i++) {
     try {
-        var person = app.people[i];
-        var emails = person.emails.value();
-        var phones = person.phones.value();
+        var emails, phones;
+        if (emailsAll !== null) {
+            emails = emailsAll[i];
+            phones = phonesAll[i];
+        } else {
+            // Fallback: per-person access (slow, but only if bulk was unavailable).
+            var person = app.people[i];
+            emails = person.emails.value();
+            phones = person.phones.value();
+        }
         var modDate = modDates[i];
         results.push({
             id: ids[i] || '',

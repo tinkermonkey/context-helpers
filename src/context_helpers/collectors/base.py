@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -16,6 +17,12 @@ if TYPE_CHECKING:
     from context_helpers.state import StateStore
 
 logger = logging.getLogger(__name__)
+
+# Request-scoped flag set by the server's ack-mode dependency from the ``?ack=``
+# query param. When True, apply_push_paging stages cursors instead of persisting
+# them (commit-ack), so a served-but-uncommitted page is re-served rather than
+# lost. Defaults False, so direct API callers keep the immediate-commit behaviour.
+push_ack_mode: ContextVar[bool] = ContextVar("push_ack_mode", default=False)
 
 _CURSORS_DIR = Path.home() / ".local" / "share" / "context-helpers" / "cursors"
 
@@ -229,7 +236,11 @@ class BaseCollector(ABC):
         return any(by_key.values())
 
     def apply_push_paging(
-        self, items: "list[dict]", ts_field: str, cursor_key: "str | None" = None
+        self,
+        items: "list[dict]",
+        ts_field: str,
+        cursor_key: "str | None" = None,
+        defer_commit: "bool | None" = None,
     ) -> "list[dict]":
         """Sort items by ts_field ASC, apply push limit, advance push cursor.
 
@@ -241,10 +252,22 @@ class BaseCollector(ABC):
             ts_field: The dict key that holds each item's ISO 8601 timestamp.
             cursor_key: Cursor namespace; defaults to self.name.  Pass a unique
                 value for each endpoint when a single collector has multiple routes.
+            defer_commit: Commit-ack mode.  When None (default) the request-scoped
+                ``push_ack_mode`` flag decides (set from the ``?ack=`` query param);
+                pass True/False to force it.  When False the push cursor is persisted
+                immediately (the data is considered delivered as soon as it is served).
+                When True the new cursor is *staged* in memory rather than persisted —
+                it only becomes the authoritative position once the consumer confirms
+                it committed the page via commit_push_cursors() (the
+                ``POST /collectors/{name}/ack`` endpoint).  Until then
+                resolve_push_since() keeps returning the last committed cursor, so a
+                page whose ingestion fails is re-served instead of silently lost.
 
         Returns:
             The bounded page (at most get_push_limit() items, oldest first).
         """
+        if defer_commit is None:
+            defer_commit = push_ack_mode.get()
         items.sort(key=lambda x: x.get(ts_field) or "")
         limit = self.get_push_limit()
         page = items[:limit]
@@ -256,7 +279,10 @@ class BaseCollector(ABC):
                     dt = datetime.fromisoformat(max_ts_str.replace("Z", "+00:00"))
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=timezone.utc)
-                    self._save_push_cursor(dt, cursor_key)
+                    if defer_commit:
+                        self._stage_push_cursor(dt, cursor_key)
+                    else:
+                        self._save_push_cursor(dt, cursor_key)
                 except ValueError:
                     pass
         effective_key = cursor_key or self.name
@@ -264,6 +290,55 @@ class BaseCollector(ABC):
             self._has_push_more_by_key: dict[str, bool] = {}
         self._has_push_more_by_key[effective_key] = len(items) > limit
         return page
+
+    # ------------------------------------------------------------------
+    # Commit-ack: stage push cursors on serve, commit them on consumer ack
+    # ------------------------------------------------------------------
+
+    def _ensure_push_stage(self) -> None:
+        if not hasattr(self, "_staged_push_cursors"):
+            # {cursor_key: proposed_cursor} — persisted only on commit_push_cursors()
+            self._staged_push_cursors: dict[str, datetime] = {}
+            self._push_stage_lock = threading.Lock()
+
+    def _stage_push_cursor(self, ts: "datetime", cursor_key: "str | None" = None) -> None:
+        """Stage a proposed push cursor without persisting it (commit-ack mode).
+
+        The cursor only becomes the authoritative position once the consumer
+        confirms the commit via commit_push_cursors().  If the ack never arrives
+        the cursor stays staged: resolve_push_since keeps returning the last
+        *committed* cursor, so the page is simply re-served (and de-duplicated)
+        on the next pull rather than being silently advanced past.  This favours
+        a visible, self-healing re-delivery over the risk of advancing past a
+        page the consumer never durably stored.
+        """
+        self._ensure_push_stage()
+        key = cursor_key or self.name
+        with self._push_stage_lock:
+            existing = self._staged_push_cursors.get(key)
+            if existing is None or ts > existing:
+                self._staged_push_cursors[key] = ts
+
+    def _persist_push_cursor_if_newer(self, ts: "datetime", cursor_key: str) -> None:
+        current = self.get_push_cursor(cursor_key)
+        if current is None or ts > current:
+            self._save_push_cursor(ts, cursor_key)
+
+    def commit_push_cursors(self) -> "list[str]":
+        """Persist all staged push cursors (commit-ack confirmation).
+
+        Called by the ``POST /collectors/{name}/ack`` endpoint after the consumer
+        has durably committed the served page(s).  Returns the cursor keys committed.
+        """
+        self._ensure_push_stage()
+        committed = []
+        with self._push_stage_lock:
+            staged = dict(self._staged_push_cursors)
+            self._staged_push_cursors.clear()
+        for key, ts in staged.items():
+            self._persist_push_cursor_if_newer(ts, key)
+            committed.append(key)
+        return committed
 
     def reset_state(self) -> "list[str]":
         """Clear all delivery cursors and in-memory push state for this collector.
@@ -291,6 +366,8 @@ class BaseCollector(ABC):
 
         if hasattr(self, "_has_push_more_by_key"):
             self._has_push_more_by_key.clear()
+        if hasattr(self, "_staged_push_cursors"):
+            self._staged_push_cursors.clear()
         cleared.append("in_memory_push_state")
 
         return cleared

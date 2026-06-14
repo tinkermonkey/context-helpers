@@ -2,7 +2,7 @@
 
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -621,3 +621,104 @@ class TestIterPage:
         (tmp_path / "a.md").write_text("content")
         items, meta = self._consume(_collector(tmp_path), after=None, limit=50)
         assert meta["next_cursor"] == items[-1]["modified_at"]
+
+
+# ---------------------------------------------------------------------------
+# FileFailureTracker — skip-known-bad-files and debounced persistence
+# ---------------------------------------------------------------------------
+
+class TestFailureTrackerSkip:
+    def _tracker(self, tmp_path):
+        from context_helpers.collectors.filesystem.failures import FileFailureTracker
+
+        return FileFailureTracker(threshold=10, state_dir=tmp_path)
+
+    def test_unknown_path_not_skipped(self, tmp_path):
+        t = self._tracker(tmp_path)
+        now = datetime.now(timezone.utc)
+        assert t.should_skip(Path("/nope/file.txt"), now) is False
+
+    def test_failed_unchanged_file_is_skipped(self, tmp_path):
+        t = self._tracker(tmp_path)
+        p = Path("/some/file.bin")
+        t.record_failure(p, UnicodeDecodeError("utf-8", b"", 0, 1, "bad"))
+        # A file whose mtime predates the failed attempt is unchanged → skip.
+        old = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        assert t.should_skip(p, old) is True
+
+    def test_failed_file_retried_after_change(self, tmp_path):
+        t = self._tracker(tmp_path)
+        p = Path("/some/file.bin")
+        t.record_failure(p, UnicodeDecodeError("utf-8", b"", 0, 1, "bad"))
+        # A file modified after the last attempt may have new bytes → retry.
+        future = datetime.now(timezone.utc) + timedelta(days=1)
+        assert t.should_skip(p, future) is False
+
+    def test_permanently_skipped_always_skipped(self, tmp_path):
+        t = self._tracker(tmp_path)
+        p = Path("/some/file.bin")
+        for _ in range(10):
+            t.record_failure(p, UnicodeDecodeError("utf-8", b"", 0, 1, "bad"))
+        assert t.is_permanently_skipped(p) is True
+        future = datetime.now(timezone.utc) + timedelta(days=365)
+        assert t.should_skip(p, future) is True
+
+    def test_transient_failure_is_retried_even_when_unchanged(self, tmp_path):
+        # A transient error (PermissionError/OSError) is NOT deterministic, so an
+        # unchanged file that failed transiently must still be retried — otherwise a
+        # readable file briefly locked by another process is dropped forever.
+        t = self._tracker(tmp_path)
+        p = Path("/some/locked.md")
+        t.record_failure(p, PermissionError("locked"))
+        old = datetime(2000, 1, 1, tzinfo=timezone.utc)  # unchanged file
+        assert t.should_skip(p, old) is False  # transient → retry
+        # ...but it still becomes permanently skipped after enough failures.
+        for _ in range(9):
+            t.record_failure(p, PermissionError("locked"))
+        assert t.should_skip(p, old) is True
+
+    def test_legacy_entry_without_kind_defaults_to_deterministic(self, tmp_path):
+        # Entries written before the 'deterministic' flag existed must keep being
+        # fast-skipped (they are overwhelmingly binary UTF-8 decode failures).
+        t = self._tracker(tmp_path)
+        p = Path("/some/legacy.bin")
+        t._data[str(p)] = {"count": 1, "last_error": "x", "last_attempted": "2026-01-01T00:00:00+00:00"}
+        old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        assert t.should_skip(p, old) is True
+
+    def test_record_failure_is_debounced_until_flush(self, tmp_path):
+        t = self._tracker(tmp_path)
+        state = tmp_path / "filesystem_failures.json"
+        t.record_failure(Path("/some/file.bin"), ValueError("x"))
+        # A single failure is held in memory; nothing written to disk yet.
+        assert not state.exists()
+        t.flush()
+        assert state.exists()
+        assert "file.bin" in state.read_text()
+
+    def test_collector_does_not_reread_known_bad_file(self, tmp_path, monkeypatch):
+        # Keep the failure-state dir separate from the scanned tree (as in
+        # production) so the flushed report files aren't themselves scanned.
+        import context_helpers.collectors.filesystem.collector as mod
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        monkeypatch.setattr(mod, "_STATE_DIR", state_dir)
+        bad = docs / "latin.txt"
+        bad.write_bytes(b"caf\xe9")  # invalid UTF-8
+        c = _collector(docs)
+        assert c.fetch_documents(since=None, extensions=None) == []
+        # Now the failure is recorded; a second scan must not attempt the read.
+        calls = {"n": 0}
+        real_read = Path.read_text
+
+        def counting_read(self, *a, **k):
+            if self == bad:
+                calls["n"] += 1
+            return real_read(self, *a, **k)
+
+        monkeypatch.setattr(Path, "read_text", counting_read)
+        assert c.fetch_documents(since=None, extensions=None) == []
+        assert calls["n"] == 0
