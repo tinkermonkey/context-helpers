@@ -1,724 +1,527 @@
-"""Tests for FilesystemCollector — filtering, skip logic, size limits, pagination."""
+"""Tests for the index-backed FilesystemCollector and its router."""
 
 import json
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+import context_helpers.collectors.base as base_mod
+import context_helpers.collectors.filesystem.collector as collector_mod
 from context_helpers.collectors.filesystem.collector import (
     FilesystemCollector,
-    _KNOWN_BINARY_EXTENSIONS,
-    _SKIP_DIRS,
+    _classify_extension,
 )
-from context_helpers.config import FilesystemConfig
+from context_helpers.config import FilesystemConfig, FilesystemRoot
+
+
+@pytest.fixture(autouse=True)
+def _isolate_state(tmp_path, monkeypatch):
+    """Redirect index + cursor state to a dir *outside* the scanned root.
+
+    Mirrors production, where ~/.local/share/context-helpers is not inside any
+    indexed root — otherwise the scanner would index its own state files.
+    """
+    state = tmp_path.parent / f"{tmp_path.name}_state"
+    state.mkdir(exist_ok=True)
+    monkeypatch.setattr(collector_mod, "_STATE_DIR", state)
+    monkeypatch.setattr(base_mod, "_CURSORS_DIR", state / "cursors")
+    yield
 
 
 def _collector(
-    tmp_path: Path,
+    root: Path,
     extensions=None,
     max_file_size_mb=1.0,
     page_size=50,
     max_response_mb=10.0,
+    exclude_globs=None,
+    include_hidden=False,
+    roots=None,
 ) -> FilesystemCollector:
+    if roots is not None:
+        root_cfgs = [FilesystemRoot(path=str(p)) for p in roots]
+    else:
+        root_cfgs = [FilesystemRoot(path=str(root))]
     cfg = FilesystemConfig(
         enabled=True,
-        directory=str(tmp_path),
+        roots=root_cfgs,
         extensions=extensions if extensions is not None else [],
         max_file_size_mb=max_file_size_mb,
         page_size=page_size,
         max_response_mb=max_response_mb,
+        exclude_globs=exclude_globs or [],
+        include_hidden=include_hidden,
     )
-    return FilesystemCollector(cfg)
+    c = FilesystemCollector(cfg)
+    c.scan_now()
+    return c
+
+
+def _label(root: Path) -> str:
+    return FilesystemCollector._slug(root.resolve().name)
+
+
+def _ids(items):
+    return sorted(i["source_id"] for i in items if not i.get("__deleted__"))
 
 
 # ---------------------------------------------------------------------------
-# fetch_documents — basic behaviour
+# Extension classification
 # ---------------------------------------------------------------------------
 
-class TestFetchDocumentsBasic:
-    def test_returns_list(self, tmp_path):
-        (tmp_path / "a.md").write_text("# Hello")
-        assert isinstance(_collector(tmp_path).fetch_documents(since=None, extensions=None), list)
+class TestClassify:
+    def test_text_extensions(self):
+        for ext in [".md", ".txt", ".py", ".rs", ".go", ".json"]:
+            assert _classify_extension(Path(f"f{ext}")) == 1
 
-    def test_md_file_included_by_default(self, tmp_path):
-        (tmp_path / "note.md").write_text("# Title\nBody text.")
-        result = _collector(tmp_path).fetch_documents(since=None, extensions=None)
-        assert len(result) == 1
+    def test_binary_extensions(self):
+        for ext in [".jpg", ".zip", ".pdf", ".mp4", ".dmg"]:
+            assert _classify_extension(Path(f"f{ext}")) == 0
 
-    def test_txt_file_included_by_default(self, tmp_path):
-        (tmp_path / "note.txt").write_text("Plain text content.")
-        result = _collector(tmp_path).fetch_documents(since=None, extensions=None)
-        assert len(result) == 1
-
-    def test_py_file_included_by_default(self, tmp_path):
-        (tmp_path / "script.py").write_text("print('hello')")
-        result = _collector(tmp_path).fetch_documents(since=None, extensions=None)
-        assert len(result) == 1
-
-    def test_required_keys_present(self, tmp_path):
-        (tmp_path / "a.md").write_text("# Hello")
-        doc = _collector(tmp_path).fetch_documents(since=None, extensions=None)[0]
-        for key in ("source_id", "markdown", "modified_at", "file_size_bytes"):
-            assert key in doc
-
-    def test_empty_files_skipped(self, tmp_path):
-        (tmp_path / "empty.md").write_text("   \n  ")
-        assert _collector(tmp_path).fetch_documents(since=None, extensions=None) == []
-
-    def test_source_id_is_relative_path(self, tmp_path):
-        sub = tmp_path / "sub"
-        sub.mkdir()
-        (sub / "note.md").write_text("content")
-        result = _collector(tmp_path).fetch_documents(since=None, extensions=None)
-        assert result[0]["source_id"] == "sub/note.md"
+    def test_unknown_extension_is_none(self):
+        assert _classify_extension(Path("Makefile")) is None
+        assert _classify_extension(Path("f.weirdext")) is None
 
 
 # ---------------------------------------------------------------------------
-# Extension allowlist
+# Walking / filtering / multi-root
 # ---------------------------------------------------------------------------
 
-class TestExtensionAllowlist:
-    def test_allowlist_includes_matching_extension(self, tmp_path):
-        (tmp_path / "a.md").write_text("content")
-        (tmp_path / "b.txt").write_text("content")
-        result = _collector(tmp_path, extensions=[".md"]).fetch_documents(since=None, extensions=None)
-        assert len(result) == 1
-        assert result[0]["source_id"] == "a.md"
+class TestWalkFiltering:
+    def test_text_files_indexed(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        (tmp_path / "b.py").write_text("print(1)")
+        c = _collector(tmp_path)
+        items, _ = c.fetch_page(after=None, limit=50)
+        assert _ids(items) == [f"{_label(tmp_path)}/a.md", f"{_label(tmp_path)}/b.py"]
 
-    def test_allowlist_excludes_non_matching(self, tmp_path):
-        (tmp_path / "a.py").write_text("print('hi')")
-        result = _collector(tmp_path, extensions=[".md"]).fetch_documents(since=None, extensions=None)
-        assert result == []
+    def test_known_binary_extension_excluded(self, tmp_path):
+        (tmp_path / "img.jpg").write_bytes(b"binary")
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        items, _ = c.fetch_page(after=None, limit=50)
+        assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
-    def test_extensions_param_overrides_config(self, tmp_path):
-        # Config allows only .md, but param requests .txt
-        (tmp_path / "a.md").write_text("md content")
-        (tmp_path / "b.txt").write_text("txt content")
-        result = _collector(tmp_path, extensions=[".md"]).fetch_documents(since=None, extensions=[".txt"])
-        assert len(result) == 1
-        assert result[0]["source_id"] == "b.txt"
+    def test_hidden_file_excluded(self, tmp_path):
+        (tmp_path / ".secret").write_text("hidden")
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        items, _ = c.fetch_page(after=None, limit=50)
+        assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
+    def test_hidden_directory_pruned(self, tmp_path):
+        gitdir = tmp_path / ".git"
+        gitdir.mkdir()
+        (gitdir / "config").write_text("text")
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        items, _ = c.fetch_page(after=None, limit=50)
+        assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
-# ---------------------------------------------------------------------------
-# Binary / skip filtering
-# ---------------------------------------------------------------------------
-
-class TestSkipLogic:
-    def test_known_binary_extension_skipped(self, tmp_path):
-        # Write bytes that happen to be valid UTF-8 but have a binary extension
-        (tmp_path / "image.jpg").write_bytes(b"fake jpg content")
-        assert _collector(tmp_path).fetch_documents(since=None, extensions=None) == []
-
-    def test_dotfile_skipped(self, tmp_path):
-        (tmp_path / ".hidden").write_text("secret")
-        assert _collector(tmp_path).fetch_documents(since=None, extensions=None) == []
-
-    def test_git_directory_skipped(self, tmp_path):
-        git_dir = tmp_path / ".git"
-        git_dir.mkdir()
-        (git_dir / "config").write_text("[core]\nrepositoryformatversion = 0")
-        assert _collector(tmp_path).fetch_documents(since=None, extensions=None) == []
-
-    def test_node_modules_skipped(self, tmp_path):
+    def test_node_modules_pruned(self, tmp_path):
         nm = tmp_path / "node_modules"
         nm.mkdir()
-        (nm / "readme.md").write_text("# Package")
-        assert _collector(tmp_path).fetch_documents(since=None, extensions=None) == []
-
-    def test_binary_content_skipped(self, tmp_path):
-        (tmp_path / "data.bin").write_bytes(bytes(range(256)))
-        assert _collector(tmp_path).fetch_documents(since=None, extensions=None) == []
-
-    def test_non_utf8_file_skipped(self, tmp_path):
-        (tmp_path / "latin.txt").write_bytes(b"caf\xe9")  # latin-1 encoded, not valid UTF-8
-        assert _collector(tmp_path).fetch_documents(since=None, extensions=None) == []
-
-
-# ---------------------------------------------------------------------------
-# Size limit
-# ---------------------------------------------------------------------------
-
-class TestSizeLimit:
-    def test_file_under_limit_included(self, tmp_path):
-        (tmp_path / "small.md").write_text("# Small file")
-        result = _collector(tmp_path, max_file_size_mb=1.0).fetch_documents(since=None, extensions=None)
-        assert len(result) == 1
-
-    def test_file_over_limit_skipped(self, tmp_path):
-        big = tmp_path / "big.txt"
-        big.write_bytes(b"x" * 2000)  # 2000 bytes > 0.001 MB (1048 bytes)
-        result = _collector(tmp_path, max_file_size_mb=0.001).fetch_documents(since=None, extensions=None)
-        assert result == []
-
-    def test_max_size_mb_param_overrides_config(self, tmp_path):
-        # Config allows 1.0 MB; param restricts to 0.001 MB
-        big = tmp_path / "big.txt"
-        big.write_bytes(b"x" * 2000)
-        result = _collector(tmp_path, max_file_size_mb=1.0).fetch_documents(since=None, extensions=None, max_size_mb=0.001)
-        assert result == []
-
-    def test_max_size_mb_param_expands_config_limit(self, tmp_path):
-        # Config is tight; param relaxes it
-        big = tmp_path / "big.txt"
-        big.write_bytes(b"x" * 2000)
-        result = _collector(tmp_path, max_file_size_mb=0.001).fetch_documents(since=None, extensions=None, max_size_mb=1.0)
-        assert len(result) == 1
-
-
-# ---------------------------------------------------------------------------
-# _should_skip_path
-# ---------------------------------------------------------------------------
-
-class TestShouldSkipPath:
-    def test_known_binary_skipped(self, tmp_path):
+        (nm / "readme.md").write_text("# pkg")
+        (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        for ext in [".iso", ".dmg", ".zip", ".jpg", ".mp4"]:
-            assert c._should_skip_path(Path(f"file{ext}")) is True
+        items, _ = c.fetch_page(after=None, limit=50)
+        assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
-    def test_text_extension_not_skipped(self, tmp_path):
-        c = _collector(tmp_path)
-        for ext in [".md", ".txt", ".py", ".rs", ".go"]:
-            assert c._should_skip_path(Path(f"file{ext}")) is False
+    def test_include_hidden_toggle(self, tmp_path):
+        (tmp_path / ".envrc").write_text("export X=1")
+        c = _collector(tmp_path, include_hidden=True)
+        items, _ = c.fetch_page(after=None, limit=50)
+        assert f"{_label(tmp_path)}/.envrc" in _ids(items)
 
-    def test_skip_dir_in_path_skipped(self, tmp_path):
-        c = _collector(tmp_path)
-        assert c._should_skip_path(Path("node_modules/readme.md")) is True
-        assert c._should_skip_path(Path(".git/config")) is True
+    def test_exclude_globs(self, tmp_path):
+        (tmp_path / "keep.md").write_text("# keep")
+        (tmp_path / "skip.md").write_text("# skip")
+        c = _collector(tmp_path, exclude_globs=["skip.*"])
+        items, _ = c.fetch_page(after=None, limit=50)
+        assert _ids(items) == [f"{_label(tmp_path)}/keep.md"]
 
-    def test_allowlist_excludes_non_matching(self, tmp_path):
+    def test_extension_allowlist(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        (tmp_path / "b.py").write_text("print(1)")
         c = _collector(tmp_path, extensions=[".md"])
-        assert c._should_skip_path(Path("file.txt")) is True
-        assert c._should_skip_path(Path("file.md")) is False
+        items, _ = c.fetch_page(after=None, limit=50)
+        assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
+
+    def test_nested_relative_source_id(self, tmp_path):
+        sub = tmp_path / "sub" / "deep"
+        sub.mkdir(parents=True)
+        (sub / "note.md").write_text("# nested")
+        c = _collector(tmp_path)
+        items, _ = c.fetch_page(after=None, limit=50)
+        assert _ids(items) == [f"{_label(tmp_path)}/sub/deep/note.md"]
+
+
+class TestMultiRoot:
+    def test_two_roots_namespaced(self, tmp_path):
+        r1 = tmp_path / "repo1"
+        r2 = tmp_path / "repo2"
+        r1.mkdir()
+        r2.mkdir()
+        (r1 / "README.md").write_text("# one")
+        (r2 / "README.md").write_text("# two")
+        c = _collector(tmp_path, roots=[r1, r2])
+        items, _ = c.fetch_page(after=None, limit=50)
+        assert _ids(items) == ["repo1/README.md", "repo2/README.md"]
+
+    def test_colliding_basenames_deduped(self, tmp_path):
+        a = tmp_path / "x" / "proj"
+        b = tmp_path / "y" / "proj"
+        a.mkdir(parents=True)
+        b.mkdir(parents=True)
+        (a / "f.md").write_text("# a")
+        (b / "f.md").write_text("# b")
+        c = _collector(tmp_path, roots=[a, b])
+        labels = set(c.roots_map().keys())
+        assert labels == {"proj", "proj-2"}
+
+
+# ---------------------------------------------------------------------------
+# Paging / cursor / delivery
+# ---------------------------------------------------------------------------
+
+class TestPaging:
+    def test_page_limit_and_has_more(self, tmp_path):
+        for i in range(5):
+            (tmp_path / f"f{i}.md").write_text(f"# {i}")
+        c = _collector(tmp_path, page_size=3)
+        items, has_more = c.fetch_page(after=None, limit=3)
+        assert len(items) == 3
+        assert has_more is True
+
+    def test_cursor_advances_across_pages(self, tmp_path):
+        for i in range(5):
+            (tmp_path / f"f{i}.md").write_text(f"# {i}")
+        c = _collector(tmp_path)
+        first, _ = c.fetch_page(after=None, limit=3)
+        c.commit_page(c._page_max_seq)
+        second, has_more = c.fetch_page(after=c.get_cursor(), limit=3)
+        assert set(_ids(first)) & set(_ids(second)) == set()
+        assert len(first) + len(second) == 5
+        assert has_more is False
+
+    def test_no_redelivery_after_full_drain(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        items, _ = c.fetch_page(after=None, limit=50)
+        c.commit_page(c._page_max_seq)
+        assert len(items) == 1
+        again, has_more = c.fetch_page(after=c.get_cursor(), limit=50)
+        assert again == []
+        assert has_more is False
+
+    def test_empty_file_not_delivered(self, tmp_path):
+        (tmp_path / "empty.md").write_text("   \n  ")
+        (tmp_path / "real.md").write_text("real")
+        c = _collector(tmp_path)
+        items, _ = c.fetch_page(after=None, limit=50)
+        assert _ids(items) == [f"{_label(tmp_path)}/real.md"]
+
+    def test_oversized_file_skipped_but_cursor_advances(self, tmp_path):
+        (tmp_path / "big.txt").write_bytes(b"x" * 4000)
+        (tmp_path / "small.md").write_text("ok")
+        c = _collector(tmp_path, max_file_size_mb=0.001)  # ~1KB cap
+        items, has_more = c.fetch_page(after=None, limit=50)
+        assert _ids(items) == [f"{_label(tmp_path)}/small.md"]
+        c.commit_page(c._page_max_seq)
+        assert c.has_changes_since(None) is False  # big file's seq was passed
+
+    def test_content_budget_stops_page(self, tmp_path):
+        for i in range(5):
+            (tmp_path / f"f{i}.md").write_text("x" * 100)
+        c = _collector(tmp_path, max_response_mb=0.0002)  # ~209 bytes
+        items, has_more = c.fetch_page(after=None, limit=50)
+        assert len(items) < 5
+        assert has_more is True
+
+    def test_unknown_extension_binary_drains(self, tmp_path):
+        # Files with an unknown extension containing NUL bytes are indexed,
+        # examined once, marked binary, and the page still drains.
+        for i in range(4):
+            (tmp_path / f"f{i}.weird").write_bytes(b"\x00\x01\x02")
+        (tmp_path / "a.md").write_text("real")
+        c = _collector(tmp_path, page_size=2)
+        delivered = []
+        cursor = None
+        for _ in range(10):
+            items, has_more = c.fetch_page(after=cursor, limit=2)
+            delivered.extend(_ids(items))
+            c.commit_page(c._page_max_seq)
+            cursor = c.get_cursor()
+            if not has_more:
+                break
+        assert delivered == [f"{_label(tmp_path)}/a.md"]
+        # The weird files are now classified binary and never re-read.
+        assert c._index.stats()["binary"] == 4
+
+    def test_cursor_beyond_max_restarts(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        items, _ = c.fetch_page(after=10_000, limit=50)  # cursor past end → restart
+        assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
+
+
+# ---------------------------------------------------------------------------
+# Change detection (rescan)
+# ---------------------------------------------------------------------------
+
+class TestRescan:
+    def test_modified_file_redelivered(self, tmp_path):
+        (tmp_path / "a.md").write_text("v1")
+        c = _collector(tmp_path)
+        c.fetch_page(after=None, limit=50)
+        c.commit_page(c._page_max_seq)
+        time.sleep(0.01)
+        (tmp_path / "a.md").write_text("v2 changed")
+        c.scan_now()
+        items, _ = c.fetch_page(after=c.get_cursor(), limit=50)
+        assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
+        assert items[0]["markdown"] == "v2 changed"
+
+    def test_unchanged_file_not_redelivered(self, tmp_path):
+        (tmp_path / "a.md").write_text("v1")
+        c = _collector(tmp_path)
+        c.fetch_page(after=None, limit=50)
+        c.commit_page(c._page_max_seq)
+        c.scan_now()  # no change
+        items, _ = c.fetch_page(after=c.get_cursor(), limit=50)
+        assert items == []
+
+    def test_deleted_file_emits_tombstone(self, tmp_path):
+        (tmp_path / "a.md").write_text("v1")
+        (tmp_path / "b.md").write_text("v2")
+        c = _collector(tmp_path)
+        c.fetch_page(after=None, limit=50)
+        c.commit_page(c._page_max_seq)
+        (tmp_path / "a.md").unlink()
+        c.scan_now()
+        items, _ = c.fetch_page(after=c.get_cursor(), limit=50)
+        tombstones = [i for i in items if i.get("__deleted__")]
+        assert len(tombstones) == 1
+        assert tombstones[0]["source_id"] == f"{_label(tmp_path)}/a.md"
+        c.commit_page(c._page_max_seq)
+        # Tombstone pruned after delivery.
+        assert c._index.stats()["deleted"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Commit-ack
+# ---------------------------------------------------------------------------
+
+class TestCommitAck:
+    def test_ack_mode_stages_cursor(self, tmp_path):
+        from context_helpers.collectors.base import push_ack_mode
+
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        token = push_ack_mode.set(True)
+        try:
+            c.fetch_page(after=None, limit=50)
+            c.commit_page(c._page_max_seq)
+            # Staged, not persisted.
+            assert c.get_cursor() is None
+            committed = c.commit_push_cursors()
+            assert committed == ["filesystem_cursor"]
+            assert c.get_cursor() is not None
+        finally:
+            push_ack_mode.reset(token)
+
+    def test_non_ack_persists_immediately(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        c.fetch_page(after=None, limit=50)
+        c.commit_page(c._page_max_seq)
+        assert c.get_cursor() is not None
+
+    def test_failed_ingest_reserves_page(self, tmp_path):
+        from context_helpers.collectors.base import push_ack_mode
+
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        token = push_ack_mode.set(True)
+        try:
+            first, _ = c.fetch_page(after=None, limit=50)
+            c.commit_page(c._page_max_seq)
+            # Consumer "crashes" without acking → cursor still None → re-served.
+            second, _ = c.fetch_page(after=c.get_cursor(), limit=50)
+            assert _ids(first) == _ids(second)
+        finally:
+            push_ack_mode.reset(token)
 
 
 # ---------------------------------------------------------------------------
 # BaseCollector interface
 # ---------------------------------------------------------------------------
 
-class TestBaseInterface:
-    def test_name_property(self, tmp_path):
+class TestInterface:
+    def test_name(self, tmp_path):
         assert _collector(tmp_path).name == "filesystem"
 
-    def test_watch_paths_returns_directory_when_exists(self, tmp_path):
-        assert _collector(tmp_path).watch_paths() == [tmp_path.resolve()]
+    def test_watch_paths(self, tmp_path):
+        c = _collector(tmp_path)
+        assert c.watch_paths() == [tmp_path.resolve()]
 
-    def test_watch_paths_empty_when_missing(self, tmp_path):
-        assert _collector(tmp_path / "nonexistent").watch_paths() == []
+    def test_has_changes_since(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        assert c.has_changes_since(None) is True
+        c.fetch_page(after=None, limit=50)
+        c.commit_page(c._page_max_seq)
+        assert c.has_changes_since(None) is False
 
+    def test_reset_state_clears_index(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        c.fetch_page(after=None, limit=50)
+        c.commit_page(c._page_max_seq)
+        cleared = c.reset_state()
+        assert "file_index" in cleared
+        assert c.get_cursor() is None
+        assert c._index.stats()["total"] == 0
 
-# ---------------------------------------------------------------------------
-# fetch_page — cursor, limits, has_more
-# ---------------------------------------------------------------------------
+    def test_health_check_ok(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        assert c.health_check()["status"] == "ok"
 
-class TestFetchPage:
-    def test_returns_all_files_when_no_cursor(self, tmp_path):
-        (tmp_path / "a.md").write_text("content A")
-        (tmp_path / "b.md").write_text("content B")
-        items, has_more = _collector(tmp_path).fetch_page(after=None, limit=50)
-        assert len(items) == 2
-        assert has_more is False
-
-    def test_items_sorted_asc_by_modified_at(self, tmp_path):
-        # Create files with distinct mtime ordering
-        a = tmp_path / "a.md"
-        a.write_text("content A")
-        time.sleep(0.02)
-        b = tmp_path / "b.md"
-        b.write_text("content B")
-        items, _ = _collector(tmp_path).fetch_page(after=None, limit=50)
-        assert items[0]["source_id"] == "a.md"
-        assert items[1]["source_id"] == "b.md"
-
-    def test_cursor_filters_older_files(self, tmp_path):
-        a = tmp_path / "a.md"
-        a.write_text("old file")
-        time.sleep(0.02)
-        b = tmp_path / "b.md"
-        b.write_text("new file")
-        # Use mtime of a as the cursor
-        a_mtime = datetime.fromtimestamp(a.stat().st_mtime, tz=timezone.utc)
-        items, _ = _collector(tmp_path).fetch_page(after=a_mtime, limit=50)
-        assert len(items) == 1
-        assert items[0]["source_id"] == "b.md"
-
-    def test_limit_stops_iteration(self, tmp_path):
-        for i in range(5):
-            (tmp_path / f"file{i}.md").write_text(f"content {i}")
-        items, has_more = _collector(tmp_path).fetch_page(after=None, limit=3)
-        assert len(items) == 3
-        assert has_more is True
-
-    def test_has_more_false_when_all_fit(self, tmp_path):
-        for i in range(3):
-            (tmp_path / f"file{i}.md").write_text(f"content {i}")
-        items, has_more = _collector(tmp_path).fetch_page(after=None, limit=10)
-        assert len(items) == 3
-        assert has_more is False
-
-    def test_content_budget_stops_iteration(self, tmp_path):
-        # Each file ~100 bytes; budget = 0.0002 MB (~209 bytes) → stops after ~2 files
-        for i in range(5):
-            (tmp_path / f"file{i}.md").write_text("x" * 100)
-        items, has_more = _collector(tmp_path, max_response_mb=0.0002).fetch_page(after=None, limit=50)
-        assert len(items) < 5
-        assert has_more is True
-
-    def test_empty_files_not_counted_toward_limit(self, tmp_path):
-        (tmp_path / "empty.md").write_text("   ")
-        (tmp_path / "real.md").write_text("real content")
-        items, has_more = _collector(tmp_path).fetch_page(after=None, limit=1)
-        # The empty file is skipped; only real.md should appear
-        assert len(items) == 1
-        assert items[0]["source_id"] == "real.md"
-        assert has_more is False
-
-    def test_extensions_override(self, tmp_path):
-        (tmp_path / "a.md").write_text("markdown")
-        (tmp_path / "b.txt").write_text("plain text")
-        items, _ = _collector(tmp_path).fetch_page(after=None, limit=50, extensions=[".txt"])
-        assert len(items) == 1
-        assert items[0]["source_id"] == "b.txt"
-
-    def test_required_keys_in_page_items(self, tmp_path):
-        (tmp_path / "note.md").write_text("# Note\nBody.")
-        items, _ = _collector(tmp_path).fetch_page(after=None, limit=50)
-        assert len(items) == 1
-        doc = items[0]
-        for key in ("source_id", "markdown", "modified_at", "file_size_bytes"):
-            assert key in doc
-
-    def test_empty_directory_returns_empty_page(self, tmp_path):
-        items, has_more = _collector(tmp_path).fetch_page(after=None, limit=50)
-        assert items == []
-        assert has_more is False
+    def test_health_check_missing_root(self, tmp_path):
+        c = _collector(tmp_path / "nope")
+        assert c.health_check()["status"] == "error"
 
 
 # ---------------------------------------------------------------------------
-# POST /filesystem/fetch endpoint
+# Router endpoints
 # ---------------------------------------------------------------------------
 
 def _make_app(collector: FilesystemCollector):
-    """Build a minimal FastAPI app with the filesystem router for testing."""
-    from fastapi import FastAPI
+    from fastapi import Depends, FastAPI
     from fastapi.testclient import TestClient
 
+    from context_helpers.server import _set_ack_mode
+
     app = FastAPI()
-    router = collector.get_router()
-    app.include_router(router)
+    app.include_router(collector.get_router(), dependencies=[Depends(_set_ack_mode)])
     return TestClient(app)
 
 
-class TestFilesystemFetchEndpoint:
-    def test_returns_200(self, tmp_path):
-        (tmp_path / "a.md").write_text("# Hello")
-        client = _make_app(_collector(tmp_path))
-        resp = client.post("/filesystem/fetch", json={"source_ref": ""})
-        assert resp.status_code == 200
+def _parse_ndjson(text: str) -> list[dict]:
+    return [json.loads(line) for line in text.strip().splitlines() if line.strip()]
 
+
+class TestFetchEndpointJSON:
     def test_response_shape(self, tmp_path):
         (tmp_path / "a.md").write_text("# Hello")
         client = _make_app(_collector(tmp_path))
         data = client.post("/filesystem/fetch", json={"source_ref": ""}).json()
-        assert "normalized_contents" in data
-        assert "has_more" in data
-        assert "next_cursor" in data
-
-    def test_normalized_contents_structure(self, tmp_path):
-        (tmp_path / "note.md").write_text("# Title\nBody.")
-        client = _make_app(_collector(tmp_path))
-        data = client.post("/filesystem/fetch", json={"source_ref": ""}).json()
+        assert set(data) >= {"normalized_contents", "deletions", "has_more", "next_cursor"}
         assert len(data["normalized_contents"]) == 1
         item = data["normalized_contents"][0]
-        assert "markdown" in item
-        assert "source_id" in item
+        assert item["source_id"] == f"{_label(tmp_path)}/a.md"
         assert "structural_hints" in item
-        assert "normalizer_version" in item
-        hints = item["structural_hints"]
-        assert "has_headings" in hints
-        assert "has_lists" in hints
-        assert "has_tables" in hints
-        assert "modified_at" in hints
-        assert "file_size_bytes" in hints
 
-    def test_structural_hints_values(self, tmp_path):
-        (tmp_path / "note.md").write_text("# Title\n- item\n| col |")
+    def test_structural_hints(self, tmp_path):
+        (tmp_path / "n.md").write_text("# Title\n- item\n| a |")
         client = _make_app(_collector(tmp_path))
         item = client.post("/filesystem/fetch", json={"source_ref": ""}).json()["normalized_contents"][0]
-        hints = item["structural_hints"]
-        assert hints["has_headings"] is True
-        assert hints["has_lists"] is True
-        assert hints["has_tables"] is True
+        h = item["structural_hints"]
+        assert h["has_headings"] and h["has_lists"] and h["has_tables"]
 
-    def test_page_size_param_limits_results(self, tmp_path):
-        for i in range(5):
-            (tmp_path / f"file{i}.md").write_text(f"content {i}")
+    def test_pagination_via_cursor(self, tmp_path):
+        for i in range(3):
+            (tmp_path / f"f{i}.md").write_text(f"# {i}")
         client = _make_app(_collector(tmp_path))
-        data = client.post("/filesystem/fetch", json={"source_ref": "", "page_size": 2}).json()
-        assert len(data["normalized_contents"]) == 2
-        assert data["has_more"] is True
+        first = client.post("/filesystem/fetch", json={"source_ref": "", "page_size": 2}).json()
+        assert first["has_more"] is True
+        second = client.post("/filesystem/fetch", json={"source_ref": first["next_cursor"]}).json()
+        assert second["has_more"] is False
+        ids = _ids(first["normalized_contents"]) + _ids(second["normalized_contents"])
+        assert len(ids) == 3
 
-    def test_has_more_false_when_all_fit(self, tmp_path):
-        (tmp_path / "a.md").write_text("content A")
+    def test_deletions_in_json(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        client = _make_app(c)
+        first = client.post("/filesystem/fetch", json={"source_ref": ""}).json()
+        (tmp_path / "a.md").unlink()
+        c.scan_now()
+        data = client.post("/filesystem/fetch", json={"source_ref": first["next_cursor"]}).json()
+        assert len(data["deletions"]) == 1
+        assert data["deletions"][0]["op"] == "delete"
+
+
+class TestFetchEndpointStream:
+    def test_ndjson_content_then_meta(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        (tmp_path / "b.md").write_text("# B")
         client = _make_app(_collector(tmp_path))
-        data = client.post("/filesystem/fetch", json={"source_ref": ""}).json()
-        assert data["has_more"] is False
+        resp = client.post("/filesystem/fetch", json={"source_ref": "", "stream": True})
+        assert "ndjson" in resp.headers["content-type"]
+        lines = _parse_ndjson(resp.text)
+        assert len(lines) == 3
+        assert "has_more" in lines[-1]
+        assert "next_cursor" in lines[-1]
 
-    def test_next_cursor_set_when_items_returned(self, tmp_path):
-        (tmp_path / "a.md").write_text("content")
-        client = _make_app(_collector(tmp_path))
-        data = client.post("/filesystem/fetch", json={"source_ref": ""}).json()
-        assert data["next_cursor"] is not None
+    def test_stream_tombstone_line(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        client = _make_app(c)
+        first = client.post("/filesystem/fetch", json={"source_ref": "", "stream": True})
+        cursor = _parse_ndjson(first.text)[-1]["next_cursor"]
+        (tmp_path / "a.md").unlink()
+        c.scan_now()
+        resp = client.post("/filesystem/fetch", json={"source_ref": cursor, "stream": True})
+        lines = _parse_ndjson(resp.text)
+        deletes = [line for line in lines if line.get("op") == "delete"]
+        assert len(deletes) == 1
 
-    def test_next_cursor_null_when_no_items(self, tmp_path):
-        client = _make_app(_collector(tmp_path))
-        data = client.post("/filesystem/fetch", json={"source_ref": ""}).json()
-        assert data["next_cursor"] is None
-
-    def test_source_ref_as_cursor_filters_results(self, tmp_path):
-        a = tmp_path / "a.md"
-        a.write_text("old file")
-        time.sleep(0.02)
-        b = tmp_path / "b.md"
-        b.write_text("new file")
-
-        # Get cursor from first fetch
-        client = _make_app(_collector(tmp_path))
-        first = client.post("/filesystem/fetch", json={"source_ref": "", "page_size": 1}).json()
-        cursor = first["next_cursor"]
-
-        second = client.post("/filesystem/fetch", json={"source_ref": cursor}).json()
-        assert len(second["normalized_contents"]) == 1
-        assert second["normalized_contents"][0]["source_id"] == "b.md"
-
-    def test_extensions_override_in_request(self, tmp_path):
-        (tmp_path / "a.md").write_text("markdown")
-        (tmp_path / "b.txt").write_text("plain text")
-        client = _make_app(_collector(tmp_path))
-        data = client.post("/filesystem/fetch", json={"source_ref": "", "extensions": [".txt"]}).json()
-        assert len(data["normalized_contents"]) == 1
-        assert data["normalized_contents"][0]["source_id"] == "b.txt"
-
-    def test_empty_directory_returns_empty_page(self, tmp_path):
-        client = _make_app(_collector(tmp_path))
-        data = client.post("/filesystem/fetch", json={"source_ref": ""}).json()
-        assert data["normalized_contents"] == []
-        assert data["has_more"] is False
-        assert data["next_cursor"] is None
+    def test_stream_advances_cursor_via_ack(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        client = _make_app(c)
+        # ack=true → staged only, not persisted until /ack.
+        client.post("/filesystem/fetch?ack=true", json={"source_ref": "", "stream": True})
+        assert c.get_cursor() is None
+        c.commit_push_cursors()
+        assert c.get_cursor() is not None
 
 
-# ---------------------------------------------------------------------------
-# GET /filesystem/file endpoint
-# ---------------------------------------------------------------------------
-
-class TestFilesystemFileEndpoint:
-    def test_returns_200_and_content(self, tmp_path):
-        (tmp_path / "note.md").write_text("# Hello\nWorld")
-        client = _make_app(_collector(tmp_path))
-        resp = client.get("/filesystem/file?path=note.md")
+class TestFileEndpoint:
+    def test_serves_by_source_id(self, tmp_path):
+        (tmp_path / "note.md").write_text("# Hello")
+        c = _collector(tmp_path)
+        client = _make_app(c)
+        resp = client.get(f"/filesystem/file?path={_label(tmp_path)}/note.md")
         assert resp.status_code == 200
         assert "Hello" in resp.text
 
-    def test_returns_404_for_missing_file(self, tmp_path):
+    def test_unknown_root_404(self, tmp_path):
         client = _make_app(_collector(tmp_path))
-        resp = client.get("/filesystem/file?path=nonexistent.md")
+        resp = client.get("/filesystem/file?path=bogus/note.md")
         assert resp.status_code == 404
 
-    def test_returns_404_for_directory(self, tmp_path):
-        (tmp_path / "subdir").mkdir()
-        client = _make_app(_collector(tmp_path))
-        resp = client.get("/filesystem/file?path=subdir")
-        assert resp.status_code == 404
-
-    def test_rejects_path_traversal_dotdot(self, tmp_path):
-        client = _make_app(_collector(tmp_path))
-        resp = client.get("/filesystem/file?path=../../etc/passwd")
-        assert resp.status_code == 403
-
-    def test_rejects_absolute_path(self, tmp_path):
-        client = _make_app(_collector(tmp_path))
-        resp = client.get("/filesystem/file?path=/etc/passwd")
-        assert resp.status_code == 403
-
-    def test_serves_subdirectory_file(self, tmp_path):
-        sub = tmp_path / "sub"
-        sub.mkdir()
-        (sub / "note.md").write_text("nested content")
-        client = _make_app(_collector(tmp_path))
-        resp = client.get("/filesystem/file?path=sub/note.md")
-        assert resp.status_code == 200
-        assert "nested" in resp.text
-
-    def test_serves_oversized_file(self, tmp_path):
-        """Files exceeding max_file_size_mb are still served — that is the point of this endpoint."""
-        big = tmp_path / "big.txt"
-        big.write_text("x" * 2000)
-        # collector with tight size limit; file endpoint ignores it
-        client = _make_app(_collector(tmp_path, max_file_size_mb=0.001))
-        resp = client.get("/filesystem/file?path=big.txt")
-        assert resp.status_code == 200
-        assert len(resp.content) == 2000
-
-    def test_returns_accept_ranges_header(self, tmp_path):
-        """FileResponse sets Accept-Ranges: bytes enabling HTTP range requests."""
-        (tmp_path / "note.md").write_text("content")
-        client = _make_app(_collector(tmp_path))
-        resp = client.get("/filesystem/file?path=note.md")
-        assert resp.headers.get("accept-ranges") == "bytes"
-
-
-# ---------------------------------------------------------------------------
-# POST /filesystem/fetch — NDJSON streaming (stream=True)
-# ---------------------------------------------------------------------------
-
-def _parse_ndjson(text: str) -> list[dict]:
-    """Parse NDJSON response text into a list of dicts."""
-    return [json.loads(line) for line in text.strip().splitlines() if line.strip()]
-
-
-class TestNDJSONStreaming:
-    def test_stream_flag_returns_ndjson_content_type(self, tmp_path):
-        (tmp_path / "a.md").write_text("content")
-        client = _make_app(_collector(tmp_path))
-        resp = client.post("/filesystem/fetch", json={"source_ref": "", "stream": True})
-        assert resp.status_code == 200
-        assert "ndjson" in resp.headers["content-type"]
-
-    def test_stream_yields_content_then_meta(self, tmp_path):
-        (tmp_path / "a.md").write_text("# Note\nBody")
-        (tmp_path / "b.md").write_text("content B")
-        client = _make_app(_collector(tmp_path))
-        resp = client.post("/filesystem/fetch", json={"source_ref": "", "stream": True})
-        lines = _parse_ndjson(resp.text)
-        # 2 content lines + 1 meta line
-        assert len(lines) == 3
-        assert "markdown" in lines[0]
-        assert "markdown" in lines[1]
-        assert "has_more" in lines[2]
-        assert "next_cursor" in lines[2]
-
-    def test_stream_content_lines_have_normalized_content_shape(self, tmp_path):
-        (tmp_path / "note.md").write_text("# Title\nBody")
-        client = _make_app(_collector(tmp_path))
-        resp = client.post("/filesystem/fetch", json={"source_ref": "", "stream": True})
-        lines = _parse_ndjson(resp.text)
-        item = lines[0]
-        assert "markdown" in item
-        assert "source_id" in item
-        assert "structural_hints" in item
-        assert "normalizer_version" in item
-
-    def test_stream_meta_has_more_false_when_all_fit(self, tmp_path):
-        (tmp_path / "a.md").write_text("content")
-        client = _make_app(_collector(tmp_path))
-        resp = client.post("/filesystem/fetch", json={"source_ref": "", "stream": True})
-        lines = _parse_ndjson(resp.text)
-        meta = lines[-1]
-        assert meta["has_more"] is False
-
-    def test_stream_page_size_limit(self, tmp_path):
-        for i in range(5):
-            (tmp_path / f"file{i}.md").write_text(f"content {i}")
-        client = _make_app(_collector(tmp_path))
-        resp = client.post("/filesystem/fetch", json={"source_ref": "", "stream": True, "page_size": 2})
-        lines = _parse_ndjson(resp.text)
-        content_lines = [l for l in lines if "markdown" in l]
-        meta = lines[-1]
-        assert len(content_lines) == 2
-        assert meta["has_more"] is True
-
-    def test_stream_next_cursor_advances(self, tmp_path):
-        (tmp_path / "a.md").write_text("content")
-        client = _make_app(_collector(tmp_path))
-        resp = client.post("/filesystem/fetch", json={"source_ref": "", "stream": True})
-        lines = _parse_ndjson(resp.text)
-        meta = lines[-1]
-        assert meta["next_cursor"] is not None
-
-    def test_stream_empty_directory_yields_only_meta(self, tmp_path):
-        client = _make_app(_collector(tmp_path))
-        resp = client.post("/filesystem/fetch", json={"source_ref": "", "stream": True})
-        lines = _parse_ndjson(resp.text)
-        assert len(lines) == 1
-        assert "has_more" in lines[0]
-        assert lines[0]["has_more"] is False
-        assert lines[0]["next_cursor"] is None
-
-    def test_stream_cursor_filters_correctly(self, tmp_path):
-        a = tmp_path / "a.md"
-        a.write_text("old file")
-        time.sleep(0.02)
-        b = tmp_path / "b.md"
-        b.write_text("new file")
-
-        # First stream: get cursor from a
-        client = _make_app(_collector(tmp_path))
-        resp1 = client.post("/filesystem/fetch", json={"source_ref": "", "stream": True, "page_size": 1})
-        lines1 = _parse_ndjson(resp1.text)
-        cursor = lines1[-1]["next_cursor"]
-
-        # Second stream: should only return b.md
-        resp2 = client.post("/filesystem/fetch", json={"source_ref": cursor, "stream": True})
-        lines2 = _parse_ndjson(resp2.text)
-        content_lines = [l for l in lines2 if "markdown" in l]
-        assert len(content_lines) == 1
-        assert content_lines[0]["source_id"] == "b.md"
-
-    def test_stream_vs_json_same_content(self, tmp_path):
-        """NDJSON stream and JSON fetch return the same normalized content."""
-        (tmp_path / "note.md").write_text("# Title\nBody text")
-        client = _make_app(_collector(tmp_path))
-
-        json_resp = client.post("/filesystem/fetch", json={"source_ref": ""}).json()
-        stream_resp = client.post("/filesystem/fetch", json={"source_ref": "", "stream": True})
-        stream_lines = _parse_ndjson(stream_resp.text)
-        stream_items = [l for l in stream_lines if "markdown" in l]
-
-        assert len(json_resp["normalized_contents"]) == len(stream_items)
-        assert json_resp["normalized_contents"][0]["source_id"] == stream_items[0]["source_id"]
-        assert json_resp["normalized_contents"][0]["markdown"] == stream_items[0]["markdown"]
-
-
-# ---------------------------------------------------------------------------
-# iter_page — collector-level generator
-# ---------------------------------------------------------------------------
-
-class TestIterPage:
-    def _consume(self, collector, **kwargs):
-        """Consume iter_page() and return (items, meta)."""
-        items = []
-        meta = None
-        for obj in collector.iter_page(**kwargs):
-            if obj.get("__meta__"):
-                meta = obj
-            else:
-                items.append(obj)
-        return items, meta
-
-    def test_yields_meta_sentinel(self, tmp_path):
-        (tmp_path / "a.md").write_text("content")
-        items, meta = self._consume(_collector(tmp_path), after=None, limit=50)
-        assert meta is not None
-        assert "has_more" in meta
-        assert "next_cursor" in meta
-
-    def test_yields_same_content_as_fetch_page(self, tmp_path):
-        for i in range(3):
-            (tmp_path / f"file{i}.md").write_text(f"content {i}")
+    def test_traversal_blocked(self, tmp_path):
         c = _collector(tmp_path)
-        page_items, _ = c.fetch_page(after=None, limit=50)
-        iter_items, _ = self._consume(c, after=None, limit=50)
-        assert sorted(i["source_id"] for i in page_items) == sorted(i["source_id"] for i in iter_items)
-
-    def test_has_more_true_when_limit_hit(self, tmp_path):
-        for i in range(5):
-            (tmp_path / f"file{i}.md").write_text(f"content {i}")
-        _, meta = self._consume(_collector(tmp_path), after=None, limit=3)
-        assert meta["has_more"] is True
-
-    def test_next_cursor_is_last_modified_at(self, tmp_path):
-        (tmp_path / "a.md").write_text("content")
-        items, meta = self._consume(_collector(tmp_path), after=None, limit=50)
-        assert meta["next_cursor"] == items[-1]["modified_at"]
+        client = _make_app(c)
+        resp = client.get(f"/filesystem/file?path={_label(tmp_path)}/../../etc/passwd")
+        assert resp.status_code == 403
 
 
-# ---------------------------------------------------------------------------
-# FileFailureTracker — skip-known-bad-files and debounced persistence
-# ---------------------------------------------------------------------------
+class TestDocumentsEndpoint:
+    def test_returns_documents(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        client = _make_app(_collector(tmp_path))
+        data = client.get("/filesystem/documents").json()
+        assert len(data) == 1
+        assert data[0]["source_id"] == f"{_label(tmp_path)}/a.md"
 
-class TestFailureTrackerSkip:
-    def _tracker(self, tmp_path):
-        from context_helpers.collectors.filesystem.failures import FileFailureTracker
-
-        return FileFailureTracker(threshold=10, state_dir=tmp_path)
-
-    def test_unknown_path_not_skipped(self, tmp_path):
-        t = self._tracker(tmp_path)
-        now = datetime.now(timezone.utc)
-        assert t.should_skip(Path("/nope/file.txt"), now) is False
-
-    def test_failed_unchanged_file_is_skipped(self, tmp_path):
-        t = self._tracker(tmp_path)
-        p = Path("/some/file.bin")
-        t.record_failure(p, UnicodeDecodeError("utf-8", b"", 0, 1, "bad"))
-        # A file whose mtime predates the failed attempt is unchanged → skip.
-        old = datetime(2000, 1, 1, tzinfo=timezone.utc)
-        assert t.should_skip(p, old) is True
-
-    def test_failed_file_retried_after_change(self, tmp_path):
-        t = self._tracker(tmp_path)
-        p = Path("/some/file.bin")
-        t.record_failure(p, UnicodeDecodeError("utf-8", b"", 0, 1, "bad"))
-        # A file modified after the last attempt may have new bytes → retry.
-        future = datetime.now(timezone.utc) + timedelta(days=1)
-        assert t.should_skip(p, future) is False
-
-    def test_permanently_skipped_always_skipped(self, tmp_path):
-        t = self._tracker(tmp_path)
-        p = Path("/some/file.bin")
-        for _ in range(10):
-            t.record_failure(p, UnicodeDecodeError("utf-8", b"", 0, 1, "bad"))
-        assert t.is_permanently_skipped(p) is True
-        future = datetime.now(timezone.utc) + timedelta(days=365)
-        assert t.should_skip(p, future) is True
-
-    def test_transient_failure_is_retried_even_when_unchanged(self, tmp_path):
-        # A transient error (PermissionError/OSError) is NOT deterministic, so an
-        # unchanged file that failed transiently must still be retried — otherwise a
-        # readable file briefly locked by another process is dropped forever.
-        t = self._tracker(tmp_path)
-        p = Path("/some/locked.md")
-        t.record_failure(p, PermissionError("locked"))
-        old = datetime(2000, 1, 1, tzinfo=timezone.utc)  # unchanged file
-        assert t.should_skip(p, old) is False  # transient → retry
-        # ...but it still becomes permanently skipped after enough failures.
-        for _ in range(9):
-            t.record_failure(p, PermissionError("locked"))
-        assert t.should_skip(p, old) is True
-
-    def test_legacy_entry_without_kind_defaults_to_deterministic(self, tmp_path):
-        # Entries written before the 'deterministic' flag existed must keep being
-        # fast-skipped (they are overwhelmingly binary UTF-8 decode failures).
-        t = self._tracker(tmp_path)
-        p = Path("/some/legacy.bin")
-        t._data[str(p)] = {"count": 1, "last_error": "x", "last_attempted": "2026-01-01T00:00:00+00:00"}
-        old = datetime(2020, 1, 1, tzinfo=timezone.utc)
-        assert t.should_skip(p, old) is True
-
-    def test_record_failure_is_debounced_until_flush(self, tmp_path):
-        t = self._tracker(tmp_path)
-        state = tmp_path / "filesystem_failures.json"
-        t.record_failure(Path("/some/file.bin"), ValueError("x"))
-        # A single failure is held in memory; nothing written to disk yet.
-        assert not state.exists()
-        t.flush()
-        assert state.exists()
-        assert "file.bin" in state.read_text()
-
-    def test_collector_does_not_reread_known_bad_file(self, tmp_path, monkeypatch):
-        # Keep the failure-state dir separate from the scanned tree (as in
-        # production) so the flushed report files aren't themselves scanned.
-        import context_helpers.collectors.filesystem.collector as mod
-
-        state_dir = tmp_path / "state"
-        state_dir.mkdir()
-        docs = tmp_path / "docs"
-        docs.mkdir()
-        monkeypatch.setattr(mod, "_STATE_DIR", state_dir)
-        bad = docs / "latin.txt"
-        bad.write_bytes(b"caf\xe9")  # invalid UTF-8
-        c = _collector(docs)
-        assert c.fetch_documents(since=None, extensions=None) == []
-        # Now the failure is recorded; a second scan must not attempt the read.
-        calls = {"n": 0}
-        real_read = Path.read_text
-
-        def counting_read(self, *a, **k):
-            if self == bad:
-                calls["n"] += 1
-            return real_read(self, *a, **k)
-
-        monkeypatch.setattr(Path, "read_text", counting_read)
-        assert c.fetch_documents(since=None, extensions=None) == []
-        assert calls["n"] == 0
+    def test_extensions_filter(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        (tmp_path / "b.py").write_text("print(1)")
+        client = _make_app(_collector(tmp_path))
+        data = client.get("/filesystem/documents?extensions=.md").json()
+        assert _ids(data) == [f"{_label(tmp_path)}/a.md"]

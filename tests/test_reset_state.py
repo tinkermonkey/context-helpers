@@ -246,48 +246,38 @@ class TestPagedCollectorResetState:
 # ---------------------------------------------------------------------------
 
 class TestFilesystemCollectorResetState:
-    def test_reset_clears_failure_tracker(self, tmp_path):
+    def _collector(self, tmp_path, monkeypatch):
+        import context_helpers.collectors.filesystem.collector as collector_mod
         from context_helpers.collectors.filesystem.collector import FilesystemCollector
-        from context_helpers.config import FilesystemConfig
+        from context_helpers.config import FilesystemConfig, FilesystemRoot
 
-        config = FilesystemConfig(directory=str(tmp_path), enabled=True)
-        collector = FilesystemCollector(config)
-
-        # Patch tracker state_dir and cursors_dir
+        # Keep the SQLite index + cursors inside the tmp dir, never the real home.
         state_dir = tmp_path / "state"
         state_dir.mkdir()
+        monkeypatch.setattr(collector_mod, "_STATE_DIR", state_dir)
+        root = tmp_path / "root"
+        root.mkdir()
+        config = FilesystemConfig(roots=[FilesystemRoot(path=str(root))], enabled=True)
+        return FilesystemCollector(config), root
+
+    def test_reset_clears_file_index(self, tmp_path, monkeypatch):
+        collector, root = self._collector(tmp_path, monkeypatch)
+        (root / "a.md").write_text("# A")
+        collector.scan_now()
+        assert collector._index.stats()["total"] == 1
+
         cursors_dir = tmp_path / "cursors"
         cursors_dir.mkdir()
-
-        # Write a fake failure state file
-        failures_path = state_dir / "filesystem_failures.json"
-        failures_path.write_text(json.dumps({"version": 1, "files": {"/some/file.txt": {"count": 5, "last_error": "oops", "last_attempted": "2026-01-01T00:00:00+00:00"}}}))
-
-        collector._tracker._state_path = failures_path
-        collector._tracker._report_path = state_dir / "filesystem_failures_report.md"
-        collector._tracker._data = {"/some/file.txt": {"count": 5, "last_error": "oops", "last_attempted": "2026-01-01T00:00:00+00:00"}}
-
         with patch("context_helpers.collectors.base._CURSORS_DIR", cursors_dir):
             cleared = collector.reset_state()
 
-        assert not failures_path.exists()
-        assert collector._tracker._data == {}
-        assert "failure_tracker" in cleared
+        assert collector._index.stats()["total"] == 0
+        assert "file_index" in cleared
 
-    def test_reset_inherits_paged_collector_cleanup(self, tmp_path):
-        from context_helpers.collectors.filesystem.collector import FilesystemCollector
-        from context_helpers.config import FilesystemConfig
-
-        config = FilesystemConfig(directory=str(tmp_path), enabled=True)
-        collector = FilesystemCollector(config)
-
+    def test_reset_inherits_paged_collector_cleanup(self, tmp_path, monkeypatch):
+        collector, _root = self._collector(tmp_path, monkeypatch)
         cursors_dir = tmp_path / "cursors"
-        page_cursor_path = _write_page_cursor(cursors_dir, "filesystem", "2026-01-01T00:00:00+00:00")
-
-        state_dir = tmp_path / "state"
-        state_dir.mkdir()
-        collector._tracker._state_path = state_dir / "filesystem_failures.json"
-        collector._tracker._report_path = state_dir / "filesystem_failures_report.md"
+        page_cursor_path = _write_page_cursor(cursors_dir, "filesystem", "5")
 
         with patch("context_helpers.collectors.base._CURSORS_DIR", cursors_dir):
             cleared = collector.reset_state()

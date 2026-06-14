@@ -139,7 +139,17 @@ class PushTrigger:
                 if not path.is_dir():
                     continue
 
-                debouncer = _DebounceHandler(self._pending.set)
+                # On a file change, both wake the push loop and ask the collector
+                # to refresh eagerly (e.g. the filesystem indexer re-scans) so the
+                # change is indexed before the next delivery cycle.
+                def _on_change(c=collector) -> None:
+                    self._pending.set()
+                    try:
+                        c.request_scan()
+                    except Exception as e:  # pragma: no cover - defensive
+                        logger.warning("PushTrigger: request_scan() failed for %s: %s", c.name, e)
+
+                debouncer = _DebounceHandler(_on_change)
 
                 class _Handler(FileSystemEventHandler):
                     def __init__(self, d):

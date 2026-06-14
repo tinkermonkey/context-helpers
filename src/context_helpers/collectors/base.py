@@ -102,6 +102,23 @@ class BaseCollector(ABC):
         """
         return []
 
+    def start(self) -> None:
+        """Optional startup hook for collectors with background work.
+
+        Called once from the app lifespan after construction.  Default no-op;
+        override (e.g. the filesystem collector) to launch a background thread.
+        """
+
+    def stop(self) -> None:
+        """Optional shutdown hook mirroring :meth:`start`.  Default no-op."""
+
+    def request_scan(self) -> None:
+        """Hint that watched paths changed; collectors may refresh eagerly.
+
+        Called by the FSEvents watcher in addition to waking the push loop.
+        Default no-op; file-indexing collectors override it.
+        """
+
     _state_store: "StateStore | None" = None
 
     def set_state_store(self, state_store: "StateStore") -> None:
