@@ -26,12 +26,6 @@ push_ack_mode: ContextVar[bool] = ContextVar("push_ack_mode", default=False)
 
 _CURSORS_DIR = Path.home() / ".local" / "share" / "context-helpers" / "cursors"
 
-# Safety net for commit-ack delivery: if a consumer requests deferred-commit
-# (stage-then-ack) mode but never sends the ack, a staged cursor older than this
-# is committed anyway on the next deferred serve, so a lost/never-sent ack can
-# never permanently stall forward progress.
-_PUSH_STAGE_TTL_SECONDS = 600
-
 
 class BaseCollector(ABC):
     """Abstract base class for all data source collectors.
@@ -303,36 +297,27 @@ class BaseCollector(ABC):
 
     def _ensure_push_stage(self) -> None:
         if not hasattr(self, "_staged_push_cursors"):
-            # {cursor_key: (proposed_cursor, staged_at)}
-            self._staged_push_cursors: dict[str, tuple[datetime, datetime]] = {}
+            # {cursor_key: proposed_cursor} — persisted only on commit_push_cursors()
+            self._staged_push_cursors: dict[str, datetime] = {}
             self._push_stage_lock = threading.Lock()
 
     def _stage_push_cursor(self, ts: "datetime", cursor_key: "str | None" = None) -> None:
-        """Stage a proposed push cursor without persisting it (commit-ack mode)."""
+        """Stage a proposed push cursor without persisting it (commit-ack mode).
+
+        The cursor only becomes the authoritative position once the consumer
+        confirms the commit via commit_push_cursors().  If the ack never arrives
+        the cursor stays staged: resolve_push_since keeps returning the last
+        *committed* cursor, so the page is simply re-served (and de-duplicated)
+        on the next pull rather than being silently advanced past.  This favours
+        a visible, self-healing re-delivery over the risk of advancing past a
+        page the consumer never durably stored.
+        """
         self._ensure_push_stage()
         key = cursor_key or self.name
-        now = datetime.now(timezone.utc)
         with self._push_stage_lock:
-            # Safety net: flush any staged cursor whose ack never arrived so a
-            # broken/missing ack cannot permanently stall forward progress.
-            self._commit_stale_push_cursors_locked(now)
             existing = self._staged_push_cursors.get(key)
-            if existing is None or ts > existing[0]:
-                self._staged_push_cursors[key] = (ts, now)
-
-    def _commit_stale_push_cursors_locked(self, now: "datetime") -> None:
-        stale = [
-            key
-            for key, (_, staged_at) in self._staged_push_cursors.items()
-            if (now - staged_at).total_seconds() >= _PUSH_STAGE_TTL_SECONDS
-        ]
-        for key in stale:
-            ts, _ = self._staged_push_cursors.pop(key)
-            self._persist_push_cursor_if_newer(ts, key)
-            logger.warning(
-                "BaseCollector: committing stale staged push cursor for %s (no ack within %ds)",
-                key, _PUSH_STAGE_TTL_SECONDS,
-            )
+            if existing is None or ts > existing:
+                self._staged_push_cursors[key] = ts
 
     def _persist_push_cursor_if_newer(self, ts: "datetime", cursor_key: str) -> None:
         current = self.get_push_cursor(cursor_key)
@@ -350,16 +335,10 @@ class BaseCollector(ABC):
         with self._push_stage_lock:
             staged = dict(self._staged_push_cursors)
             self._staged_push_cursors.clear()
-        for key, (ts, _) in staged.items():
+        for key, ts in staged.items():
             self._persist_push_cursor_if_newer(ts, key)
             committed.append(key)
         return committed
-
-    def discard_push_cursors(self) -> None:
-        """Drop staged (un-acked) push cursors without persisting them."""
-        self._ensure_push_stage()
-        with self._push_stage_lock:
-            self._staged_push_cursors.clear()
 
     def reset_state(self) -> "list[str]":
         """Clear all delivery cursors and in-memory push state for this collector.

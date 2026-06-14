@@ -663,6 +663,29 @@ class TestFailureTrackerSkip:
         future = datetime.now(timezone.utc) + timedelta(days=365)
         assert t.should_skip(p, future) is True
 
+    def test_transient_failure_is_retried_even_when_unchanged(self, tmp_path):
+        # A transient error (PermissionError/OSError) is NOT deterministic, so an
+        # unchanged file that failed transiently must still be retried — otherwise a
+        # readable file briefly locked by another process is dropped forever.
+        t = self._tracker(tmp_path)
+        p = Path("/some/locked.md")
+        t.record_failure(p, PermissionError("locked"))
+        old = datetime(2000, 1, 1, tzinfo=timezone.utc)  # unchanged file
+        assert t.should_skip(p, old) is False  # transient → retry
+        # ...but it still becomes permanently skipped after enough failures.
+        for _ in range(9):
+            t.record_failure(p, PermissionError("locked"))
+        assert t.should_skip(p, old) is True
+
+    def test_legacy_entry_without_kind_defaults_to_deterministic(self, tmp_path):
+        # Entries written before the 'deterministic' flag existed must keep being
+        # fast-skipped (they are overwhelmingly binary UTF-8 decode failures).
+        t = self._tracker(tmp_path)
+        p = Path("/some/legacy.bin")
+        t._data[str(p)] = {"count": 1, "last_error": "x", "last_attempted": "2026-01-01T00:00:00+00:00"}
+        old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        assert t.should_skip(p, old) is True
+
     def test_record_failure_is_debounced_until_flush(self, tmp_path):
         t = self._tracker(tmp_path)
         state = tmp_path / "filesystem_failures.json"

@@ -63,19 +63,25 @@ class FileFailureTracker:
 
         A file is skipped without a read attempt when it is either:
           - permanently skipped (failure count >= threshold), or
-          - previously failed and unchanged since the last attempt.
+          - previously failed with a *deterministic* error and unchanged since.
 
-        UTF-8 decode failures are deterministic for given file bytes, so a file
-        that failed to read keeps failing until its content changes.  We compare
-        the file's *mtime* against ``last_attempted``: if the file has not been
-        modified since we last tried (and failed), re-reading it is wasted work.
-        A newer mtime means the bytes may have changed, so we retry.
+        A UTF-8 decode failure is deterministic for given file bytes, so a file
+        that failed to decode keeps failing until its content changes — we compare
+        the file's *mtime* against ``last_attempted`` and skip the re-read while it
+        is unchanged.  A *transient* error (PermissionError, a momentary OSError)
+        is NOT skipped on this basis: those can succeed on a later scan, so they
+        are retried every scan until they either succeed or hit the permanent-skip
+        threshold.  (Older entries written before this distinction lack the
+        ``deterministic`` flag and default to deterministic, preserving the
+        fast-skip for the large pre-existing set of binary-decode failures.)
         """
         entry = self._data.get(str(path))
         if entry is None:
             return False
         if entry.get("count", 0) >= self._threshold:
             return True
+        if not entry.get("deterministic", True):
+            return False
         last = entry.get("last_attempted")
         if not last:
             return False
@@ -105,6 +111,9 @@ class FileFailureTracker:
         entry["count"] += 1
         entry["last_error"] = str(error)
         entry["last_attempted"] = now
+        # A UTF-8 decode failure is deterministic for the file's bytes; anything
+        # else (PermissionError, OSError) is transient and should be retried.
+        entry["deterministic"] = isinstance(error, UnicodeDecodeError)
         newly_skipped = entry["count"] == self._threshold
         self._dirty = True
         self._unsaved += 1

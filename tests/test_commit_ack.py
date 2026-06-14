@@ -9,7 +9,6 @@ immediate-commit behaviour.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from fastapi import APIRouter, Query
@@ -65,10 +64,10 @@ def _auth() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Unit tests: staging / commit / discard
+# Unit tests: staging / commit
 # ---------------------------------------------------------------------------
 
-class TestStageCommitDiscard:
+class TestStageCommit:
     def test_defer_commit_does_not_persist(self, tmp_path):
         c = _PushCollector()
         cursors = tmp_path / "cursors"
@@ -86,15 +85,6 @@ class TestStageCommitDiscard:
             cur = c.get_push_cursor("push")
             assert cur is not None and cur.isoformat() == _MAX_TS
 
-    def test_discard_drops_staged_cursor(self, tmp_path):
-        c = _PushCollector()
-        cursors = tmp_path / "cursors"
-        with patch("context_helpers.collectors.base._CURSORS_DIR", cursors):
-            c.apply_push_paging([dict(i) for i in _ITEMS], "ts", "push", defer_commit=True)
-            c.discard_push_cursors()
-            assert c.get_push_cursor("push") is None
-            assert c.commit_push_cursors() == []  # nothing left to commit
-
     def test_immediate_commit_default_persists(self, tmp_path):
         c = _PushCollector()
         cursors = tmp_path / "cursors"
@@ -102,17 +92,25 @@ class TestStageCommitDiscard:
             c.apply_push_paging([dict(i) for i in _ITEMS], "ts", "push", defer_commit=False)
             assert c.get_push_cursor("push").isoformat() == _MAX_TS
 
-    def test_stale_staged_cursor_auto_commits(self, tmp_path):
+    def test_unacked_serve_does_not_advance_cursor(self, tmp_path):
+        # Without an ack, a deferred serve must NOT persist the cursor — the page
+        # is re-served (and de-duplicated) on the next pull rather than skipped.
         c = _PushCollector()
         cursors = tmp_path / "cursors"
         with patch("context_helpers.collectors.base._CURSORS_DIR", cursors):
-            # Stage a cursor, then backdate its staged_at beyond the TTL.
             c.apply_push_paging([dict(i) for i in _ITEMS], "ts", "push", defer_commit=True)
-            ts, _ = c._staged_push_cursors["push"]
-            c._staged_push_cursors["push"] = (ts, datetime.now(timezone.utc) - timedelta(seconds=601))
-            # A later deferred serve for a *different* key flushes the stale one.
-            c.apply_push_paging([dict(i) for i in _ITEMS], "ts", "other", defer_commit=True)
-            assert c.get_push_cursor("push").isoformat() == _MAX_TS  # auto-committed
+            c.apply_push_paging([dict(i) for i in _ITEMS], "ts", "push", defer_commit=True)
+            assert c.get_push_cursor("push") is None  # still not persisted
+            assert c.commit_push_cursors() == ["push"]  # only commits on ack
+            assert c.get_push_cursor("push").isoformat() == _MAX_TS
+
+    def test_reset_clears_staged_cursors(self, tmp_path):
+        c = _PushCollector()
+        cursors = tmp_path / "cursors"
+        with patch("context_helpers.collectors.base._CURSORS_DIR", cursors):
+            c.apply_push_paging([dict(i) for i in _ITEMS], "ts", "push", defer_commit=True)
+            c.reset_state()
+            assert c.commit_push_cursors() == []  # staged cursors were cleared
 
 
 # ---------------------------------------------------------------------------
