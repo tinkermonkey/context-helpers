@@ -57,6 +57,14 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Start collector background work (e.g. the filesystem indexer) first so
+        # data is ready by the time the push trigger asks for it.
+        for collector in collectors:
+            try:
+                collector.start()
+            except Exception as e:
+                logger.error("collector %s: start() failed: %s", collector.name, e)
+
         push_trigger = None
         if config.push.enabled and config.push.library_url:
             try:
@@ -74,6 +82,12 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
                 push_trigger.stop()
             except Exception as e:
                 logger.error("PushTrigger failed to stop cleanly: %s", e)
+
+        for collector in collectors:
+            try:
+                collector.stop()
+            except Exception as e:
+                logger.error("collector %s: stop() failed: %s", collector.name, e)
 
     app = FastAPI(
         title="context-helpers",
@@ -137,7 +151,14 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
 
             if isinstance(collector, PagedCollector):
                 page_cursor = collector.get_cursor()
-                info["cursor"] = page_cursor.isoformat() if page_cursor else None
+                # Cursor may be a datetime (mtime-based collectors) or an int
+                # (filesystem's change-sequence) — render either as a string.
+                if page_cursor is None:
+                    info["cursor"] = None
+                elif hasattr(page_cursor, "isoformat"):
+                    info["cursor"] = page_cursor.isoformat()
+                else:
+                    info["cursor"] = str(page_cursor)
                 info["has_pending"] = collector.has_pending()
                 info["has_more"] = collector.has_more()
 

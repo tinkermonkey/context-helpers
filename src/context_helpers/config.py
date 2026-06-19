@@ -74,16 +74,62 @@ class MusicConfig(BaseSettings):
     push_page_size: int = 200
 
 
+# Directory names never worth indexing — VCS internals, dep caches, build output.
+# Tunable per-deployment via FilesystemConfig.exclude_dirs (this is the default set).
+_DEFAULT_EXCLUDE_DIRS = [
+    ".git", ".hg", ".svn",
+    "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", ".tox", ".gradle", ".idea", ".vscode",
+    "dist", "build", "target", "out", ".next", ".nuxt", ".cache",
+    "coverage", ".terraform", "vendor", "Pods", "DerivedData",
+    ".Trash", ".DS_Store",
+]
+
+
+class FilesystemRoot(BaseSettings):
+    """One indexed root directory.
+
+    Multiple roots let a single filesystem collector span unrelated trees
+    (e.g. several code repos) while keeping source_ids unambiguous: every
+    document's source_id is namespaced ``<label>/<relative-path>`` so the same
+    relative path in two roots never collides.
+    """
+
+    model_config = {"extra": "ignore"}
+
+    path: str
+    # Display/source_id namespace for this root. Empty → derived from the
+    # directory basename (deduplicated across roots by FilesystemCollector).
+    label: str = ""
+
+
 class FilesystemConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
     enabled: bool = False
-    directory: str = "~/Documents"
-    extensions: list[str] = []          # empty = all readable text files; non-empty = explicit allowlist
+
+    # Indexed roots. Prefer `roots`; `directory` is the legacy single-root form
+    # and is folded into roots when `roots` is empty. When both are empty the
+    # collector defaults to ~/workspace (text-rich; ~/Documents is binary noise).
+    roots: list[FilesystemRoot] = []
+    directory: str = ""                 # legacy single-root; folded into roots
+
+    extensions: list[str] = []          # empty = all detected-text files; non-empty = explicit allowlist
     max_file_size_mb: float = 1.0       # files larger than this are skipped before reading
-    page_size: int = 50                 # max files per paged delivery cycle
+    page_size: int = 200                # candidates examined per paged delivery cycle (index-backed, cheap)
     max_response_mb: float = 10.0       # max total content bytes per page
-    failure_skip_threshold: int = 10    # failures before a file is permanently skipped
+    failure_skip_threshold: int = 5     # deterministic read failures before a file is permanently skipped
+
+    # Exclusions — applied while walking, so excluded trees are never descended.
+    exclude_dirs: list[str] = []        # directory names to prune; empty = use _DEFAULT_EXCLUDE_DIRS
+    exclude_globs: list[str] = []       # fnmatch patterns (posix relpath) to skip, e.g. "*.lock", "secrets/*"
+    include_hidden: bool = False        # when False (default), dot-dirs and dotfiles are skipped
+
+    scan_interval_sec: int = 300        # periodic safety re-scan interval for the background indexer
+
+    def effective_exclude_dirs(self) -> set[str]:
+        """Resolved set of directory names to prune (config override or defaults)."""
+        return set(self.exclude_dirs) if self.exclude_dirs else set(_DEFAULT_EXCLUDE_DIRS)
 
 
 class ObsidianConfig(BaseSettings):

@@ -1,29 +1,33 @@
-"""FilesystemCollector — serves local text files over HTTP."""
+"""FilesystemCollector — index-backed delivery of local text files over HTTP.
+
+Design overview lives in ``index.py``. In short: a background scanner keeps a
+SQLite index of the configured roots fresh, and delivery serves pages straight
+out of that index using a monotonic change-sequence cursor. This makes a full
+ingest O(N) (one scan + one delivery pass) instead of the old O(N²) (a full
+tree walk per page), handles deletions via tombstones, and uses a collision-free
+integer cursor instead of a fragile mtime cursor.
+"""
 
 from __future__ import annotations
 
+import fnmatch
+import hashlib
+import json
 import logging
 import os
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from context_helpers.collectors.base import PagedCollector
-from context_helpers.collectors.filesystem.failures import FileFailureTracker
+from context_helpers.collectors.base import PagedCollector, push_ack_mode
+from context_helpers.collectors.filesystem.index import FileIndex, IndexedFile
 from context_helpers.config import FilesystemConfig
 
 logger = logging.getLogger(__name__)
 
-# Directories that are never worth scanning — contain no user content
-_SKIP_DIRS = {
-    ".git", ".hg", ".svn",
-    "node_modules", ".venv", "venv", "__pycache__",
-    ".DS_Store", ".Trash",
-}
-
-# Extensions that are definitively binary — skip before attempting a read.
-# This is a fast-path optimisation; the UTF-8 decode attempt is the real gate.
+# Extensions that are definitively binary — never indexed, never read.
 _KNOWN_BINARY_EXTENSIONS = {
     ".iso", ".dmg", ".img", ".bin",
     ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
@@ -34,362 +38,469 @@ _KNOWN_BINARY_EXTENSIONS = {
     ".db", ".sqlite", ".sqlite3",
     ".pyc", ".class", ".o", ".a",
     ".ttf", ".otf", ".woff", ".woff2", ".eot",
-    # CAD / 3D / design source formats
     ".dwg", ".dxf", ".blend", ".blend1", ".blend2", ".fbx", ".obj", ".stl",
     ".sketch", ".fig", ".xd", ".psd", ".ai", ".indd",
-    # Font source formats
     ".vfb", ".vfbak", ".ufo", ".glyphs", ".sfd",
-    # Backup / scratch files
     ".bak", ".bak2", ".tmp", ".swp", ".swo", ".orig",
 }
 
+# Extensions known to be UTF-8 text — classified without ever reading the file.
+# Anything not in either set is "unknown" (is_text=NULL): classified once on the
+# first read attempt and cached, so a misclassified file is read at most once.
+_KNOWN_TEXT_EXTENSIONS = {
+    ".md", ".markdown", ".txt", ".text", ".rst", ".org", ".adoc",
+    ".py", ".pyi", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".astro",
+    ".json", ".jsonl", ".ndjson", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".properties",
+    ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat",
+    ".go", ".rs", ".java", ".kt", ".kts", ".scala", ".clj", ".cljs",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".cs", ".m", ".mm",
+    ".rb", ".php", ".pl", ".pm", ".lua", ".r", ".jl", ".nim", ".zig", ".dart",
+    ".ex", ".exs", ".erl", ".hs", ".ml", ".mli", ".fs", ".fsx",
+    ".sql", ".graphql", ".gql", ".proto",
+    ".html", ".htm", ".xml", ".svg", ".css", ".scss", ".sass", ".less",
+    ".csv", ".tsv", ".tex", ".bib",
+    ".tf", ".hcl", ".gradle", ".cmake", ".mk", ".dockerfile", ".env",
+    ".gitignore", ".gitattributes", ".editorconfig", ".log",
+}
+
 _STATE_DIR = Path.home() / ".local" / "share" / "context-helpers"
+_DEFAULT_ROOT = "~/workspace"
+
+
+def _classify_extension(path: Path) -> int | None:
+    """Return 1 (text), 0 (binary), or None (unknown — decide on first read)."""
+    ext = path.suffix.lower()
+    if ext in _KNOWN_BINARY_EXTENSIONS:
+        return 0
+    if ext in _KNOWN_TEXT_EXTENSIONS:
+        return 1
+    return None
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 class FilesystemCollector(PagedCollector):
-    """Collector that reads files from a local directory and serves them over HTTP."""
+    """Serves indexed text files from one or more local roots over HTTP."""
 
-    cursor_field = "modified_at"
+    # Cursor is an integer change-sequence (see index.py), not a timestamp.
+    cursor_field = "seq"
 
     def __init__(self, config: FilesystemConfig) -> None:
         super().__init__()
         self._config = config
-        self._directory = Path(config.directory).expanduser().resolve()
-        self._tracker = FileFailureTracker(
-            threshold=config.failure_skip_threshold,
-            state_dir=_STATE_DIR,
+        self._roots = self._resolve_roots(config)
+        self._index = FileIndex(
+            _STATE_DIR / "filesystem_index.db",
+            failure_threshold=config.failure_skip_threshold,
         )
-        # Max timestamp seen in the last page across all processed files,
-        # including permanently-skipped ones.  Set by fetch_page()/iter_page();
-        # used by consume_stash() and fill_stash() to advance the cursor past
-        # permanently-skipped files so they never block forward progress.
-        self._page_cursor: datetime | None = None
+        self._exclude_dirs = config.effective_exclude_dirs()
+        self._allowlist = {e.lower() for e in config.extensions} if config.extensions else None
+
+        # Background scanner lifecycle.
+        self._scan_thread: threading.Thread | None = None
+        self._scan_stop = threading.Event()
+        self._scan_wake = threading.Event()
+        self._scan_lock = threading.Lock()  # serialise concurrent scan_now() calls
+
+        # Max seq examined by the most recent page — used to advance the cursor
+        # past skipped (binary/oversized) files and to stage the commit-ack seq.
+        self._page_max_seq: int | None = None
+        # Commit-ack staging (mirrors BaseCollector's push-cursor staging but for
+        # the integer seq cursor this collector uses).
+        self._staged_seq: int | None = None
+        self._seq_stage_lock = threading.Lock()
 
     @property
     def name(self) -> str:
         return "filesystem"
+
+    # ------------------------------------------------------------------
+    # Roots
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _slug(name: str) -> str:
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
+        return slug or "root"
+
+    def _resolve_roots(self, config: FilesystemConfig) -> list[tuple[str, Path]]:
+        """Return [(label, resolved_path)] from config, with deduplicated labels.
+
+        Precedence: explicit `roots`, else legacy single `directory`, else the
+        ~/workspace default. Labels namespace source_ids so identical relative
+        paths in different roots never collide.
+        """
+        raw: list[tuple[str, str]] = []
+        if config.roots:
+            for r in config.roots:
+                raw.append((r.label, r.path))
+        elif config.directory:
+            raw.append(("", config.directory))
+        else:
+            raw.append(("", _DEFAULT_ROOT))
+
+        resolved: list[tuple[str, Path]] = []
+        used: set[str] = set()
+        for label, path_str in raw:
+            p = Path(path_str).expanduser().resolve()
+            base = label.strip() or self._slug(p.name)
+            unique = base
+            i = 2
+            while unique in used:
+                unique = f"{base}-{i}"
+                i += 1
+            used.add(unique)
+            resolved.append((unique, p))
+        return resolved
+
+    def roots_map(self) -> dict[str, Path]:
+        return {label: path for label, path in self._roots}
+
+    # ------------------------------------------------------------------
+    # BaseCollector interface
+    # ------------------------------------------------------------------
 
     def get_router(self):
         from context_helpers.collectors.filesystem.router import make_filesystem_router
         return make_filesystem_router(self)
 
     def health_check(self) -> dict:
-        if not self._directory.exists():
-            return {"status": "error", "message": f"Directory not found: {self._directory}"}
-        if not self._directory.is_dir():
-            return {"status": "error", "message": f"Path is not a directory: {self._directory}"}
-        try:
-            next(self._directory.iterdir())
-        except StopIteration:
-            pass  # Empty directory is fine
-        except PermissionError:
-            return {"status": "error", "message": f"Permission denied reading directory: {self._directory}"}
-        return {"status": "ok", "message": f"Directory accessible: {self._directory}"}
+        existing = [p for _, p in self._roots if p.is_dir()]
+        missing = [str(p) for _, p in self._roots if not p.is_dir()]
+        if not existing:
+            return {"status": "error", "message": f"No indexed roots exist: {missing}"}
+        stats = self._index.stats()
+        msg = f"Indexing {len(existing)} root(s); {stats['text']} text / {stats['total']} files"
+        if missing:
+            return {"status": "degraded", "message": f"{msg}; missing roots: {missing}"}
+        return {"status": "ok", "message": msg}
 
     def check_permissions(self) -> list[str]:
-        if not self._directory.exists():
-            return [f"Directory not found: {self._directory}"]
-        try:
-            next(self._directory.iterdir())
-        except StopIteration:
-            pass
-        except PermissionError:
-            return [f"Read permission required for: {self._directory}"]
-        return []
-
-    def reset_state(self) -> list[str]:
-        cleared = super().reset_state()
-        cleared.extend(self._tracker.reset())
-        return cleared
-
-    def _walk_files(self) -> Iterator[Path]:
-        """Yield all file paths under the configured directory.
-
-        Uses os.walk() with in-place directory pruning so skip-dirs and
-        hidden directories are never descended into — far faster than
-        rglob("*") on large trees (e.g. ~/Documents with 400K+ files in
-        hidden subdirectories).
-        """
-        for dirpath, dirnames, filenames in os.walk(self._directory):
-            # Prune in-place: os.walk will not descend into removed entries
-            dirnames[:] = [
-                d for d in dirnames
-                if not (d.startswith(".") or d in _SKIP_DIRS)
-            ]
-            dir_path = Path(dirpath)
-            for filename in filenames:
-                yield dir_path / filename
-
-    def _should_skip_path(self, path: Path) -> bool:
-        """Return True if this path should be excluded from scanning."""
-        if any(part.startswith(".") or part in _SKIP_DIRS for part in path.parts):
-            return True
-        ext = path.suffix.lower()
-        if ext in _KNOWN_BINARY_EXTENSIONS:
-            return True
-        if self._config.extensions and ext not in {e.lower() for e in self._config.extensions}:
-            return True
-        return False
-
-    def has_changes_since(self, watermark: datetime | None) -> bool:
-        # Compare against the collector's own delivery cursor, not the global watermark.
-        # The watermark reflects the last successful push cycle (often today's date), but
-        # the collector cursor tracks delivery position within the file tree — which may
-        # be years behind for a fresh ingest.  Using watermark here would return False for
-        # all historical files and stall the backlog indefinitely.
-        check_after = self.get_cursor()
-        max_bytes = int(self._config.max_file_size_mb * 1024 * 1024)
-        for path in self._walk_files():
-            if self._should_skip_path(path):
+        problems = []
+        for _, p in self._roots:
+            if not p.exists():
+                problems.append(f"Root not found: {p}")
                 continue
             try:
-                stat = path.stat()
-                if stat.st_size > max_bytes:
-                    continue
-                mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-                # Known-bad (and unchanged) files would only fail to read again —
-                # don't report them as "changes" or the push trigger fires forever.
-                if self._tracker.should_skip(path, mtime):
-                    continue
-                if check_after is None or mtime > check_after:
-                    return True
-            except OSError:
-                pass
-        return False
+                next(os.scandir(p), None)
+            except PermissionError:
+                problems.append(f"Read permission required for: {p}")
+        return problems
 
     def watch_paths(self) -> list[Path]:
-        return [self._directory] if self._directory.is_dir() else []
+        return [p for _, p in self._roots if p.is_dir()]
+
+    def has_changes_since(self, watermark: datetime | None) -> bool:
+        # Cheap index lookup against the collector's own delivery cursor — the
+        # global watermark is irrelevant to where we are in the file stream.
+        return self._index.has_changes(self.get_cursor() or 0)
 
     # ------------------------------------------------------------------
-    # PagedCollector overrides — cursor advancement past skipped files
+    # Scanner lifecycle (start/stop called from the app lifespan)
     # ------------------------------------------------------------------
 
-    def fill_stash(self, limit: int) -> None:
-        """Pre-load one page into the stash, then advance cursor past any
-        permanently-skipped files whose timestamps trail the page boundary.
+    def start(self) -> None:
+        if self._scan_thread is not None:
+            return
+        self._scan_stop.clear()
+        self._scan_thread = threading.Thread(
+            target=self._scan_loop, daemon=True, name="filesystem-scanner"
+        )
+        self._scan_thread.start()
+        logger.info("filesystem: scanner started for roots %s", [str(p) for _, p in self._roots])
 
-        If every candidate in the page is permanently skipped (stash stays
-        empty), the cursor is still advanced here so the next poll cycle
-        does not re-attempt those files.
-        """
-        super().fill_stash(limit)
-        # When the stash is empty (all-skipped edge case) consume_stash() is
-        # never called, so we must advance the cursor now.
-        # Note: _page_cursor is NOT reset here. base.fill_stash() is idempotent
-        # (early-returns if stash is already populated without calling fetch_page()),
-        # so resetting _page_cursor before super() would clobber the value set
-        # by the previous real fill, breaking cursor advancement on consume.
-        # fetch_page() always writes _page_cursor at the end, including None when
-        # there are no candidates, so the value is always fresh after a real fill.
-        if not self.has_pending() and self._page_cursor is not None:
-            current = self.get_cursor()
-            if current is None or self._page_cursor > current:
-                self._save_cursor(self._page_cursor)
+    def stop(self) -> None:
+        self._scan_stop.set()
+        self._scan_wake.set()
+        if self._scan_thread is not None:
+            self._scan_thread.join(timeout=10.0)
+            self._scan_thread = None
+        self._index.close()
 
-    def consume_stash(self) -> list[dict]:
-        """Return stash and advance cursor, including past permanently-skipped files."""
-        items = super().consume_stash()  # advances cursor to max of delivered items
-        # Advance further if any permanently-skipped file had a higher timestamp
-        # than the highest-timestamp delivered item.
-        if self._page_cursor is not None:
-            current = self.get_cursor()
-            if current is None or self._page_cursor > current:
-                self._save_cursor(self._page_cursor)
-        return items
+    def request_scan(self) -> None:
+        """Wake the scanner immediately (called by the FSEvents watcher)."""
+        self._scan_wake.set()
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _collect_candidates(
-        self,
-        after: datetime | None,
-        extensions: list[str] | None,
-        max_size_mb: float | None,
-    ) -> list[tuple[datetime, Path, object]]:
-        """Collect candidate files matching filters, sorted ASC by modified_at.
-
-        Reads only file metadata (stat); no file content is read here.
-        """
-        effective_max_mb = max_size_mb if max_size_mb is not None else self._config.max_file_size_mb
-        max_file_bytes = int(effective_max_mb * 1024 * 1024)
-        override_exts = {e.lower() for e in extensions} if extensions else None
-
-        candidates = []
-        for file_path in self._walk_files():
-            ext = file_path.suffix.lower()
-            if override_exts is not None:
-                if ext not in override_exts:
-                    continue
-            elif self._should_skip_path(file_path):
-                continue
+    def _scan_loop(self) -> None:
+        while not self._scan_stop.is_set():
             try:
-                stat = file_path.stat()
-                if stat.st_size > max_file_bytes:
-                    logger.debug(
-                        "Skipping %s: exceeds max_file_size_mb (%.1f MB)",
-                        file_path, stat.st_size / 1024 / 1024,
-                    )
-                    continue
-                modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-                # Strictly greater than cursor — exclude the file at the cursor timestamp
-                # so that repeated fetches with the same cursor don't re-deliver it.
-                if after and modified_at <= after:
-                    continue
-                candidates.append((modified_at, file_path, stat))
-            except OSError:
-                pass
+                self.scan_now()
+            except Exception as e:
+                logger.error("filesystem: scan failed: %s", e, exc_info=True)
+            self._scan_wake.wait(timeout=self._config.scan_interval_sec)
+            self._scan_wake.clear()
 
-        candidates.sort(key=lambda x: x[0])
-        return candidates
+    def scan_now(self) -> dict:
+        """Run one full scan synchronously; returns a small summary.
 
-    def _make_doc(self, file_path: Path, content: str, modified_at: datetime, stat: object) -> dict:
-        """Build the flat document dict for a file whose content has been read."""
-        source_id = str(file_path.relative_to(self._directory))
+        Serialised so a manual scan and the background loop never overlap.
+        """
+        with self._scan_lock:
+            gen = self._index.begin_scan()
+            seen = 0
+            changed = 0
+            for label, root in self._roots:
+                if not root.is_dir():
+                    continue
+                for abspath, rel in self._walk(root):
+                    try:
+                        st = abspath.stat()
+                    except OSError:
+                        continue
+                    seen += 1
+                    if self._index.index_file(
+                        source_id=f"{label}/{rel}",
+                        abspath=str(abspath),
+                        root_label=label,
+                        rel_path=rel,
+                        size=st.st_size,
+                        mtime=st.st_mtime,
+                        is_text=_classify_extension(abspath),
+                        gen=gen,
+                    ):
+                        changed += 1
+            deleted = self._index.finalize_scan(gen)
+            logger.debug("filesystem: scan gen=%d seen=%d changed=%d deleted=%d", gen, seen, changed, deleted)
+            return {"seen": seen, "changed": changed, "deleted": deleted}
+
+    # ------------------------------------------------------------------
+    # Walking / filtering
+    # ------------------------------------------------------------------
+
+    def _dir_allowed(self, name: str) -> bool:
+        if not self._config.include_hidden and name.startswith("."):
+            return False
+        return name not in self._exclude_dirs
+
+    def _file_allowed(self, name: str, rel: str) -> bool:
+        if not self._config.include_hidden and name.startswith("."):
+            return False
+        ext = Path(name).suffix.lower()
+        if ext in _KNOWN_BINARY_EXTENSIONS:
+            return False
+        if self._allowlist is not None and ext not in self._allowlist:
+            return False
+        for pat in self._config.exclude_globs:
+            if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(name, pat):
+                return False
+        return True
+
+    def _walk(self, root: Path) -> Iterator[tuple[Path, str]]:
+        """Yield (abspath, posix-relpath) for included files under *root*."""
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if self._dir_allowed(d)]
+            base = Path(dirpath)
+            for fn in filenames:
+                ap = base / fn
+                try:
+                    rel = ap.relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                if self._file_allowed(fn, rel):
+                    yield ap, rel
+
+    # ------------------------------------------------------------------
+    # Document construction
+    # ------------------------------------------------------------------
+
+    def _make_doc(self, f: IndexedFile, content: str, content_hash: str) -> dict:
+        modified_at = datetime.fromtimestamp(f.mtime, tz=timezone.utc)
         return {
-            "source_id": source_id,
+            "source_id": f.source_id,
             "markdown": content,
             "modified_at": modified_at.isoformat(),
-            "file_size_bytes": stat.st_size,  # type: ignore[attr-defined]
+            "file_size_bytes": f.size,
+            "content_hash": content_hash,
             "has_headings": bool(re.search(r"^#{1,6}\s", content, re.MULTILINE)),
             "has_lists": bool(re.search(r"^(?:[\-\*\+]|\d+\.)\s", content, re.MULTILINE)),
             "has_tables": bool(re.search(r"^\|.+\|$", content, re.MULTILINE)),
         }
 
+    def _make_tombstone(self, f: IndexedFile) -> dict:
+        modified_at = datetime.fromtimestamp(f.mtime, tz=timezone.utc)
+        return {
+            "__deleted__": True,
+            "source_id": f.source_id,
+            "modified_at": modified_at.isoformat(),
+        }
+
     # ------------------------------------------------------------------
-    # PagedCollector protocol
+    # Paged delivery (canonical generator; fetch_page wraps it)
     # ------------------------------------------------------------------
-
-    def fetch_page(
-        self,
-        after: datetime | None,
-        limit: int,
-        extensions: list[str] | None = None,
-        max_size_mb: float | None = None,
-    ) -> tuple[list[dict], bool]:
-        """Fetch up to limit files modified after `after`, bounded by content budget.
-
-        Args:
-            after: Cursor; only return files with modified_at strictly > after.
-            limit: Maximum number of files to return.
-            extensions: Optional override for file extension filter.
-            max_size_mb: Optional override for per-file size cap.
-
-        Returns:
-            (files sorted ASC by modified_at, has_more)
-
-        Side-effect:
-            Sets self._page_cursor to the max modified_at seen across all
-            processed candidates (delivered + permanently-skipped), so the
-            caller can advance the persistent cursor past skipped files.
-        """
-        candidates = self._collect_candidates(after, extensions, max_size_mb)
-        max_content_bytes = int(self._config.max_response_mb * 1024 * 1024)
-
-        results = []
-        content_bytes = 0
-        idx = 0
-        page_max_ts: datetime | None = None
-
-        while idx < len(candidates) and len(results) < limit and content_bytes < max_content_bytes:
-            modified_at, file_path, stat = candidates[idx]
-            idx += 1
-
-            # Skip permanently-skipped files and files that already failed and
-            # haven't changed — but advance the cursor past them so they never
-            # block forward progress.
-            if self._tracker.should_skip(file_path, modified_at):
-                if page_max_ts is None or modified_at > page_max_ts:
-                    page_max_ts = modified_at
-                continue
-
-            try:
-                content = file_path.read_text(encoding="utf-8")
-                if not content.strip():
-                    continue
-                content_bytes += len(content.encode("utf-8"))
-                results.append(self._make_doc(file_path, content, modified_at, stat))
-                if page_max_ts is None or modified_at > page_max_ts:
-                    page_max_ts = modified_at
-            except (UnicodeDecodeError, PermissionError, OSError) as e:
-                self._tracker.record_failure(file_path, e)
-                if self._tracker.is_permanently_skipped(file_path):
-                    # Newly crossed threshold: include ts in cursor advancement
-                    if page_max_ts is None or modified_at > page_max_ts:
-                        page_max_ts = modified_at
-                else:
-                    logger.warning("Skipping %s: %s", file_path, e)
-                continue
-
-        self._tracker.flush()
-        self._page_cursor = page_max_ts
-        return results, idx < len(candidates)
 
     def iter_page(
         self,
-        after: datetime | None,
+        after: int | None,
         limit: int,
         extensions: list[str] | None = None,
         max_size_mb: float | None = None,
     ) -> Iterator[dict]:
-        """Lazily yield document dicts one at a time within the page budget.
+        """Lazily yield content/tombstone dicts for one page, then a meta sentinel.
 
-        Yields file dicts (same shape as fetch_page items) for each file,
-        then a final sentinel dict: ``{"__meta__": True, "has_more": bool,
-        "next_cursor": str | None}`` marking the end of the page.
-
-        Unlike fetch_page(), file content is read one file at a time —
-        peak memory is bounded to the size of a single file rather than
-        the full page.
-
-        The ``next_cursor`` in the sentinel reflects the max modified_at seen
-        across all processed files, including permanently-skipped ones, so
-        the caller's cursor always advances past skipped files.
+        Content docs read one file at a time (peak memory ≈ one file). The page
+        examines at most *limit* index rows ordered by seq; the cursor advances
+        past every examined row (including skipped binary/oversized files), so
+        progress is never blocked. The trailing sentinel is
+        ``{"__meta__": True, "has_more": bool, "next_cursor": str}``.
         """
-        candidates = self._collect_candidates(after, extensions, max_size_mb)
+        override_exts = {e.lower() for e in extensions} if extensions else self._allowlist
+        max_mb = max_size_mb if max_size_mb is not None else self._config.max_file_size_mb
+        max_file_bytes = int(max_mb * 1024 * 1024)
         max_content_bytes = int(self._config.max_response_mb * 1024 * 1024)
 
+        after_seq = after or 0
+        ceiling = self._index.max_seq()
+        # Cursor beyond our highest seq ⇒ the index was reset out from under the
+        # consumer; restart from the beginning (the consumer dedupes by content).
+        if after_seq > ceiling:
+            after_seq = 0
+
+        candidates = self._index.fetch_candidates(after_seq, limit)
         content_bytes = 0
-        count = 0
-        idx = 0
-        max_ts_seen: datetime | None = None
+        page_max = after_seq
 
-        while idx < len(candidates) and count < limit and content_bytes < max_content_bytes:
-            modified_at, file_path, stat = candidates[idx]
-            idx += 1
+        for f in candidates:
+            page_max = f.seq  # advance over every examined row, delivered or not
 
-            # Skip permanently-skipped files and files that already failed and
-            # haven't changed — but advance the cursor past them.
-            if self._tracker.should_skip(file_path, modified_at):
-                if max_ts_seen is None or modified_at > max_ts_seen:
-                    max_ts_seen = modified_at
+            if f.state == "deleted":
+                yield self._make_tombstone(f)
+                continue
+            if f.is_text == 0:
+                continue  # known binary — skip; cursor still advances past it
+            if f.size > max_file_bytes:
+                continue
+            if override_exts is not None and Path(f.rel_path).suffix.lower() not in override_exts:
+                continue
+
+            abspath = Path(f.abspath)
+            try:
+                data = abspath.read_bytes()
+            except FileNotFoundError:
+                continue  # vanished since scan; next scan will tombstone it
+            except (PermissionError, OSError) as e:
+                self._index.record_transient_failure(f.source_id, str(e))
                 continue
 
             try:
-                content = file_path.read_text(encoding="utf-8")
-                if not content.strip():
-                    continue
-                content_bytes += len(content.encode("utf-8"))
-                doc = self._make_doc(file_path, content, modified_at, stat)
-                count += 1
-                if max_ts_seen is None or modified_at > max_ts_seen:
-                    max_ts_seen = modified_at
-                yield doc
-            except (UnicodeDecodeError, PermissionError, OSError) as e:
-                self._tracker.record_failure(file_path, e)
-                if self._tracker.is_permanently_skipped(file_path):
-                    if max_ts_seen is None or modified_at > max_ts_seen:
-                        max_ts_seen = modified_at
-                else:
-                    logger.warning("Skipping %s: %s", file_path, e)
+                content = data.decode("utf-8")
+            except UnicodeDecodeError as e:
+                self._index.mark_binary(f.source_id, str(e))
+                continue
+            if "\x00" in content:
+                self._index.mark_binary(f.source_id, "NUL byte in content")
                 continue
 
-        self._tracker.flush()
-        next_cursor = max_ts_seen.isoformat() if max_ts_seen else None
-        yield {"__meta__": True, "has_more": idx < len(candidates), "next_cursor": next_cursor}
+            content_hash = _sha256(data)
+            if not content.strip():
+                # Cache as text so we don't re-read it, but don't deliver empties.
+                self._index.mark_text(f.source_id, content_hash)
+                continue
+
+            self._index.mark_text(f.source_id, content_hash)
+            yield self._make_doc(f, content, content_hash)
+            content_bytes += len(data)
+            if content_bytes >= max_content_bytes:
+                break
+
+        self._page_max_seq = page_max
+        has_more = self._index.has_changes(page_max)
+        yield {"__meta__": True, "has_more": has_more, "next_cursor": str(page_max)}
+
+    def fetch_page(  # type: ignore[override]
+        self,
+        after: int | None,
+        limit: int,
+        extensions: list[str] | None = None,
+        max_size_mb: float | None = None,
+    ) -> tuple[list[dict], bool]:
+        """Materialise one page: (content+tombstone dicts, has_more)."""
+        items: list[dict] = []
+        has_more = False
+        for obj in self.iter_page(after, limit, extensions, max_size_mb):
+            if obj.get("__meta__"):
+                has_more = bool(obj["has_more"])
+                break
+            items.append(obj)
+        return items, has_more
 
     # ------------------------------------------------------------------
-    # Backward-compatible direct API (GET /documents)
+    # Cursor (integer seq) + commit-ack
+    # ------------------------------------------------------------------
+
+    def get_cursor(self) -> int | None:  # type: ignore[override]
+        if not self._cursor_path.exists():
+            return None
+        try:
+            with open(self._cursor_path) as fh:
+                v = json.load(fh).get("cursor")
+            return int(v) if v is not None else None
+        except (json.JSONDecodeError, OSError, ValueError, TypeError):
+            return None
+
+    def _save_cursor(self, seq: int) -> None:  # type: ignore[override]
+        self._cursor_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._cursor_path.with_suffix(".tmp")
+        try:
+            with open(tmp, "w") as fh:
+                json.dump({"cursor": int(seq)}, fh)
+                fh.write("\n")
+            tmp.replace(self._cursor_path)
+        except OSError as e:
+            logger.error("filesystem: failed to write cursor: %s", e)
+
+    def commit_page(self, page_max_seq: int) -> None:
+        """Advance the cursor to *page_max_seq* and prune delivered tombstones.
+
+        Honours commit-ack: in ack mode the seq is staged and only persisted by
+        commit_push_cursors() (after the consumer confirms it committed). Outside
+        ack mode the cursor is persisted immediately.
+        """
+        if push_ack_mode.get():
+            with self._seq_stage_lock:
+                if self._staged_seq is None or page_max_seq > self._staged_seq:
+                    self._staged_seq = page_max_seq
+            return
+        self._persist_seq(page_max_seq)
+
+    def _persist_seq(self, seq: int) -> None:
+        current = self.get_cursor() or 0
+        if seq > current:
+            self._save_cursor(seq)
+        self._index.prune_deleted(seq)
+
+    def commit_push_cursors(self) -> list[str]:  # type: ignore[override]
+        """Commit the staged seq cursor (the ?ack=true confirmation)."""
+        with self._seq_stage_lock:
+            seq = self._staged_seq
+            self._staged_seq = None
+        if seq is None:
+            return []
+        self._persist_seq(seq)
+        return ["filesystem_cursor"]
+
+    # ------------------------------------------------------------------
+    # Stash overrides (push-trigger compatibility) — non-ack immediate commit
+    # ------------------------------------------------------------------
+
+    def fill_stash(self, limit: int) -> None:
+        super().fill_stash(limit)
+        # All-skipped page leaves the stash empty and consume_stash is never
+        # called, so advance the cursor here to avoid re-examining skipped files.
+        if not self.has_pending() and self._page_max_seq is not None:
+            self._persist_seq(self._page_max_seq)
+
+    def consume_stash(self) -> list[dict]:
+        with self._stash_lock:
+            items = self._stash
+            self._stash = []
+        if self._page_max_seq is not None:
+            self._persist_seq(self._page_max_seq)
+        return items
+
+    # ------------------------------------------------------------------
+    # Backward-compatible direct API (GET /filesystem/documents)
     # ------------------------------------------------------------------
 
     def fetch_documents(
@@ -398,26 +509,14 @@ class FilesystemCollector(PagedCollector):
         extensions: list[str] | None,
         max_size_mb: float | None = None,
     ) -> list[dict]:
-        """Return documents from the configured directory.
+        """Return present text documents (optionally modified since *since*).
 
-        Args:
-            since: Optional ISO 8601 timestamp; only return files modified after this time.
-            extensions: Optional list of file extensions to include (e.g. [".md", ".txt"]).
-                        Defaults to the configured extensions.
-            max_size_mb: Optional size cap in MB; overrides the configured max_file_size_mb
-                         when provided by the caller (e.g. the adapter).
-
-        Returns:
-            List of document dicts with source_id, markdown, and structural hint fields.
-
-        Note on cursor semantics vs fetch_page():
-            This method uses ``modified_at >= since`` (i.e. ``not < since``) so that
-            files modified exactly at ``since`` are included.  This is correct for the
-            incremental GET /documents use-case where the caller passes the previous
-            response's latest timestamp and expects idempotent re-delivery of boundary
-            items.  fetch_page() / _collect_candidates() use ``> after`` (i.e. ``<= after``
-            exclusion) to prevent re-delivery in the paged push-trigger flow.
+        Convenience direct API: triggers a synchronous scan when the index is
+        empty, then reads matching files. Does not advance any delivery cursor.
         """
+        if self._index.stats()["total"] == 0:
+            self.scan_now()
+
         since_dt: datetime | None = None
         if since:
             try:
@@ -425,50 +524,50 @@ class FilesystemCollector(PagedCollector):
                 if since_dt.tzinfo is None:
                     since_dt = since_dt.replace(tzinfo=timezone.utc)
             except ValueError:
-                logger.warning("Invalid since timestamp: %s", since)
+                logger.warning("filesystem: invalid since timestamp: %s", since)
 
-        # extensions param overrides config; empty = all readable text files
-        override_exts = {e.lower() for e in extensions} if extensions else None
-        effective_max_mb = max_size_mb if max_size_mb is not None else self._config.max_file_size_mb
-        max_bytes = int(effective_max_mb * 1024 * 1024)
-        results = []
+        override_exts = {e.lower() for e in extensions} if extensions else self._allowlist
+        max_mb = max_size_mb if max_size_mb is not None else self._config.max_file_size_mb
+        max_file_bytes = int(max_mb * 1024 * 1024)
 
-        for file_path in self._walk_files():
-            ext = file_path.suffix.lower()
-            if override_exts is not None:
-                if ext not in override_exts:
+        results: list[dict] = []
+        # Drain the whole index via the seq stream without touching the cursor.
+        seq = 0
+        while True:
+            batch = self._index.fetch_candidates(seq, 500)
+            if not batch:
+                break
+            seq = batch[-1].seq
+            for f in batch:
+                if f.state != "present" or f.is_text == 0 or f.size > max_file_bytes:
                     continue
-            elif self._should_skip_path(file_path):
-                continue
-
-            try:
-                stat = file_path.stat()
-
-                if stat.st_size > max_bytes:
-                    logger.debug("Skipping %s: exceeds max_file_size_mb (%.1f MB)",
-                                 file_path, stat.st_size / 1024 / 1024)
+                if override_exts is not None and Path(f.rel_path).suffix.lower() not in override_exts:
                     continue
-
-                modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-
-                # Skip known-bad files (permanent or unchanged-since-last-failure)
-                # without a read attempt.
-                if self._tracker.should_skip(file_path, modified_at):
+                mtime = datetime.fromtimestamp(f.mtime, tz=timezone.utc)
+                if since_dt and mtime < since_dt:
                     continue
-
-                if since_dt and modified_at < since_dt:
+                try:
+                    data = Path(f.abspath).read_bytes()
+                    content = data.decode("utf-8")
+                except (FileNotFoundError, PermissionError, OSError):
                     continue
-
-                content = file_path.read_text(encoding="utf-8")
-                if not content.strip():
+                except UnicodeDecodeError as e:
+                    self._index.mark_binary(f.source_id, str(e))
                     continue
-
-                results.append(self._make_doc(file_path, content, modified_at, stat))
-            except (UnicodeDecodeError, PermissionError, OSError) as e:
-                self._tracker.record_failure(file_path, e)
-                if not self._tracker.is_permanently_skipped(file_path):
-                    logger.warning("Skipping %s: %s", file_path, e)
-                continue
-
-        self._tracker.flush()
+                if "\x00" in content or not content.strip():
+                    continue
+                results.append(self._make_doc(f, content, _sha256(data)))
         return results
+
+    # ------------------------------------------------------------------
+    # Reset
+    # ------------------------------------------------------------------
+
+    def reset_state(self) -> list[str]:
+        cleared = super().reset_state()
+        self._index.reset()
+        cleared.append("file_index")
+        with self._seq_stage_lock:
+            self._staged_seq = None
+        self._page_max_seq = None
+        return cleared
