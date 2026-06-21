@@ -39,16 +39,16 @@ def setup_telemetry(
         from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
         from opentelemetry.sdk.resources import Resource
         from opentelemetry._logs import set_logger_provider
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-        from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
-        from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 
         resource = Resource.create({
             "service.name": service_name,
             "service.version": version,
             "deployment.environment": environment,
         })
-        exporter_kwargs: dict[str, Any] = {"endpoint": endpoint, "insecure": True}
+        exporter_kwargs: dict[str, Any] = {"endpoint": endpoint}
 
         # Traces
         _tracer_provider = TracerProvider(resource=resource)
