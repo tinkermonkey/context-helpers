@@ -11,6 +11,10 @@ from fastapi import APIRouter
 
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import MusicConfig
+from context_helpers import telemetry as tel
+from context_helpers.telemetry import jxa_span
+
+_tracer = tel.get_tracer("context_helpers.collectors.music")
 
 logger = logging.getLogger(__name__)
 
@@ -154,17 +158,19 @@ class MusicCollector(BaseCollector):
             after_expr = "null"
 
         script = _JXA_TRACKS_SCRIPT.format(after_expr=after_expr)
-        try:
-            result = subprocess.run(
-                ["osascript", "-l", "JavaScript", "-e", script],
-                capture_output=True, text=True, timeout=120,
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Music.app JXA query timed out after 120s")
+        with jxa_span(_tracer, "music", "music.get_library") as span:
+            try:
+                result = subprocess.run(
+                    ["osascript", "-l", "JavaScript", "-e", script],
+                    capture_output=True, text=True, timeout=120,
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("Music.app JXA query timed out after 120s")
 
-        if result.returncode != 0:
-            raise RuntimeError(f"JXA failed: {result.stderr.strip()}")
+            if result.returncode != 0:
+                raise RuntimeError(f"JXA failed: {result.stderr.strip()}")
 
-        tracks: list[dict] = json.loads(result.stdout.strip())
+            tracks: list[dict] = json.loads(result.stdout.strip())
+            span.set_attribute("jxa.track_count", len(tracks))
         tracks.sort(key=lambda t: t["played_at"], reverse=True)
         return tracks

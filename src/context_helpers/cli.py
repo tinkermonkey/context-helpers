@@ -71,6 +71,32 @@ def start(daemon: bool, config: str | None) -> None:
         click.echo(f"Config error: {e}", err=True)
         sys.exit(1)
 
+    from context_helpers.telemetry import setup_telemetry
+    try:
+        from importlib.metadata import version as _pkg_version
+        _svc_version = _pkg_version("context-helpers")
+    except Exception:
+        _svc_version = "unknown"
+    setup_telemetry(
+        service_name=app_config.telemetry.service_name,
+        version=_svc_version,
+        endpoint=app_config.telemetry.otlp_endpoint,
+        enabled=app_config.telemetry.enabled,
+        environment=app_config.telemetry.environment,
+    )
+
+    try:
+        from opentelemetry.instrumentation.urllib import URLLibInstrumentor
+        URLLibInstrumentor().instrument()
+    except ImportError:
+        pass
+
+    try:
+        from opentelemetry.instrumentation.sqlite3 import SQLite3Instrumentor
+        SQLite3Instrumentor().instrument()
+    except ImportError:
+        pass
+
     from context_helpers.collectors.registry import build_collector_registry
     from context_helpers.server import create_app
 

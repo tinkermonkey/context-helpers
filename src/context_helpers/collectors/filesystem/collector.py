@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
@@ -24,6 +25,9 @@ from typing import Iterator
 from context_helpers.collectors.base import PagedCollector, push_ack_mode
 from context_helpers.collectors.filesystem.index import FileIndex, IndexedFile
 from context_helpers.config import FilesystemConfig
+from context_helpers import telemetry as tel
+
+_tracer = tel.get_tracer("context_helpers.collectors.filesystem")
 
 logger = logging.getLogger(__name__)
 
@@ -205,8 +209,14 @@ class FilesystemCollector(PagedCollector):
         if self._scan_thread is not None:
             return
         self._scan_stop.clear()
+        _scan_ctx = tel.capture_context()
+
+        def _scan_target():
+            with tel.run_in_context(_scan_ctx):
+                self._scan_loop()
+
         self._scan_thread = threading.Thread(
-            target=self._scan_loop, daemon=True, name="filesystem-scanner"
+            target=_scan_target, daemon=True, name="filesystem-scanner"
         )
         self._scan_thread.start()
         logger.info("filesystem: scanner started for roots %s", [str(p) for _, p in self._roots])
@@ -237,32 +247,40 @@ class FilesystemCollector(PagedCollector):
 
         Serialised so a manual scan and the background loop never overlap.
         """
-        with self._scan_lock:
-            gen = self._index.begin_scan()
-            seen = 0
-            changed = 0
-            for label, root in self._roots:
-                if not root.is_dir():
-                    continue
-                for abspath, rel in self._walk(root):
-                    try:
-                        st = abspath.stat()
-                    except OSError:
+        with _tracer.start_as_current_span("filesystem.scan") as span:
+            roots_list = [str(p) for _, p in self._roots]
+            span.set_attribute("filesystem.roots", str(roots_list))
+            t0 = time.monotonic()
+            with self._scan_lock:
+                gen = self._index.begin_scan()
+                seen = 0
+                changed = 0
+                for label, root in self._roots:
+                    if not root.is_dir():
                         continue
-                    seen += 1
-                    if self._index.index_file(
-                        source_id=f"{label}/{rel}",
-                        abspath=str(abspath),
-                        root_label=label,
-                        rel_path=rel,
-                        size=st.st_size,
-                        mtime=st.st_mtime,
-                        is_text=_classify_extension(abspath),
-                        gen=gen,
-                    ):
-                        changed += 1
-            deleted = self._index.finalize_scan(gen)
-            logger.debug("filesystem: scan gen=%d seen=%d changed=%d deleted=%d", gen, seen, changed, deleted)
+                    for abspath, rel in self._walk(root):
+                        try:
+                            st = abspath.stat()
+                        except OSError:
+                            continue
+                        seen += 1
+                        if self._index.index_file(
+                            source_id=f"{label}/{rel}",
+                            abspath=str(abspath),
+                            root_label=label,
+                            rel_path=rel,
+                            size=st.st_size,
+                            mtime=st.st_mtime,
+                            is_text=_classify_extension(abspath),
+                            gen=gen,
+                        ):
+                            changed += 1
+                deleted = self._index.finalize_scan(gen)
+                logger.debug("filesystem: scan gen=%d seen=%d changed=%d deleted=%d", gen, seen, changed, deleted)
+            span.set_attribute("filesystem.files_seen", seen)
+            span.set_attribute("filesystem.files_changed", changed)
+            span.set_attribute("filesystem.files_deleted", deleted)
+            span.set_attribute("filesystem.duration_ms", round((time.monotonic() - t0) * 1000))
             return {"seen": seen, "changed": changed, "deleted": deleted}
 
     # ------------------------------------------------------------------

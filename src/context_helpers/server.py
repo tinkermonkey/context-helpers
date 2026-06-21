@@ -233,4 +233,10 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
                 content={"ok": False, "collector": name, "committed": [], "errors": [str(e)]},
             )
 
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        FastAPIInstrumentor().instrument_app(app)
+    except ImportError:
+        pass
+
     return app

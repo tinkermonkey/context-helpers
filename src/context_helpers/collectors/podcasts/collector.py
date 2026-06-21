@@ -44,6 +44,10 @@ from fastapi import APIRouter
 
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import PodcastsConfig
+from context_helpers import telemetry as tel
+from context_helpers.telemetry import subprocess_span
+
+_tracer = tel.get_tracer("context_helpers.collectors.podcasts")
 
 logger = logging.getLogger(__name__)
 
@@ -344,15 +348,20 @@ def _transcribe_audio_file(audio_path: Path, model_name: str) -> str | None:
 
     repo = _mlx_repo_for_model(model_name)
     logger.debug("PodcastsCollector: transcribing %s with %s", audio_path.name, repo)
-    try:
-        result = _mlx_whisper.transcribe(str(audio_path), path_or_hf_repo=repo)
-        text = (result.get("text") or "").strip()
-        return text or None
-    except Exception as e:
-        logger.warning(
-            "PodcastsCollector: transcription failed for %s: %s", audio_path.name, e
-        )
-        return None
+    with subprocess_span(_tracer, "podcasts.transcribe", "mlx-whisper",
+                         podcasts_audio_file=audio_path.name,
+                         podcasts_model=model_name) as span:
+        try:
+            result = _mlx_whisper.transcribe(str(audio_path), path_or_hf_repo=repo)
+            text = (result.get("text") or "").strip()
+            if text:
+                span.set_attribute("podcasts.transcript_chars", len(text))
+            return text or None
+        except Exception as e:
+            logger.warning(
+                "PodcastsCollector: transcription failed for %s: %s", audio_path.name, e
+            )
+            return None
 
 
 def _write_whisper_transcript(
@@ -842,8 +851,14 @@ class PodcastsCollector(BaseCollector):
                 and self._transcription_thread.is_alive()
             ):
                 return
+            _transcribe_ctx = tel.capture_context()
+
+            def _transcribe_target():
+                with tel.run_in_context(_transcribe_ctx):
+                    self._run_transcription_backfill()
+
             t = threading.Thread(
-                target=self._run_transcription_backfill,
+                target=_transcribe_target,
                 daemon=True,
                 name="podcasts-transcription",
             )

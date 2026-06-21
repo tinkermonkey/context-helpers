@@ -11,6 +11,9 @@ from pathlib import Path
 
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import ObsidianConfig
+from context_helpers import telemetry as tel
+
+_tracer = tel.get_tracer("context_helpers.collectors.obsidian")
 
 _VAULT_CACHE_TTL = 300  # seconds between vault graph rebuilds
 
@@ -97,20 +100,34 @@ class ObsidianCollector(BaseCollector):
         now = time.monotonic()
         with self._vault_lock:
             if self._vault is None or (now - self._vault_cache_time) > _VAULT_CACHE_TTL:
-                try:
-                    self._vault = otools.Vault(self._vault_path).connect()
-                    self._vault_cache_time = now
-                except Exception as e:
-                    if self._vault is not None:
-                        # Transient failure (e.g. iCloud sync deadlock). Serve the stale
-                        # graph and advance cache_time so we don't retry on every request;
-                        # the next rebuild attempt will happen after a full TTL window.
-                        logger.warning(
-                            "Vault connect failed (%s); serving stale graph cache", e
-                        )
+                with _tracer.start_as_current_span("obsidian.parse_vault") as span:
+                    span.set_attribute("obsidian.vault_path", str(self._vault_path))
+                    t0 = time.monotonic()
+                    try:
+                        self._vault = otools.Vault(self._vault_path).connect()
                         self._vault_cache_time = now
-                    else:
-                        raise RuntimeError(f"Failed to connect to Obsidian vault: {e}") from e
+                        try:
+                            note_count = len(list(self._vault_path.rglob("*.md")))
+                            span.set_attribute("obsidian.note_count", note_count)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        if self._vault is not None:
+                            # Transient failure (e.g. iCloud sync deadlock). Serve the stale
+                            # graph and advance cache_time so we don't retry on every request;
+                            # the next rebuild attempt will happen after a full TTL window.
+                            logger.warning(
+                                "Vault connect failed (%s); serving stale graph cache", e
+                            )
+                            span.record_exception(e)
+                            tel._set_error(span)
+                            self._vault_cache_time = now
+                        else:
+                            span.record_exception(e)
+                            tel._set_error(span)
+                            raise RuntimeError(f"Failed to connect to Obsidian vault: {e}") from e
+                    finally:
+                        span.set_attribute("obsidian.duration_ms", round((time.monotonic() - t0) * 1000))
             return self._vault
 
     def fetch_notes(self, since: str | None) -> list[dict]:

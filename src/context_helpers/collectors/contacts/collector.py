@@ -13,6 +13,10 @@ from fastapi import APIRouter
 
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import ContactsConfig
+from context_helpers import telemetry as tel
+from context_helpers.telemetry import jxa_span
+
+_tracer = tel.get_tracer("context_helpers.collectors.contacts")
 
 logger = logging.getLogger(__name__)
 
@@ -177,18 +181,21 @@ class ContactsCollector(BaseCollector):
         Raises:
             RuntimeError: If osascript fails or returns invalid JSON
         """
-        result = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", _JXA_FETCH_ALL],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"JXA contacts fetch failed: {result.stderr.strip()}")
-        try:
-            contacts = json.loads(result.stdout.strip())
-        except json.JSONDecodeError as e:
-            raise RuntimeError(f"JXA returned invalid JSON: {e}") from e
-        if not isinstance(contacts, list):
-            raise RuntimeError(f"JXA returned unexpected type: {type(contacts).__name__}")
+        with jxa_span(_tracer, "contacts", "contacts.get_all") as span:
+            span.set_attribute("contacts.cache_hit", False)
+            result = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", _JXA_FETCH_ALL],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"JXA contacts fetch failed: {result.stderr.strip()}")
+            try:
+                contacts = json.loads(result.stdout.strip())
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"JXA returned invalid JSON: {e}") from e
+            if not isinstance(contacts, list):
+                raise RuntimeError(f"JXA returned unexpected type: {type(contacts).__name__}")
+            span.set_attribute("jxa.contact_count", len(contacts))
         return contacts
 
     def _get_cached(self) -> list[dict]:

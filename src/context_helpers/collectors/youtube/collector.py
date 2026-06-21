@@ -34,6 +34,10 @@ from fastapi import APIRouter
 
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import YouTubeConfig
+from context_helpers import telemetry as tel
+from context_helpers.telemetry import subprocess_span
+
+_tracer = tel.get_tracer("context_helpers.collectors.youtube")
 
 logger = logging.getLogger(__name__)
 
@@ -193,35 +197,39 @@ class YouTubeCollector(BaseCollector):
             "--no-warnings",
             "https://www.youtube.com/feed/history",
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("yt-dlp timed out after 120 s")
-        except FileNotFoundError:
-            raise RuntimeError("yt-dlp not found — install with: pip install yt-dlp")
-
-        # Exit code 1 is a partial failure (some videos unavailable / private);
-        # still parse whatever output we have.  Higher codes are fatal.
-        if result.returncode > 1:
-            raise RuntimeError(
-                f"yt-dlp exited {result.returncode}: {result.stderr.strip()[:400]}"
-            )
-
-        entries: list[dict] = []
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
+        with subprocess_span(_tracer, "youtube.fetch", "yt-dlp",
+                             youtube_feed="history",
+                             youtube_browser=self._browser) as span:
             try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                logger.debug("Skipping non-JSON yt-dlp output: %r", line[:80])
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("yt-dlp timed out after 120 s")
+            except FileNotFoundError:
+                raise RuntimeError("yt-dlp not found — install with: pip install yt-dlp")
 
+            # Exit code 1 is a partial failure (some videos unavailable / private);
+            # still parse whatever output we have.  Higher codes are fatal.
+            if result.returncode > 1:
+                raise RuntimeError(
+                    f"yt-dlp exited {result.returncode}: {result.stderr.strip()[:400]}"
+                )
+
+            entries: list[dict] = []
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    logger.debug("Skipping non-JSON yt-dlp output: %r", line[:80])
+
+            span.set_attribute("youtube.videos_fetched", len(entries))
         return entries
 
     # ------------------------------------------------------------------

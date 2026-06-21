@@ -12,6 +12,9 @@ from fastapi import APIRouter
 
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import NotesConfig
+from context_helpers import telemetry as tel
+
+_tracer = tel.get_tracer("context_helpers.collectors.notes")
 
 logger = logging.getLogger(__name__)
 
@@ -110,31 +113,36 @@ class NotesCollector(BaseCollector):
             if since_dt.tzinfo is None:
                 since_dt = since_dt.replace(tzinfo=timezone.utc)
 
-        notes = []
-        for raw in extract_notes():
-            folder = "Notes"
+        with _tracer.start_as_current_span("notes.fetch") as span:
+            span.set_attribute("collector.name", "notes")
+            span.set_attribute("notes.backend", "apple_notes_to_sqlite")
 
-            if folder_filter and folder != folder_filter:
-                continue
+            notes = []
+            for raw in extract_notes():
+                folder = "Notes"
 
-            updated_str = raw.get("updated") or ""
-            if since_dt and updated_str:
-                try:
-                    updated_dt = datetime.fromisoformat(updated_str)
-                    if updated_dt.tzinfo is None:
-                        updated_dt = updated_dt.replace(tzinfo=timezone.utc)
-                    if updated_dt <= since_dt:
-                        continue
-                except ValueError:
-                    pass
+                if folder_filter and folder != folder_filter:
+                    continue
 
-            notes.append({
-                "id": str(raw.get("id") or ""),
-                "title": raw.get("title") or "Untitled",
-                "body_markdown": raw.get("body") or "",
-                "folder": folder,
-                "created_at": raw.get("created") or "",
-                "modified_at": updated_str,
-            })
+                updated_str = raw.get("updated") or ""
+                if since_dt and updated_str:
+                    try:
+                        updated_dt = datetime.fromisoformat(updated_str)
+                        if updated_dt.tzinfo is None:
+                            updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                        if updated_dt <= since_dt:
+                            continue
+                    except ValueError:
+                        pass
 
-        return notes
+                notes.append({
+                    "id": str(raw.get("id") or ""),
+                    "title": raw.get("title") or "Untitled",
+                    "body_markdown": raw.get("body") or "",
+                    "folder": folder,
+                    "created_at": raw.get("created") or "",
+                    "modified_at": updated_str,
+                })
+
+            span.set_attribute("jxa.note_count", len(notes))
+            return notes

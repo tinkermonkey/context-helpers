@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from context_helpers.collectors.base import PagedCollector
+from context_helpers import telemetry as tel
+
+_tracer = tel.get_tracer("context_helpers.push")
 
 if TYPE_CHECKING:
     from context_helpers.collectors.base import BaseCollector
@@ -90,8 +93,14 @@ class PushTrigger:
         else:
             logger.info("PushTrigger: watchdog not installed — using poll-only mode for file collectors")
 
+        _poll_ctx = tel.capture_context()
+
+        def _poll_target():
+            with tel.run_in_context(_poll_ctx):
+                self._run_poll_loop()
+
         self._poll_thread = threading.Thread(
-            target=self._run_poll_loop, daemon=True, name="push-trigger-poll"
+            target=_poll_target, daemon=True, name="push-trigger-poll"
         )
         self._poll_thread.start()
         logger.info(
@@ -182,43 +191,51 @@ class PushTrigger:
         """Ask each collector if it has changes; deliver if any do."""
         watermark = self._state.get_watermark()
 
-        changed = []
-        for collector in self._collectors:
-            try:
-                # Paged collectors with a loaded stash or more pages are always changed
-                if isinstance(collector, PagedCollector) and (
-                    collector.has_pending() or collector.has_more()
-                ):
-                    changed.append(collector.name)
-                    continue
-                if collector.has_changes_since(watermark):
-                    changed.append(collector.name)
-            except Exception as e:
-                logger.warning(
-                    "PushTrigger: has_changes_since() raised for '%s': %s", collector.name, e
-                )
-                changed.append(collector.name)  # conservative: assume changed
+        with _tracer.start_as_current_span("push.cycle") as span:
+            span.set_attribute("push.watermark", watermark.isoformat() if watermark else "")
 
-        if not changed:
-            logger.debug("PushTrigger: no changes detected")
-            return
+            changed = []
+            for collector in self._collectors:
+                try:
+                    # Paged collectors with a loaded stash or more pages are always changed
+                    if isinstance(collector, PagedCollector) and (
+                        collector.has_pending() or collector.has_more()
+                    ):
+                        changed.append(collector.name)
+                        continue
+                    if collector.has_changes_since(watermark):
+                        changed.append(collector.name)
+                except Exception as e:
+                    logger.warning(
+                        "PushTrigger: has_changes_since() raised for '%s': %s", collector.name, e
+                    )
+                    changed.append(collector.name)  # conservative: assume changed
 
-        # Pre-fill stash for paged collectors in changed that have no stash yet
-        for collector in self._collectors:
-            if isinstance(collector, PagedCollector) and collector.name in changed:
-                if not collector.has_pending():
-                    page_size = getattr(getattr(collector, "_config", None), "page_size", 200)
-                    collector.fill_stash(limit=page_size)
-                    # If fill produced nothing and no more pages remain, skip delivery
-                    if not collector.has_pending() and not collector.has_more():
-                        changed.remove(collector.name)
+            all_names = {c.name for c in self._collectors}
+            skipped_names = sorted(all_names - set(changed))
+            span.set_attribute("push.changed_collectors", list(changed))
+            span.set_attribute("push.skipped_collectors", list(skipped_names))
 
-        if not changed:
-            logger.debug("PushTrigger: stash empty after fill — no delivery needed")
-            return
+            if not changed:
+                logger.debug("PushTrigger: no changes detected")
+                return
 
-        logger.info("PushTrigger: changes in %s — triggering delivery", changed)
-        self._deliver(watermark)
+            # Pre-fill stash for paged collectors in changed that have no stash yet
+            for collector in self._collectors:
+                if isinstance(collector, PagedCollector) and collector.name in changed:
+                    if not collector.has_pending():
+                        page_size = getattr(getattr(collector, "_config", None), "page_size", 200)
+                        collector.fill_stash(limit=page_size)
+                        # If fill produced nothing and no more pages remain, skip delivery
+                        if not collector.has_pending() and not collector.has_more():
+                            changed.remove(collector.name)
+
+            if not changed:
+                logger.debug("PushTrigger: stash empty after fill — no delivery needed")
+                return
+
+            logger.info("PushTrigger: changes in %s — triggering delivery", changed)
+            self._deliver(watermark)
 
     def _deliver(self, watermark: datetime | None) -> None:
         """POST to context-library /ingest/helpers with the current watermark cursor."""
@@ -232,49 +249,67 @@ class PushTrigger:
         if self._config.library_secret:
             req.add_header("Authorization", f"Bearer {self._config.library_secret}")
 
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                if resp.status == 200:
-                    self._consecutive_timeouts = 0
-                    self._restore_push_limits()
-                    now = datetime.now(timezone.utc)
-                    self._state.advance_watermark(now)
-                    logger.info(
-                        "PushTrigger: delivery succeeded, watermark advanced to %s", now.isoformat()
+        with _tracer.start_as_current_span("push.deliver") as span:
+            span.set_attribute("push.library_url", str(url))
+            span.set_attribute("push.watermark", watermark.isoformat() if watermark else "")
+            span.set_attribute("push.consecutive_timeouts", self._consecutive_timeouts)
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    if resp.status == 200:
+                        self._consecutive_timeouts = 0
+                        self._restore_push_limits()
+                        now = datetime.now(timezone.utc)
+                        self._state.advance_watermark(now)
+                        span.set_attribute("push.result", "success")
+                        logger.info(
+                            "PushTrigger: delivery succeeded, watermark advanced to %s", now.isoformat()
+                        )
+                        # Chain immediately if any collector has more data to deliver
+                        for collector in self._collectors:
+                            if isinstance(collector, PagedCollector) and collector.has_more():
+                                logger.debug(
+                                    "PushTrigger: collector '%s' has more pages — scheduling immediate next cycle",
+                                    collector.name,
+                                )
+                                self._pending.set()
+                                break
+                            if not isinstance(collector, PagedCollector) and collector.has_push_more():
+                                logger.debug(
+                                    "PushTrigger: collector '%s' has more push data — scheduling immediate next cycle",
+                                    collector.name,
+                                )
+                                self._pending.set()
+                                break
+                    else:
+                        span.set_attribute("push.result", f"http_{resp.status}")
+                        logger.warning("PushTrigger: unexpected response status %d", resp.status)
+            except urllib.error.HTTPError as e:
+                span.set_attribute("push.result", f"http_error_{e.code}")
+                span.record_exception(e)
+                tel._set_error(span)
+                logger.error("PushTrigger: delivery HTTP %d — %s", e.code, e.reason)
+            except urllib.error.URLError as e:
+                is_timeout = isinstance(e.reason, (socket.timeout, TimeoutError))
+                if is_timeout:
+                    self._consecutive_timeouts += 1
+                    span.set_attribute("push.result", "timeout")
+                    span.record_exception(e)
+                    tel._set_error(span)
+                    logger.error(
+                        "PushTrigger: delivery timed out (consecutive=%d) — reducing page sizes",
+                        self._consecutive_timeouts,
                     )
-                    # Chain immediately if any collector has more data to deliver
-                    for collector in self._collectors:
-                        if isinstance(collector, PagedCollector) and collector.has_more():
-                            logger.debug(
-                                "PushTrigger: collector '%s' has more pages — scheduling immediate next cycle",
-                                collector.name,
-                            )
-                            self._pending.set()
-                            break
-                        if not isinstance(collector, PagedCollector) and collector.has_push_more():
-                            logger.debug(
-                                "PushTrigger: collector '%s' has more push data — scheduling immediate next cycle",
-                                collector.name,
-                            )
-                            self._pending.set()
-                            break
+                    self._reduce_push_limits()
                 else:
-                    logger.warning("PushTrigger: unexpected response status %d", resp.status)
-        except urllib.error.HTTPError as e:
-            logger.error("PushTrigger: delivery HTTP %d — %s", e.code, e.reason)
-        except urllib.error.URLError as e:
-            is_timeout = isinstance(e.reason, (socket.timeout, TimeoutError))
-            if is_timeout:
-                self._consecutive_timeouts += 1
-                logger.error(
-                    "PushTrigger: delivery timed out (consecutive=%d) — reducing page sizes",
-                    self._consecutive_timeouts,
-                )
-                self._reduce_push_limits()
-            else:
-                logger.error("PushTrigger: delivery failed (server unreachable?): %s", e.reason)
-        except Exception as e:
-            logger.error("PushTrigger: delivery failed unexpectedly: %s", e, exc_info=True)
+                    span.set_attribute("push.result", "url_error")
+                    span.record_exception(e)
+                    tel._set_error(span)
+                    logger.error("PushTrigger: delivery failed (server unreachable?): %s", e.reason)
+            except Exception as e:
+                span.set_attribute("push.result", type(e).__name__)
+                span.record_exception(e)
+                tel._set_error(span)
+                logger.error("PushTrigger: delivery failed unexpectedly: %s", e, exc_info=True)
 
     def _reduce_push_limits(self) -> None:
         """Halve push page sizes for all non-paged collectors after a timeout."""

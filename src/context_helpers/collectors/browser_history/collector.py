@@ -48,6 +48,10 @@ from fastapi import APIRouter
 
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import BrowserHistoryConfig
+from context_helpers import telemetry as tel
+from context_helpers.telemetry import jxa_span
+
+_tracer = tel.get_tracer("context_helpers.collectors.browser_history")
 
 logger = logging.getLogger(__name__)
 
@@ -687,30 +691,33 @@ def _fetch_jxa_tabs(app_label: str, browser: str, script: str) -> list[dict]:
     script timeout, JSON parse failure).
     """
     try:
-        result = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            logger.debug(
-                "browser_history: %s tabs script failed (rc=%d): %s",
-                app_label,
-                result.returncode,
-                result.stderr.strip(),
+        with jxa_span(_tracer, "browser_history", f"browser.get_open_tabs.{browser}") as span:
+            result = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
-            return []
-        raw: list[dict] = json.loads(result.stdout.strip() or "[]")
-        return [
-            {
-                "url": _sanitize_url(t.get("url") or ""),
-                "title": (t.get("title") or "").strip(),
-                "browser": browser,
-            }
-            for t in raw
-            if t.get("url")
-        ]
+            if result.returncode != 0:
+                logger.debug(
+                    "browser_history: %s tabs script failed (rc=%d): %s",
+                    app_label,
+                    result.returncode,
+                    result.stderr.strip(),
+                )
+                return []
+            raw: list[dict] = json.loads(result.stdout.strip() or "[]")
+            tabs = [
+                {
+                    "url": _sanitize_url(t.get("url") or ""),
+                    "title": (t.get("title") or "").strip(),
+                    "browser": browser,
+                }
+                for t in raw
+                if t.get("url")
+            ]
+            span.set_attribute("jxa.tab_count", len(tabs))
+            return tabs
     except subprocess.TimeoutExpired:
         logger.debug("browser_history: %s tabs script timed out", app_label)
         return []

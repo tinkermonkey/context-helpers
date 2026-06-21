@@ -15,6 +15,9 @@ from fastapi import APIRouter
 
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import OuraConfig
+from context_helpers import telemetry as tel
+
+_tracer = tel.get_tracer("context_helpers.collectors.oura")
 
 logger = logging.getLogger(__name__)
 
@@ -215,35 +218,41 @@ class OuraCollector(BaseCollector):
         Thread-safe: acquires a lock and re-checks the store before posting,
         in case a concurrent thread already refreshed using the same token.
         """
-        with self._refresh_lock:
-            # Re-check: another thread may have already refreshed
-            stored = self._token_store.load()
-            stored_refresh = stored.get("refresh_token")
-            if stored_refresh and stored_refresh != refresh_token:
-                # Another thread already consumed this refresh token; use their result
-                return stored.get("access_token", "")
+        with _tracer.start_as_current_span("oura.token_refresh") as span:
+            with self._refresh_lock:
+                # Re-check: another thread may have already refreshed
+                stored = self._token_store.load()
+                stored_refresh = stored.get("refresh_token")
+                if stored_refresh and stored_refresh != refresh_token:
+                    # Another thread already consumed this refresh token; use their result
+                    return stored.get("access_token", "")
 
-            data = urllib.parse.urlencode(
-                {
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": self._config.client_id,
-                    "client_secret": self._config.client_secret,
-                }
-            ).encode()
-            req = urllib.request.Request(self._config.token_url, data=data, method="POST")
-            req.add_header("Content-Type", "application/x-www-form-urlencoded")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                payload = json.loads(resp.read().decode())
+                data = urllib.parse.urlencode(
+                    {
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                        "client_id": self._config.client_id,
+                        "client_secret": self._config.client_secret,
+                    }
+                ).encode()
+                req = urllib.request.Request(self._config.token_url, data=data, method="POST")
+                req.add_header("Content-Type", "application/x-www-form-urlencoded")
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        payload = json.loads(resp.read().decode())
+                except Exception as exc:
+                    span.record_exception(exc)
+                    tel._set_error(span)
+                    raise
 
-            access_token = payload["access_token"]
-            new_refresh = payload["refresh_token"]
-            expires_in = payload.get("expires_in", 2592000)  # default 30 days
-            expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                access_token = payload["access_token"]
+                new_refresh = payload["refresh_token"]
+                expires_in = payload.get("expires_in", 2592000)  # default 30 days
+                expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-            self._token_store.save(access_token, new_refresh, expires_at)
-            logger.info("Oura: token refreshed, expires at %s", expires_at.isoformat())
-            return access_token
+                self._token_store.save(access_token, new_refresh, expires_at)
+                logger.info("Oura: token refreshed, expires at %s", expires_at.isoformat())
+                return access_token
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -254,37 +263,58 @@ class OuraCollector(BaseCollector):
 
         On 401, attempts one token refresh + retry before raising.
         """
-        token = self._get_token()
-        url = self._config.base_url.rstrip("/") + path
-        if params:
-            url = f"{url}?{urllib.parse.urlencode(params)}"
-        req = urllib.request.Request(url)
-        req.add_header("Authorization", f"Bearer {token}")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and _retry:
-                refresh_token = self._token_store.load().get("refresh_token") or self._config.refresh_token
-                if refresh_token and self._config.client_id and self._config.client_secret:
-                    try:
-                        self._do_refresh(refresh_token)
-                        return self._get(path, params, _retry=False)
-                    except Exception as refresh_err:
-                        logger.warning("Oura: forced refresh on 401 failed: %s", refresh_err)
-            raise
+        with _tracer.start_as_current_span("oura.api_request") as span:
+            span.set_attribute("oura.endpoint", path)
+            span.set_attribute("http.method", "GET")
+            token = self._get_token()
+            url = self._config.base_url.rstrip("/") + path
+            if params:
+                url = f"{url}?{urllib.parse.urlencode(params)}"
+            req = urllib.request.Request(url)
+            req.add_header("Authorization", f"Bearer {token}")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.loads(resp.read().decode())
+                items = result.get("data", []) if isinstance(result, dict) else []
+                span.set_attribute("oura.result_count", len(items))
+                return result
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and _retry:
+                    refresh_token = self._token_store.load().get("refresh_token") or self._config.refresh_token
+                    if refresh_token and self._config.client_id and self._config.client_secret:
+                        try:
+                            self._do_refresh(refresh_token)
+                            span.set_attribute("oura.result_count", -1)
+                            return self._get(path, params, _retry=False)
+                        except Exception as refresh_err:
+                            logger.warning("Oura: forced refresh on 401 failed: %s", refresh_err)
+                span.record_exception(e)
+                tel._set_error(span)
+                raise
+            except Exception as exc:
+                span.record_exception(exc)
+                tel._set_error(span)
+                raise
 
     def _get_all_pages(self, path: str, start_date: str, end_date: str) -> list[dict]:
         """Fetch all pages for a date-range query, following next_token."""
-        params: dict = {"start_date": start_date, "end_date": end_date}
-        items: list[dict] = []
-        while True:
-            payload = self._get(path, params)
-            items.extend(payload.get("data", []))
-            next_token = payload.get("next_token")
-            if not next_token:
-                break
-            params = {"next_token": next_token}
+        with _tracer.start_as_current_span("oura.api_request_paged") as span:
+            span.set_attribute("oura.endpoint", path)
+            span.set_attribute("oura.start_date", start_date)
+            span.set_attribute("oura.end_date", end_date)
+            params: dict = {"start_date": start_date, "end_date": end_date}
+            items: list[dict] = []
+            pages_fetched = 0
+            while True:
+                payload = self._get(path, params)
+                items.extend(payload.get("data", []))
+                pages_fetched += 1
+                next_token = payload.get("next_token")
+                if not next_token:
+                    break
+                params = {"next_token": next_token}
+            span.set_attribute("oura.pages_fetched", pages_fetched)
+            span.set_attribute("oura.total_items", len(items))
         return items
 
     # ------------------------------------------------------------------

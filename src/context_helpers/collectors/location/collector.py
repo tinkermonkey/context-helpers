@@ -34,6 +34,9 @@ from fastapi import APIRouter
 
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import LocationConfig
+from context_helpers import telemetry as tel
+
+_tracer = tel.get_tracer("context_helpers.collectors.location")
 
 logger = logging.getLogger(__name__)
 
@@ -306,9 +309,13 @@ class LocationCollector(BaseCollector):
 
         Returns None if the file does not exist or cannot be parsed.
         """
-        try:
-            with open(self._current_location_path) as f:
-                data = json.load(f)
-            return data
-        except (OSError, json.JSONDecodeError):
-            return None
+        with _tracer.start_as_current_span("location.read_current") as span:
+            span.set_attribute("location.json_path", str(self._current_location_path))
+            try:
+                with open(self._current_location_path) as f:
+                    data = json.load(f)
+                span.set_attribute("location.has_fix", data.get("latitude") is not None)
+                return data
+            except (OSError, json.JSONDecodeError):
+                span.set_attribute("location.has_fix", False)
+                return None

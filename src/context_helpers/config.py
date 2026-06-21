@@ -256,6 +256,15 @@ class PushConfig(BaseSettings):
     poll_interval: int = 60    # Seconds between polling cycles for non-file sources
 
 
+class TelemetryConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    otlp_endpoint: str = ""
+    service_name: str = "context-helpers"
+    environment: str = "production"
+
+
 class CollectorsConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
@@ -282,6 +291,7 @@ class AppConfig(BaseSettings):
     server: ServerConfig = ServerConfig()
     collectors: CollectorsConfig = CollectorsConfig()
     push: PushConfig = PushConfig()
+    telemetry: TelemetryConfig = TelemetryConfig()
 
 
 def load_config(config_path: Path | None = None) -> AppConfig:
@@ -312,6 +322,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
     server_raw = raw.get("server", {})
     collectors_raw = raw.get("collectors", {})
     push_raw = raw.get("push", {})
+    telemetry_raw = raw.get("telemetry", {})
 
     api_key = server_raw.get("api_key", "")
     if not api_key or api_key == "change-me":
@@ -342,4 +353,5 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             location=LocationConfig(**collectors_raw.get("location", {})),
         ),
         push=PushConfig(**push_raw),
+        telemetry=TelemetryConfig(**telemetry_raw),
     )

@@ -16,6 +16,9 @@ from fastapi import APIRouter
 
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import HealthConfig
+from context_helpers import telemetry as tel
+
+_tracer = tel.get_tracer("context_helpers.collectors.health")
 
 logger = logging.getLogger(__name__)
 
@@ -218,22 +221,33 @@ class HealthCollector(BaseCollector):
             if tmp_db.exists():
                 tmp_db.unlink()
 
-            with _zipfile.ZipFile(export_zip) as zf:
-                candidates = [
-                    zi.filename for zi in zf.filelist
-                    if zi.filename.count("/") == 1 and zi.filename.endswith(".xml")
-                ]
-                export_xml_path = None
-                for candidate in candidates:
-                    firstbytes = zf.open(candidate).read(1024)
-                    if b"<!DOCTYPE HealthData" in firstbytes or b"<HealthData " in firstbytes:
-                        export_xml_path = candidate
-                        break
-                if export_xml_path is None:
-                    raise RuntimeError(f"No valid HealthData XML found in {export_zip.name}")
-                fp = zf.open(export_xml_path)
-                db = sqlite_utils.Database(str(tmp_db))
-                convert_xml_to_sqlite(fp, db, zipfile=zf)
+            with _tracer.start_as_current_span("health.convert_export") as span:
+                import time as _time
+                span.set_attribute("health.export_path", str(export_zip))
+                try:
+                    span.set_attribute("health.export_size_bytes", os.path.getsize(export_zip))
+                except Exception:
+                    pass
+                t0 = _time.monotonic()
+
+                with _zipfile.ZipFile(export_zip) as zf:
+                    candidates = [
+                        zi.filename for zi in zf.filelist
+                        if zi.filename.count("/") == 1 and zi.filename.endswith(".xml")
+                    ]
+                    export_xml_path = None
+                    for candidate in candidates:
+                        firstbytes = zf.open(candidate).read(1024)
+                        if b"<!DOCTYPE HealthData" in firstbytes or b"<HealthData " in firstbytes:
+                            export_xml_path = candidate
+                            break
+                    if export_xml_path is None:
+                        raise RuntimeError(f"No valid HealthData XML found in {export_zip.name}")
+                    fp = zf.open(export_xml_path)
+                    db = sqlite_utils.Database(str(tmp_db))
+                    convert_xml_to_sqlite(fp, db, zipfile=zf)
+
+                span.set_attribute("health.duration_ms", round((_time.monotonic() - t0) * 1000))
 
             tmp_db.replace(_CACHE_DB)
             _CACHE_META.write_text(json.dumps({"mtime": zip_mtime, "size": zip_size}))

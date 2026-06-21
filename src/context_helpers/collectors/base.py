@@ -12,9 +12,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter
+from context_helpers import telemetry as tel
 
 if TYPE_CHECKING:
     from context_helpers.state import StateStore
+
+_tracer = tel.get_tracer("context_helpers.collector")
 
 logger = logging.getLogger(__name__)
 
@@ -283,30 +286,36 @@ class BaseCollector(ABC):
         Returns:
             The bounded page (at most get_push_limit() items, oldest first).
         """
-        if defer_commit is None:
-            defer_commit = push_ack_mode.get()
-        items.sort(key=lambda x: x.get(ts_field) or "")
-        limit = self.get_push_limit()
-        page = items[:limit]
-        if page:
-            ts_vals = [x[ts_field] for x in page if x.get(ts_field)]
-            if ts_vals:
-                max_ts_str = max(ts_vals)
-                try:
-                    dt = datetime.fromisoformat(max_ts_str.replace("Z", "+00:00"))
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    if defer_commit:
-                        self._stage_push_cursor(dt, cursor_key)
-                    else:
-                        self._save_push_cursor(dt, cursor_key)
-                except ValueError:
-                    pass
-        effective_key = cursor_key or self.name
-        if not hasattr(self, "_has_push_more_by_key"):
-            self._has_push_more_by_key: dict[str, bool] = {}
-        self._has_push_more_by_key[effective_key] = len(items) > limit
-        return page
+        with _tracer.start_as_current_span("collector.fetch") as span:
+            span.set_attribute("collector.name", self.name)
+            span.set_attribute("collector.type", "base")
+            span.set_attribute("collector.cursor_key", str(cursor_key or self.name))
+            if defer_commit is None:
+                defer_commit = push_ack_mode.get()
+            items.sort(key=lambda x: x.get(ts_field) or "")
+            limit = self.get_push_limit()
+            page = items[:limit]
+            if page:
+                ts_vals = [x[ts_field] for x in page if x.get(ts_field)]
+                if ts_vals:
+                    max_ts_str = max(ts_vals)
+                    try:
+                        dt = datetime.fromisoformat(max_ts_str.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if defer_commit:
+                            self._stage_push_cursor(dt, cursor_key)
+                        else:
+                            self._save_push_cursor(dt, cursor_key)
+                    except ValueError:
+                        pass
+            effective_key = cursor_key or self.name
+            if not hasattr(self, "_has_push_more_by_key"):
+                self._has_push_more_by_key: dict[str, bool] = {}
+            self._has_push_more_by_key[effective_key] = len(items) > limit
+            span.set_attribute("collector.items_returned", len(page))
+            span.set_attribute("collector.has_more", len(items) > limit)
+            return page
 
     # ------------------------------------------------------------------
     # Commit-ack: stage push cursors on serve, commit them on consumer ack
@@ -453,22 +462,29 @@ class PagedCollector(BaseCollector):
 
     def fill_stash(self, limit: int) -> None:
         """Pre-load one page into the stash. Idempotent; blocks in caller's thread."""
-        with self._stash_lock:
-            if self._stash or self._loading:
-                return
-            self._loading = True
-        try:
-            cursor = self.get_cursor()
-            items, has_more = self.fetch_page(after=cursor, limit=limit)
-        except Exception as e:
-            logger.error("PagedCollector: fill_stash() failed for %s: %s", self.name, e)
-            items, has_more = [], False
-        finally:
+        with _tracer.start_as_current_span("collector.fill_stash") as span:
+            span.set_attribute("collector.name", self.name)
+            span.set_attribute("collector.type", "paged")
             with self._stash_lock:
-                self._loading = False
-        with self._stash_lock:
-            self._stash = items
-            self._has_more = has_more
+                if self._stash or self._loading:
+                    return
+                self._loading = True
+            try:
+                cursor = self.get_cursor()
+                items, has_more = self.fetch_page(after=cursor, limit=limit)
+            except Exception as e:
+                logger.error("PagedCollector: fill_stash() failed for %s: %s", self.name, e)
+                span.record_exception(e)
+                tel._set_error(span)
+                items, has_more = [], False
+            finally:
+                with self._stash_lock:
+                    self._loading = False
+            with self._stash_lock:
+                self._stash = items
+                self._has_more = has_more
+            span.set_attribute("collector.items_stashed", len(items))
+            span.set_attribute("collector.has_more", bool(has_more))
 
     def consume_stash(self) -> "list[dict]":
         """Return stash and advance cursor. Clears the stash."""
