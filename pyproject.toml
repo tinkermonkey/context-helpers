@@ -36,7 +36,7 @@ telemetry = [
 ]
 
 # Convenience bundle
-all = ["healthkit-to-sqlite", "apple-notes-to-sqlite", "obsidiantools", "python-frontmatter", "watchdog", "yt-dlp", "mlx-whisper", "opentelemetry-api>=1.25.0", "opentelemetry-sdk>=1.25.0", "opentelemetry-exporter-otlp-proto-grpc>=1.25.0", "opentelemetry-instrumentation-fastapi>=0.46b0", "opentelemetry-instrumentation-urllib>=0.46b0", "opentelemetry-instrumentation-sqlite3>=0.46b0", "opentelemetry-instrumentation-logging>=0.46b0"]
+all = ["healthkit-to-sqlite", "apple-notes-to-sqlite", "obsidiantools", "python-frontmatter", "watchdog", "yt-dlp", "mlx-whisper", "context-helpers[telemetry]"]
 
 dev = [
     "pytest",
