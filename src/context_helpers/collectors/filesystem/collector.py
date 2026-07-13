@@ -23,9 +23,21 @@ from pathlib import Path
 from typing import Iterator
 
 from context_helpers.collectors.base import PagedCollector, push_ack_mode
+from context_helpers.collectors.filesystem.convert import (
+    CONVERTIBLE_EXTENSIONS,
+    IWORK_EXTENSIONS,
+)
 from context_helpers.collectors.filesystem.index import FileIndex, IndexedFile
 from context_helpers.config import FilesystemConfig
 from context_helpers import telemetry as tel
+
+_HAS_MARKITDOWN = False
+try:  # optional [documents] extra
+    import markitdown  # noqa: F401
+
+    _HAS_MARKITDOWN = True
+except ImportError:
+    pass
 
 _tracer = tel.get_tracer("context_helpers.collectors.filesystem")
 
@@ -304,7 +316,11 @@ class FilesystemCollector(PagedCollector):
         if not self._config.include_hidden and name.startswith("."):
             return False
         ext = Path(name).suffix.lower()
-        if ext in _KNOWN_BINARY_EXTENSIONS:
+        # Convertible documents (PDF/Office/iWork) are binary but admitted:
+        # delivery converts them to markdown instead of reading them as text.
+        if self._converts_documents() and ext in CONVERTIBLE_EXTENSIONS:
+            pass
+        elif ext in _KNOWN_BINARY_EXTENSIONS:
             return False
         if self._allowlist is not None and ext not in self._allowlist:
             return False
@@ -313,10 +329,35 @@ class FilesystemCollector(PagedCollector):
                 return False
         return True
 
+    def _converts_documents(self) -> bool:
+        return bool(self._config.convert_documents) and _HAS_MARKITDOWN
+
     def _walk(self, root: Path) -> Iterator[tuple[Path, str]]:
-        """Yield (abspath, posix-relpath) for included files under *root*."""
+        """Yield (abspath, posix-relpath) for included files under *root*.
+
+        Apple iWork documents saved as *directory bundles* (.pages/.numbers/.key
+        packages) are yielded as single file-like entries — their internals are
+        proprietary and must never be indexed individually; delivery extracts
+        the bundle's embedded preview PDF instead.
+        """
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if self._dir_allowed(d)]
+            kept_dirs = []
+            for d in dirnames:
+                if (
+                    self._converts_documents()
+                    and Path(d).suffix.lower() in IWORK_EXTENSIONS
+                    and self._dir_allowed(d)
+                ):
+                    ap = Path(dirpath) / d
+                    try:
+                        rel = ap.relative_to(root).as_posix()
+                    except ValueError:
+                        continue
+                    if self._file_allowed(d, rel):
+                        yield ap, rel  # bundle as a single document; do not descend
+                elif self._dir_allowed(d):
+                    kept_dirs.append(d)
+            dirnames[:] = kept_dirs
             base = Path(dirpath)
             for fn in filenames:
                 ap = base / fn
@@ -326,6 +367,50 @@ class FilesystemCollector(PagedCollector):
                     continue
                 if self._file_allowed(fn, rel):
                     yield ap, rel
+
+    # ------------------------------------------------------------------
+    # Document conversion (PDF / Office / iWork → markdown)
+    # ------------------------------------------------------------------
+
+    def _convert_document(self, path: Path) -> "tuple[str | None, str | None]":
+        """Convert a document to markdown in a timeout-guarded subprocess.
+
+        Returns (markdown, None) on success or (None, error) on failure. A
+        subprocess (not in-process MarkItDown) so a pathological file can be
+        killed at convert_timeout_sec and parser crashes/memory stay out of
+        the server process.
+        """
+        import subprocess
+        import sys
+
+        with _tracer.start_as_current_span("filesystem.convert") as span:
+            span.set_attribute("filesystem.convert.path", str(path))
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "context_helpers.collectors.filesystem.convert", str(path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=self._config.convert_timeout_sec,
+                )
+            except subprocess.TimeoutExpired:
+                span.set_attribute("filesystem.convert.result", "timeout")
+                return None, f"conversion timed out after {self._config.convert_timeout_sec}s"
+            except OSError as e:
+                span.set_attribute("filesystem.convert.result", "spawn_error")
+                return None, f"conversion subprocess failed to start: {e}"
+
+            if result.returncode != 0:
+                err = (result.stderr or "").strip()[:300] or f"exit {result.returncode}"
+                span.set_attribute("filesystem.convert.result", "error")
+                return None, err
+
+            markdown = result.stdout
+            if not markdown.strip():
+                span.set_attribute("filesystem.convert.result", "empty")
+                return None, "conversion produced empty markdown"
+            span.set_attribute("filesystem.convert.result", "ok")
+            span.set_attribute("filesystem.convert.chars", len(markdown))
+            return markdown, None
 
     # ------------------------------------------------------------------
     # Document construction
@@ -390,19 +475,64 @@ class FilesystemCollector(PagedCollector):
         candidates = self._index.fetch_candidates(after_seq, limit)
         content_bytes = 0
         page_max = after_seq
+        convert_seconds_used = 0.0
 
         for f in candidates:
+            ext = Path(f.rel_path).suffix.lower()
+            convertible = (
+                f.state != "deleted"
+                and self._converts_documents()
+                and ext in CONVERTIBLE_EXTENSIONS
+            )
+            cached_md = (
+                self._index.get_conversion(f.source_id, f.size, f.mtime)
+                if convertible
+                else None
+            )
+
+            # Per-page conversion budget: converting is seconds-per-file, and a
+            # page full of fresh PDFs must not outlive the consumer's fetch
+            # timeout (a timed-out page is re-served from the same cursor —
+            # a permanent stall). End the page BEFORE advancing past this row;
+            # it is the first item of the next page, where its cache entry may
+            # already exist.
+            if (
+                convertible
+                and cached_md is None
+                and convert_seconds_used >= self._config.convert_budget_sec
+            ):
+                break
+
             page_max = f.seq  # advance over every examined row, delivered or not
 
             if f.state == "deleted":
                 yield self._make_tombstone(f)
                 continue
-            if f.is_text == 0:
-                continue  # known binary — skip; cursor still advances past it
             if f.size > max_file_bytes:
                 continue
-            if override_exts is not None and Path(f.rel_path).suffix.lower() not in override_exts:
+            if override_exts is not None and ext not in override_exts:
                 continue
+
+            if convertible:
+                if cached_md is None:
+                    t0 = time.monotonic()
+                    cached_md, err = self._convert_document(Path(f.abspath))
+                    convert_seconds_used += time.monotonic() - t0
+                    if cached_md is None:
+                        # Same policy as transient read failures: requeue with a
+                        # fresh seq until failure_skip_threshold retires it.
+                        self._index.record_transient_failure(f.source_id, err or "conversion failed")
+                        continue
+                    self._index.store_conversion(f.source_id, f.size, f.mtime, cached_md)
+                encoded = cached_md.encode("utf-8")
+                yield self._make_doc(f, cached_md, _sha256(encoded))
+                content_bytes += len(encoded)
+                if content_bytes >= max_content_bytes:
+                    break
+                continue
+
+            if f.is_text == 0:
+                continue  # known binary — skip; cursor still advances past it
 
             abspath = Path(f.abspath)
             try:
