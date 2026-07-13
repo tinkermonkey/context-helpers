@@ -23,6 +23,7 @@ oura      = []          # stdlib only: urllib
 push      = ["watchdog"]
 youtube   = ["yt-dlp"]  # requires yt-dlp CLI on PATH; pip install yt-dlp
 whisper   = ["mlx-whisper"]  # Mac Silicon only; enables auto-transcription of podcast episodes
+documents = ["markitdown[pdf,docx,xlsx,pptx]>=0.1.5"]  # filesystem collector: PDF/Office/iWork → markdown
 
 # OpenTelemetry instrumentation
 telemetry = [
@@ -36,7 +37,7 @@ telemetry = [
 ]
 
 # Convenience bundle
-all = ["healthkit-to-sqlite", "apple-notes-to-sqlite", "obsidiantools", "python-frontmatter", "watchdog", "yt-dlp", "mlx-whisper", "context-helpers[telemetry]"]
+all = ["healthkit-to-sqlite", "apple-notes-to-sqlite", "obsidiantools", "python-frontmatter", "watchdog", "yt-dlp", "mlx-whisper", "markitdown[pdf,docx,xlsx,pptx]>=0.1.5", "context-helpers[telemetry]"]
 
 dev = [
     "pytest",

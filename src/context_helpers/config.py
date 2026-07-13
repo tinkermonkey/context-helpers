@@ -127,6 +127,15 @@ class FilesystemConfig(BaseSettings):
 
     scan_interval_sec: int = 300        # periodic safety re-scan interval for the background indexer
 
+    # Document conversion (PDF/Office/iWork → markdown via MarkItDown, run in a
+    # timeout-guarded subprocess). Requires the [documents] extra; when the
+    # dependency is missing, convertible files are skipped with a warning.
+    convert_documents: bool = True
+    convert_timeout_sec: int = 90       # hard per-file subprocess timeout
+    convert_budget_sec: float = 120.0   # max conversion time spent per delivery page:
+                                        # the page ends early (has_more=True) rather
+                                        # than risking the consumer's fetch timeout
+
     def effective_exclude_dirs(self) -> set[str]:
         """Resolved set of directory names to prune (config override or defaults)."""
         return set(self.exclude_dirs) if self.exclude_dirs else set(_DEFAULT_EXCLUDE_DIRS)

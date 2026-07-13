@@ -60,6 +60,16 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS idx_files_seq ON files(seq);
 CREATE INDEX IF NOT EXISTS idx_files_state ON files(state);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+-- Converted-document cache: document→markdown conversion (PDF/Office/iWork)
+-- is expensive (seconds per file in a subprocess), so results are cached
+-- keyed by (size, mtime) and re-serves cost one SELECT. Stale rows are
+-- overwritten on re-conversion and cleared by reset().
+CREATE TABLE IF NOT EXISTS conversions (
+    source_id  TEXT PRIMARY KEY,
+    size       INTEGER NOT NULL,
+    mtime      REAL NOT NULL,
+    markdown   TEXT NOT NULL
+);
 """
 
 
@@ -346,11 +356,32 @@ class FileIndex:
     # Maintenance
     # ------------------------------------------------------------------
 
+    def get_conversion(self, source_id: str, size: int, mtime: float) -> str | None:
+        """Return cached converted markdown if it matches the file's (size, mtime)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT markdown FROM conversions WHERE source_id=? AND size=? AND mtime=?",
+                (source_id, size, mtime),
+            ).fetchone()
+        return row["markdown"] if row else None
+
+    def store_conversion(self, source_id: str, size: int, mtime: float, markdown: str) -> None:
+        """Cache converted markdown for *source_id* at (size, mtime)."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO conversions (source_id, size, mtime, markdown) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (source_id) DO UPDATE SET size=excluded.size, "
+                "mtime=excluded.mtime, markdown=excluded.markdown",
+                (source_id, size, mtime, markdown),
+            )
+            self._conn.commit()
+
     def reset(self) -> None:
         """Clear the entire index (all files and counters)."""
         with self._lock:
             self._conn.execute("DELETE FROM files")
             self._conn.execute("DELETE FROM meta")
+            self._conn.execute("DELETE FROM conversions")
             self._conn.commit()
 
     def stats(self) -> dict:
