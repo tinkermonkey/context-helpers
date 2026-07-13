@@ -82,6 +82,11 @@ _KNOWN_TEXT_EXTENSIONS = {
 _STATE_DIR = Path.home() / ".local" / "share" / "context-helpers"
 _DEFAULT_ROOT = "~/workspace"
 
+# macOS UF_DATALESS: the file is an iCloud placeholder whose content is
+# evicted ("Optimize Mac Storage"). Reading one returns EDEADLK ("Resource
+# deadlock avoided") — observed retiring 3.5k ~/Documents files in production.
+_UF_DATALESS = 0x40000000
+
 
 def _classify_extension(path: Path) -> int | None:
     """Return 1 (text), 0 (binary), or None (unknown — decide on first read)."""
@@ -375,6 +380,32 @@ class FilesystemCollector(PagedCollector):
                     yield ap, rel
 
     # ------------------------------------------------------------------
+    # iCloud placeholder handling
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_dataless(abspath: str) -> bool:
+        """True if the file is an evicted iCloud placeholder (UF_DATALESS)."""
+        try:
+            return bool(getattr(os.stat(abspath), "st_flags", 0) & _UF_DATALESS)
+        except OSError:
+            return False  # vanished/unreadable — let the read path classify it
+
+    @staticmethod
+    def _request_icloud_download(abspath: str) -> None:
+        """Fire-and-forget materialization request via brctl (never raises)."""
+        import subprocess
+
+        try:
+            subprocess.Popen(
+                ["brctl", "download", abspath],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:  # pragma: no cover - brctl missing
+            logger.warning("filesystem: brctl download failed to start: %s", e)
+
+    # ------------------------------------------------------------------
     # Wire cursors (generation-stamped opaque tokens)
     # ------------------------------------------------------------------
 
@@ -555,6 +586,17 @@ class FilesystemCollector(PagedCollector):
             if f.size > max_file_bytes:
                 continue
             if override_exts is not None and ext not in override_exts:
+                continue
+
+            # iCloud placeholder: content is evicted and a read would fail with
+            # EDEADLK. Ask fileproviderd to materialize it and retry on a later
+            # page (the transient-failure requeue); by the next drain pass the
+            # download has usually completed.
+            if self._is_dataless(f.abspath):
+                self._request_icloud_download(f.abspath)
+                self._index.record_transient_failure(
+                    f.source_id, "iCloud dataless placeholder; download requested"
+                )
                 continue
 
             if convertible:

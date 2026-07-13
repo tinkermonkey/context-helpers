@@ -640,3 +640,55 @@ class TestGenerationCursor:
         assert c.resolve_after("") == page_max
         items2, _, _ = c.fetch_page(after=c.resolve_after(""), limit=50)
         assert len([i for i in items2 if not i.get("op")]) == 2  # only the remainder
+
+
+class TestICloudDataless:
+    """Evicted iCloud placeholders (UF_DATALESS) read as EDEADLK; delivery must
+    request materialization and requeue instead of retiring 3.5k files as
+    binary (the production failure mode)."""
+
+    def test_dataless_file_requeued_with_download_request(self, tmp_path, monkeypatch):
+        (tmp_path / "evicted.md").write_text("# will be treated as dataless")
+        (tmp_path / "local.md").write_text("# fully local")
+        c = _collector(tmp_path)
+
+        downloads = []
+        monkeypatch.setattr(
+            type(c), "_is_dataless",
+            staticmethod(lambda p: p.endswith("evicted.md")),
+        )
+        monkeypatch.setattr(
+            type(c), "_request_icloud_download",
+            staticmethod(lambda p: downloads.append(p)),
+        )
+
+        items, _, page_max = c.fetch_page(after=None, limit=50)
+        ids = [i["source_id"] for i in items if not i.get("op")]
+        # Local file delivered; evicted one skipped but download requested
+        assert any(s.endswith("local.md") for s in ids)
+        assert not any(s.endswith("evicted.md") for s in ids)
+        assert len(downloads) == 1 and downloads[0].endswith("evicted.md")
+
+        # Requeued transiently: still has changes past this page, failures=1
+        assert c._index.has_changes(page_max)
+        row = c._index.lookup(f"{c._roots[0][0]}/evicted.md")
+        assert row.failures == 1  # requeued transiently (last_error persists only on give-up)
+
+    def test_materialized_file_delivers_on_retry(self, tmp_path, monkeypatch):
+        (tmp_path / "evicted.md").write_text("# now materialized")
+        c = _collector(tmp_path)
+
+        state = {"dataless": True}
+        monkeypatch.setattr(
+            type(c), "_is_dataless",
+            staticmethod(lambda p: state["dataless"]),
+        )
+        monkeypatch.setattr(
+            type(c), "_request_icloud_download", staticmethod(lambda p: None)
+        )
+
+        _, _, page_max = c.fetch_page(after=None, limit=50)
+        state["dataless"] = False  # download completed
+        items, _, _ = c.fetch_page(after=page_max, limit=50)
+        ids = [i["source_id"] for i in items if not i.get("op")]
+        assert any(s.endswith("evicted.md") for s in ids)
