@@ -88,6 +88,11 @@ def _sha256(data: bytes) -> str:
 class FilesystemCollector(PagedCollector):
     """Serves indexed text files from one or more local roots over HTTP."""
 
+    # Delivery is driven by the context-library poller (background_poll=True
+    # there); the push trigger must not deliver or chain for this collector.
+    pull_owned = True
+
+
     # Cursor is an integer change-sequence (see index.py), not a timestamp.
     cursor_field = "seq"
 

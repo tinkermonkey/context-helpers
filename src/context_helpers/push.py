@@ -196,6 +196,13 @@ class PushTrigger:
 
             changed = []
             for collector in self._collectors:
+                # Pull-owned collectors are delivered by the context-library
+                # poller on its own schedule; push-triggering them only produces
+                # empty broadcast deliveries (the library skips them) and an
+                # unconsumed stash that makes the push loop spin. FSEvents still
+                # call request_scan() for them so their indexes stay fresh.
+                if collector.pull_owned:
+                    continue
                 try:
                     # Paged collectors with a loaded stash or more pages are always changed
                     if isinstance(collector, PagedCollector) and (
@@ -221,6 +228,8 @@ class PushTrigger:
                 return
 
             # Pre-fill stash for paged collectors in changed that have no stash yet
+            # (pull-owned collectors never appear in `changed`, so their stash is
+            # never pre-filled — their delivery flows through their fetch routes)
             for collector in self._collectors:
                 if isinstance(collector, PagedCollector) and collector.name in changed:
                     if not collector.has_pending():
@@ -266,6 +275,8 @@ class PushTrigger:
                         )
                         # Chain immediately if any collector has more data to deliver
                         for collector in self._collectors:
+                            if collector.pull_owned:
+                                continue
                             if isinstance(collector, PagedCollector) and collector.has_more():
                                 logger.debug(
                                     "PushTrigger: collector '%s' has more pages — scheduling immediate next cycle",
