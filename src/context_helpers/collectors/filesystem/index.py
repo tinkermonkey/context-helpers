@@ -356,6 +356,21 @@ class FileIndex:
     # Maintenance
     # ------------------------------------------------------------------
 
+    def generation(self) -> int:
+        """Reset generation — bumped by reset() so stale consumer cursors are
+        detectable even when the rebuilt index has a similar seq range.
+
+        (The old detection compared cursor > max_seq, which fails whenever the
+        re-indexed corpus is the same size as before — observed in production:
+        a post-reset drain served nothing because the consumer echoed a cursor
+        equal to the new index's ceiling.)
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='reset_gen'"
+            ).fetchone()
+        return int(row["value"]) if row else 0
+
     def get_conversion(self, source_id: str, size: int, mtime: float) -> str | None:
         """Return cached converted markdown if it matches the file's (size, mtime)."""
         with self._lock:
@@ -377,11 +392,19 @@ class FileIndex:
             self._conn.commit()
 
     def reset(self) -> None:
-        """Clear the entire index (all files and counters)."""
+        """Clear the entire index (all files and counters), bumping the reset
+        generation so any cursor issued against the old index is rejected."""
         with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='reset_gen'"
+            ).fetchone()
+            next_gen = (int(row["value"]) if row else 0) + 1
             self._conn.execute("DELETE FROM files")
             self._conn.execute("DELETE FROM meta")
             self._conn.execute("DELETE FROM conversions")
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES('reset_gen', ?)", (str(next_gen),)
+            )
             self._conn.commit()
 
     def stats(self) -> dict:

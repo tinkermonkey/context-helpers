@@ -49,13 +49,6 @@ def _to_tombstone(doc: dict) -> dict:
     return {"op": "delete", "source_id": doc["source_id"], "modified_at": doc.get("modified_at")}
 
 
-def _parse_cursor(source_ref: str) -> int | None:
-    if not source_ref:
-        return None
-    try:
-        return int(source_ref)
-    except ValueError:
-        return None  # unparseable cursor → start from the beginning
 
 
 class FetchRequest(BaseModel):
@@ -123,7 +116,10 @@ def make_filesystem_router(collector: "FilesystemCollector") -> APIRouter:
         ``POST /collectors/filesystem/ack``, so a page whose ingestion fails is
         re-served rather than skipped.
         """
-        after = _parse_cursor(body.source_ref)
+        # Opaque generation-stamped cursor: empty resumes from the committed
+        # (ack'd) position; a token from a previous index generation restarts
+        # from 0 (see FilesystemCollector.resolve_after).
+        after = collector.resolve_after(body.source_ref)
         limit = body.page_size if body.page_size is not None else collector._config.page_size
 
         if body.stream:
@@ -149,7 +145,7 @@ def make_filesystem_router(collector: "FilesystemCollector") -> APIRouter:
             "normalized_contents": contents,
             "deletions": deletions,
             "has_more": has_more,
-            "next_cursor": str(page_max),
+            "next_cursor": collector.wire_cursor(page_max),
         }
 
     return router
@@ -167,8 +163,8 @@ def _ndjson_stream(page_iter: Iterator[dict], collector: "FilesystemCollector") 
     for item in page_iter:
         if item.get("__meta__"):
             try:
-                page_max = int(item["next_cursor"])
-            except (TypeError, ValueError):
+                page_max = int(item["next_seq"])
+            except (TypeError, ValueError, KeyError):
                 page_max = None
             yield _json.dumps({"has_more": item["has_more"], "next_cursor": item["next_cursor"]}) + "\n"
             break

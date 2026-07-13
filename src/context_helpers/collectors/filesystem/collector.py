@@ -97,6 +97,12 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# Wire cursor token: "g<reset-generation>-<seq>". The generation lets delivery
+# reject cursors issued against a previous index (post-reset), which a bare
+# seq comparison cannot do when the rebuilt index has a similar seq range.
+_CURSOR_TOKEN_RE = re.compile(r"^g(\d+)-(\d+)$")
+
+
 class FilesystemCollector(PagedCollector):
     """Serves indexed text files from one or more local roots over HTTP."""
 
@@ -369,6 +375,44 @@ class FilesystemCollector(PagedCollector):
                     yield ap, rel
 
     # ------------------------------------------------------------------
+    # Wire cursors (generation-stamped opaque tokens)
+    # ------------------------------------------------------------------
+
+    def wire_cursor(self, seq: int) -> str:
+        """Format *seq* as the opaque wire token for the current index generation."""
+        return f"g{self._index.generation()}-{seq}"
+
+    def resolve_after(self, source_ref: "str | None") -> int:
+        """Map an opaque wire cursor to a starting seq against the current index.
+
+        - empty → the committed (ack'd) cursor: the crash-recovery floor
+        - "g<gen>-<seq>" with the current generation → that seq
+        - "g<gen>-<seq>" from an older generation → 0 (the index was reset;
+          the consumer dedupes the re-serve)
+        - legacy bare integer → honored unless it exceeds the index ceiling
+        - anything else → 0
+        """
+        if not source_ref:
+            committed = self.get_cursor()
+            return committed or 0
+        m = _CURSOR_TOKEN_RE.match(source_ref)
+        if m:
+            gen, seq = int(m.group(1)), int(m.group(2))
+            if gen != self._index.generation():
+                logger.info(
+                    "filesystem: cursor %s is from a previous index generation "
+                    "(current g%d) — restarting delivery from 0",
+                    source_ref, self._index.generation(),
+                )
+                return 0
+            return seq
+        try:
+            seq = int(source_ref)
+        except ValueError:
+            return 0
+        return 0 if seq > self._index.max_seq() else seq
+
+    # ------------------------------------------------------------------
     # Document conversion (PDF / Office / iWork → markdown)
     # ------------------------------------------------------------------
 
@@ -565,7 +609,12 @@ class FilesystemCollector(PagedCollector):
                 break
 
         has_more = self._index.has_changes(page_max)
-        yield {"__meta__": True, "has_more": has_more, "next_cursor": str(page_max)}
+        yield {
+            "__meta__": True,
+            "has_more": has_more,
+            "next_cursor": self.wire_cursor(page_max),  # opaque wire token
+            "next_seq": page_max,                       # internal commit value
+        }
 
     def fetch_page(  # type: ignore[override]
         self,
@@ -586,7 +635,7 @@ class FilesystemCollector(PagedCollector):
         for obj in self.iter_page(after, limit, extensions, max_size_mb):
             if obj.get("__meta__"):
                 has_more = bool(obj["has_more"])
-                page_max = int(obj["next_cursor"])
+                page_max = int(obj["next_seq"])
                 break
             items.append(obj)
         return items, has_more, page_max

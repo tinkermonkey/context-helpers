@@ -583,3 +583,60 @@ class TestDocumentsEndpoint:
         client = _make_app(_collector(tmp_path))
         data = client.get("/filesystem/documents?extensions=.md").json()
         assert _ids(data) == [f"{_label(tmp_path)}/a.md"]
+
+
+class TestGenerationCursor:
+    """Reset-generation stamping: cursors from a previous index must restart
+    delivery at 0 even when the rebuilt index has the same seq range (the
+    production failure: same corpus re-indexed → cursor == new ceiling →
+    every drain served empty pages and acked the bogus cursor)."""
+
+    def test_wire_cursor_carries_generation(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        _, _, page_max = c.fetch_page(after=None, limit=50)
+        assert c.wire_cursor(page_max).startswith("g0-")
+        c._index.reset()
+        assert c.wire_cursor(page_max).startswith("g1-")
+
+    def test_stale_generation_token_restarts_from_zero(self, tmp_path):
+        for i in range(5):
+            (tmp_path / f"f{i}.md").write_text(f"# {i}")
+        c = _collector(tmp_path)
+        _, _, page_max = c.fetch_page(after=None, limit=50)
+        token = c.wire_cursor(page_max)
+
+        # Same-size reset: identical corpus re-indexed → same ceiling.
+        c._index.reset()
+        c.scan_now()
+        assert c.resolve_after(token) == 0
+        items, _, _ = c.fetch_page(after=c.resolve_after(token), limit=50)
+        assert len([i for i in items if not i.get("op")]) == 5  # full re-serve
+
+    def test_current_generation_token_resumes(self, tmp_path):
+        for i in range(5):
+            (tmp_path / f"f{i}.md").write_text(f"# {i}")
+        c = _collector(tmp_path)
+        items, _, page_max = c.fetch_page(after=None, limit=3)
+        token = c.wire_cursor(page_max)
+        items2, _, _ = c.fetch_page(after=c.resolve_after(token), limit=50)
+        ids = {i["source_id"] for i in items} | {i["source_id"] for i in items2}
+        assert len(ids) == 5  # resumed, no overlap needed
+
+    def test_legacy_int_cursor_honored_within_ceiling(self, tmp_path):
+        for i in range(5):
+            (tmp_path / f"f{i}.md").write_text(f"# {i}")
+        c = _collector(tmp_path)
+        assert c.resolve_after("2") == 2
+        assert c.resolve_after(str(10**9)) == 0  # beyond ceiling → restart
+        assert c.resolve_after("garbage") == 0
+
+    def test_empty_source_ref_resumes_from_committed_cursor(self, tmp_path):
+        for i in range(5):
+            (tmp_path / f"f{i}.md").write_text(f"# {i}")
+        c = _collector(tmp_path)
+        _, _, page_max = c.fetch_page(after=None, limit=3)
+        c.commit_page(page_max)  # non-ack: persists immediately
+        assert c.resolve_after("") == page_max
+        items2, _, _ = c.fetch_page(after=c.resolve_after(""), limit=50)
+        assert len([i for i in items2 if not i.get("op")]) == 2  # only the remainder
