@@ -30,6 +30,21 @@ push_ack_mode: ContextVar[bool] = ContextVar("push_ack_mode", default=False)
 _CURSORS_DIR = Path.home() / ".local" / "share" / "context-helpers" / "cursors"
 
 
+def _parse_item_ts(value) -> "datetime | None":
+    """Parse an item timestamp to an aware datetime, or None if unparseable.
+
+    Accepts ISO 8601 (including a trailing Z) and the space-separated
+    local-offset form some source databases emit. Naive values are assumed UTC.
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 class BaseCollector(ABC):
     """Abstract base class for all data source collectors.
 
@@ -304,23 +319,37 @@ class BaseCollector(ABC):
             span.set_attribute("collector.cursor_key", str(cursor_key or self.name))
             if defer_commit is None:
                 defer_commit = push_ack_mode.get()
-            items.sort(key=lambda x: x.get(ts_field) or "")
+            # Sort by parsed instant, not by string: string order breaks across
+            # mixed UTC offsets (e.g. -0400 vs -0500 around DST, or Z vs +00:00).
+            # Unparseable/missing timestamps sort first, matching the old
+            # empty-string behaviour.
+            _epoch = datetime.min.replace(tzinfo=timezone.utc)
+            items.sort(key=lambda x: _parse_item_ts(x.get(ts_field)) or _epoch)
             limit = self.get_push_limit()
             page = items[:limit]
             if page:
-                ts_vals = [x[ts_field] for x in page if x.get(ts_field)]
-                if ts_vals:
-                    max_ts_str = max(ts_vals)
-                    try:
-                        dt = datetime.fromisoformat(max_ts_str.replace("Z", "+00:00"))
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        if defer_commit:
-                            self._stage_push_cursor(dt, cursor_key)
-                        else:
-                            self._save_push_cursor(dt, cursor_key)
-                    except ValueError:
-                        pass
+                parsed = [
+                    dt for x in page if (dt := _parse_item_ts(x.get(ts_field))) is not None
+                ]
+                if parsed:
+                    dt = max(parsed)
+                    if defer_commit:
+                        self._stage_push_cursor(dt, cursor_key)
+                    else:
+                        self._save_push_cursor(dt, cursor_key)
+                else:
+                    # A full page with zero parseable timestamps means the cursor
+                    # cannot advance and the same page will be re-served forever.
+                    # This must be loud — silence here turns a format bug into an
+                    # invisible delivery stall.
+                    logger.error(
+                        "%s: page of %d items has no parseable '%s' timestamps "
+                        "(e.g. %r) — push cursor NOT advanced; delivery will not progress",
+                        self.name,
+                        len(page),
+                        ts_field,
+                        page[0].get(ts_field),
+                    )
             effective_key = cursor_key or self.name
             if not hasattr(self, "_has_push_more_by_key"):
                 self._has_push_more_by_key: dict[str, bool] = {}
@@ -362,17 +391,32 @@ class BaseCollector(ABC):
         if current is None or ts > current:
             self._save_push_cursor(ts, cursor_key)
 
-    def commit_push_cursors(self) -> "list[str]":
-        """Persist all staged push cursors (commit-ack confirmation).
+    def commit_push_cursors(self, keys: "list[str] | None" = None) -> "list[str]":
+        """Persist staged push cursors (commit-ack confirmation).
 
         Called by the ``POST /collectors/{name}/ack`` endpoint after the consumer
-        has durably committed the served page(s).  Returns the cursor keys committed.
+        has durably committed the served page(s).
+
+        Args:
+            keys: Optional subset of cursor keys to commit (endpoint-keyed ack).
+                Multi-endpoint consumers pass only the keys whose pages fully
+                ingested; keys left out REMAIN staged, so their pages are
+                re-served rather than skipped. None commits everything staged
+                (single-endpoint consumers and older library versions).
+
+        Returns:
+            The cursor keys committed.
         """
         self._ensure_push_stage()
         committed = []
         with self._push_stage_lock:
-            staged = dict(self._staged_push_cursors)
-            self._staged_push_cursors.clear()
+            if keys is None:
+                staged = dict(self._staged_push_cursors)
+                self._staged_push_cursors.clear()
+            else:
+                staged = {k: v for k, v in self._staged_push_cursors.items() if k in keys}
+                for k in staged:
+                    del self._staged_push_cursors[k]
         for key, ts in staged.items():
             self._persist_push_cursor_if_newer(ts, key)
             committed.append(key)
@@ -427,6 +471,10 @@ class PagedCollector(BaseCollector):
         self._has_more: bool = False
         self._stash_lock = threading.Lock()
         self._loading: bool = False
+        # Commit-ack staging for the PAGE cursor (separate from push cursors):
+        # consume_stash() stages here in ack mode instead of persisting, so a
+        # served-but-never-committed page is re-served rather than lost.
+        self._staged_page_cursor: "datetime | None" = None
 
     @property
     def _cursor_path(self) -> Path:
@@ -499,21 +547,58 @@ class PagedCollector(BaseCollector):
             span.set_attribute("collector.has_more", bool(has_more))
 
     def consume_stash(self) -> "list[dict]":
-        """Return stash and advance cursor. Clears the stash."""
+        """Return stash and advance the page cursor. Clears the stash.
+
+        In commit-ack mode (``?ack=true``) the new cursor is STAGED rather than
+        persisted — it only becomes authoritative when the consumer confirms
+        the durable commit via ``POST /collectors/{name}/ack`` (see
+        commit_push_cursors). Previously consume_stash persisted on serve
+        regardless of ack mode, making reminders/calendar delivery
+        at-most-once: a page whose ingestion failed downstream was gone.
+        """
         with self._stash_lock:
             items = self._stash
             self._stash = []
         if items:
             try:
                 max_ts = max(
-                    datetime.fromisoformat(item[self.cursor_field].replace("Z", "+00:00"))
+                    dt
                     for item in items
-                    if item.get(self.cursor_field)
+                    if (dt := _parse_item_ts(item.get(self.cursor_field))) is not None
                 )
-                self._save_cursor(max_ts)
-            except (ValueError, KeyError) as e:
+                if push_ack_mode.get():
+                    self._stage_page_cursor(max_ts)
+                else:
+                    self._save_cursor(max_ts)
+            except ValueError as e:
                 logger.warning("PagedCollector: could not advance cursor for %s: %s", self.name, e)
         return items
+
+    def _stage_page_cursor(self, ts: "datetime") -> None:
+        with self._stash_lock:
+            if self._staged_page_cursor is None or ts > self._staged_page_cursor:
+                self._staged_page_cursor = ts
+
+    def page_cursor_ack_key(self) -> str:
+        """Cursor key that identifies the page cursor in keyed acks."""
+        return f"{self.name}_page"
+
+    def commit_push_cursors(self, keys: "list[str] | None" = None) -> "list[str]":
+        """Also commit the staged page cursor (see consume_stash)."""
+        committed = super().commit_push_cursors(keys)
+
+        page_key = self.page_cursor_ack_key()
+        with self._stash_lock:
+            staged = self._staged_page_cursor
+            take = staged is not None and (keys is None or page_key in keys)
+            if take:
+                self._staged_page_cursor = None
+        if take and staged is not None:
+            current = self.get_cursor()
+            if current is None or staged > current:
+                self._save_cursor(staged)
+            committed.append(page_key)
+        return committed
 
     def discard_stash(self) -> None:
         """Discard any pre-filled stash without advancing the cursor.
@@ -548,6 +633,8 @@ class PagedCollector(BaseCollector):
             cleared.append(f"page_cursor:{self.name}")
 
         self.discard_stash()
+        with self._stash_lock:
+            self._staged_page_cursor = None
         cleared.append("stash")
 
         return cleared

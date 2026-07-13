@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -119,14 +119,24 @@ class YouTubeCollector(BaseCollector):
                 since_dt = since_dt.replace(tzinfo=timezone.utc)
 
         entries = self._run_ytdlp()
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
 
-        # Record first-seen timestamp for any new video_id.
+        # Record first-seen timestamps for new video_ids.  Each new video gets
+        # a strictly increasing synthetic timestamp (now + i microseconds, in
+        # discovery order) so first-seen timestamps are unique: if all videos
+        # of a large first run shared one timestamp, everything beyond the
+        # first push page would be filtered out forever by the strictly
+        # greater-than cursor (`watched_dt <= since`).  Unique timestamps let
+        # paging walk through the backlog.  Values already in the persisted
+        # seen-cache are never modified.
         changed = False
+        new_count = 0
         for entry in entries:
             vid = entry.get("id")
             if vid and vid not in self._seen:
-                self._seen[vid] = now_iso
+                self._seen[vid] = (now + timedelta(microseconds=new_count)).isoformat()
+                new_count += 1
                 changed = True
         if changed:
             self._save_seen_cache()

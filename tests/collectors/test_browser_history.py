@@ -296,11 +296,14 @@ class TestFetchSafari:
         c._safari_db = tmp_path / "nonexistent.db"
         assert c.fetch_safari(since=None) == []
 
-    def test_respects_push_page_size(self, safari_db):
+    def test_returns_page_size_plus_one_for_has_more(self, safari_db):
+        """fetch returns up to push_page_size + 1 visits so apply_push_paging
+        can signal has_more; slicing to the limit here would make every full
+        page look final and throttle catch-up to one page per poll interval."""
         c = _collector(push_page_size=1)
         c._safari_db = safari_db
         items = c.fetch_safari(since=None)
-        assert len(items) <= 1
+        assert len(items) == 2  # limit + 1 (3 deliverable visits exist)
 
     def test_empty_when_nothing_after_cursor(self, safari_db):
         c = _collector()
@@ -416,6 +419,84 @@ class TestFetchChrome:
         c = _collector()
         c._chrome_history = chrome_db
         assert c.fetch_chrome(since="2030-01-01T00:00:00+00:00") == []
+
+
+# ---------------------------------------------------------------------------
+# Blocklist batching + has_more signaling
+# ---------------------------------------------------------------------------
+
+class TestBlocklistBatching:
+    """Blocked URLs are dropped after the SQL fetch, so the scan must batch
+    past all-blocked runs — otherwise a page of blocked visits starves
+    delivery of everything behind it."""
+
+    def test_all_blocked_batch_does_not_starve_later_visits(self, safari_db):
+        # example.com (early) and news.ycombinator.com (mid) are blocked;
+        # with push_page_size=1 the first SQL batch (2 rows) is all-blocked,
+        # so the scan must advance its offset to reach github.com (late).
+        c = _collector(
+            push_page_size=1,
+            blocklist_domains=["example.com", "news.ycombinator.com"],
+        )
+        c._safari_db = safari_db
+        items = c.fetch_safari(since=None)
+        assert [i["url"] for i in items] == ["https://github.com/orgs"]
+
+    def test_entirely_blocked_remainder_returns_empty(self, safari_db):
+        """If every remaining visit is blocked, the page is empty and no
+        has_more is signaled — the cursor stays put and the blocked run is
+        re-scanned next poll, but there is no delivery loop."""
+        c = _collector(
+            push_page_size=1,
+            blocklist_domains=["example.com", "news.ycombinator.com", "github.com"],
+        )
+        c._safari_db = safari_db
+        items = c.fetch_safari(since=None)
+        assert items == []
+        page = c.apply_push_paging(
+            items, "visitedAt", "browser_history_safari", defer_commit=True
+        )
+        assert page == []
+        assert c.has_push_more("browser_history_safari") is False
+
+    def test_full_page_chains_via_has_more(self, safari_db, tmp_path, monkeypatch):
+        """Regression: with push_page_size=1, chained pages via the push
+        cursor must deliver all visits — previously the fetch sliced off the
+        +1 row, apply_push_paging saw exactly `limit` items, has_more stayed
+        False, and delivery crawled one page per poll interval."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+
+        c = _collector(push_page_size=1, firefox_enabled=False, chrome_enabled=False)
+        c._safari_db = safari_db
+
+        app = FastAPI()
+        app.include_router(c.get_router())
+        client = TestClient(app)
+
+        delivered: list[str] = []
+        since_param = ""
+        for _ in range(10):
+            url = "/browser/history" + (f"?since={since_param}" if since_param else "")
+            page = client.get(url).json()
+            if not page:
+                break
+            assert len(page) == 1
+            delivered.extend(i["url"] for i in page)
+            if not c.has_push_more("browser_history_safari"):
+                break
+            since_param = "2000-01-01T00:00:00%2B00:00"  # non-empty; cursor wins
+        else:
+            pytest.fail("paging did not terminate")
+
+        assert delivered == [
+            "https://example.com/page1",
+            "https://news.ycombinator.com/",
+            "https://github.com/orgs",
+        ]
 
 
 # ---------------------------------------------------------------------------

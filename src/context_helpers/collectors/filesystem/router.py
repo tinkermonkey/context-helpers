@@ -135,10 +135,12 @@ def make_filesystem_router(collector: "FilesystemCollector") -> APIRouter:
                 media_type="application/x-ndjson",
             )
 
-        items, has_more = collector.fetch_page(
+        items, has_more, page_max = collector.fetch_page(
             after=after, limit=limit, extensions=body.extensions, max_size_mb=body.max_size_mb,
         )
-        page_max = collector._page_max_seq if collector._page_max_seq is not None else (after or 0)
+        # page_max is THIS request's max examined seq, returned by fetch_page —
+        # never read from shared collector state, so overlapping requests each
+        # commit exactly the page they served.
         collector.commit_page(page_max)
 
         contents = [_to_normalized_content(d) for d in items if not d.get("__deleted__")]
@@ -154,20 +156,25 @@ def make_filesystem_router(collector: "FilesystemCollector") -> APIRouter:
 
 
 def _ndjson_stream(page_iter: Iterator[dict], collector: "FilesystemCollector") -> Iterator[str]:
-    """Yield NDJSON lines from iter_page() output, then commit the page cursor."""
-    next_cursor = "0"
+    """Yield NDJSON lines from iter_page() output, then commit the page cursor.
+
+    The page's max seq arrives in THIS iterator's meta sentinel (a per-request
+    value) — never from shared collector state — so overlapping requests each
+    commit exactly the page they streamed. If the sentinel never arrives (the
+    stream aborted mid-page), nothing is committed and the page is re-served.
+    """
+    page_max: int | None = None
     for item in page_iter:
         if item.get("__meta__"):
-            next_cursor = item["next_cursor"]
-            yield _json.dumps({"has_more": item["has_more"], "next_cursor": next_cursor}) + "\n"
+            try:
+                page_max = int(item["next_cursor"])
+            except (TypeError, ValueError):
+                page_max = None
+            yield _json.dumps({"has_more": item["has_more"], "next_cursor": item["next_cursor"]}) + "\n"
             break
         if item.get("__deleted__"):
             yield _json.dumps(_to_tombstone(item)) + "\n"
         else:
             yield _json.dumps(_to_normalized_content(item)) + "\n"
-    # iter_page set _page_max_seq while iterating; commit after the page is served.
-    try:
-        page_max = int(next_cursor)
-    except (TypeError, ValueError):
-        page_max = collector._page_max_seq or 0
-    collector.commit_page(page_max)
+    if page_max is not None:
+        collector.commit_page(page_max)

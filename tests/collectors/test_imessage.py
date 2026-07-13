@@ -69,11 +69,23 @@ class TestFetchMessages:
         for msg in result:
             assert isinstance(msg["is_from_me"], bool)
 
-    def test_results_ordered_by_date_desc(self, chat_db):
-        """Most recent messages come first."""
+    def test_results_ordered_by_date_asc(self, chat_db):
+        """Oldest messages come first — backlog paging advances through history."""
         result = _collector(chat_db).fetch_messages(since=None)
         timestamps = [m["timestamp"] for m in result]
-        assert timestamps == sorted(timestamps, reverse=True)
+        assert timestamps == sorted(timestamps)
+
+    def test_fetch_bounded_to_push_limit_plus_one(self, chat_db):
+        """The fetch window is push_page_size + 1 OLDEST rows, so a backlog
+        larger than one page is delivered oldest-first across cycles instead of
+        stranding everything older than a newest-first window."""
+        collector = _collector(chat_db)
+        collector.set_push_limit(10)
+        result = collector.fetch_messages(since=None)
+        assert len(result) <= 11
+        # And they must be the oldest rows, not the newest
+        all_rows = collector.fetch_messages(since=None, limit=100000)
+        assert [m["id"] for m in result] == [m["id"] for m in all_rows[: len(result)]]
 
     def test_id_is_string(self, chat_db):
         result = _collector(chat_db).fetch_messages(since=None)
@@ -101,8 +113,8 @@ class TestEpochConversion:
     def test_timestamp_matches_inserted_date(self, chat_db):
         """The base message (msg 1) must round-trip to _BASE_DT."""
         result = _collector(chat_db).fetch_messages(since=None)
-        # Most recent first; msg 1 is oldest
-        oldest = result[-1]  # "Hello!" was inserted at base_ns
+        # Oldest first; msg 1 is oldest
+        oldest = result[0]  # "Hello!" was inserted at base_ns
         assert oldest["text"] == "Hello!"
         parsed = datetime.fromisoformat(oldest["timestamp"])
         # Allow ±1 second for rounding from ns → s

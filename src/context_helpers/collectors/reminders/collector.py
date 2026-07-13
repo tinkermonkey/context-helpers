@@ -104,10 +104,16 @@ def _datetime_to_apple_ts(dt: datetime) -> float:
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
+    # NULL ZLASTMODIFIEDDATE maps to the Apple epoch (2001-01-01T00:00:00+00:00),
+    # NOT now(): mapping to now() jumped the push cursor past the entire backlog
+    # on first load (apply_push_paging advances the cursor to the page's max
+    # timestamp). With the epoch the row sorts first, delivers once, and can
+    # never advance the cursor past real timestamps (max() of the page always
+    # prefers real timestamps — same for consume_stash's max(cursor_field)).
     modified_dt = (
         _apple_ts_to_datetime(row["modified_ts"])
         if row["modified_ts"]
-        else datetime.now(tz=timezone.utc)
+        else _apple_ts_to_datetime(0)
     )
     due_dt = _apple_ts_to_datetime(row["due_ts"]) if row["due_ts"] else None
     completion_dt = (

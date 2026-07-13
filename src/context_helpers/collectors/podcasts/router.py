@@ -26,11 +26,19 @@ def make_podcasts_router(collector: "PodcastsCollector") -> APIRouter:
         Each item represents an episode that has been played (fully or partially).
         Items are ordered by ZPLAYSTATELASTMODIFIEDDATE ASC so the push cursor
         advances monotonically.
+
+        The paging ts_field is playStateModifiedAt, which mirrors the SQL
+        filter column (ZPLAYSTATELASTMODIFIEDDATE) — NOT listenedAt, whose
+        fallbacks (last_played_ts / now()) live in a different time domain
+        than the query filter and would advance the cursor past undelivered
+        rows.  listenedAt remains in the payload for consumers.
         """
         items = collector.fetch_listen_history(
             since=collector.resolve_push_since(since, "podcasts_listen_history")
         )
-        return collector.apply_push_paging(items, "listenedAt", "podcasts_listen_history")
+        return collector.apply_push_paging(
+            items, "playStateModifiedAt", "podcasts_listen_history"
+        )
 
     @router.get("/podcasts/transcripts")
     def get_transcripts(

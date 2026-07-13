@@ -170,9 +170,15 @@ def _row_to_dict(
         "calendar": row["calendar_name"] or "",
         "location": row["location"] or None,
         "status": _STATUS_MAP.get(row["status"], "confirmed"),
+        # NULL ZLASTMODIFIED maps to the Apple epoch (2001-01-01T00:00:00+00:00),
+        # NOT now(): mapping to now() jumped the push cursor past the entire
+        # backlog on first load (apply_push_paging advances the cursor to the
+        # page's max timestamp). With the epoch the row sorts first, delivers
+        # once, and never outranks real timestamps in max()-based cursor
+        # advancement (apply_push_paging and consume_stash alike).
         "lastModified": (
             _apple_ts_to_iso(row["modified_ts"])
-            or datetime.now(tz=timezone.utc).isoformat()
+            or _apple_ts_to_datetime(0).isoformat()
         ),
         "attendees": attendees,
         "recurrence": recurrence,

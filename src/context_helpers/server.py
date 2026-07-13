@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from context_helpers.auth import make_auth_dependency
 from context_helpers.collectors.base import BaseCollector, PagedCollector, push_ack_mode
@@ -14,6 +15,18 @@ from context_helpers.config import AppConfig
 from context_helpers.state import StateStore
 
 logger = logging.getLogger(__name__)
+
+
+class AckRequest(BaseModel):
+    """Optional body for POST /collectors/{name}/ack.
+
+    Endpoint-keyed ack: commit only these staged cursor keys. Keys left out
+    remain staged so their pages are re-served, not skipped. Omitted body (or
+    null keys) commits everything staged — the behaviour older library
+    versions rely on.
+    """
+
+    keys: list[str] | None = None
 
 
 async def _set_ack_mode(
@@ -64,6 +77,15 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
                 collector.start()
             except Exception as e:
                 logger.error("collector %s: start() failed: %s", collector.name, e)
+
+        # Staleness gauges: cursor age / has_more / watermark age, so a stalled
+        # collector is visible in SigNoz instead of failing silently.
+        try:
+            from context_helpers.staleness import register_staleness_metrics
+
+            register_staleness_metrics(collectors, state_store)
+        except Exception as e:
+            logger.warning("staleness metrics not registered: %s", e)
 
         push_trigger = None
         if config.push.enabled and config.push.library_url:
@@ -208,7 +230,7 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
             )
 
     @app.post("/collectors/{name}/ack", dependencies=[Depends(auth_dep)])
-    async def ack_collector(name: str) -> dict:
+    async def ack_collector(name: str, body: AckRequest | None = Body(default=None)) -> dict:
         """Commit a collector's staged push cursors (commit-ack confirmation).
 
         When a consumer pulls with ``?ack=true`` the collector *stages* its new
@@ -217,12 +239,17 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
         committed the served page(s); only then does the cursor advance. A page
         whose ingestion fails is therefore re-served on the next pull rather than
         being silently skipped. Safe to call when nothing is staged (no-op).
+
+        Multi-endpoint consumers (health, oura) may pass ``{"keys": [...]}`` to
+        commit only the endpoints whose pages fully ingested; the failed
+        endpoints' cursors stay staged and re-serve.
         """
         collector = collector_index.get(name)
         if collector is None:
             raise HTTPException(status_code=404, detail=f"No collector named '{name}'")
         try:
-            committed = collector.commit_push_cursors()
+            keys = body.keys if body is not None else None
+            committed = collector.commit_push_cursors(keys)
             if committed:
                 logger.info("collector %s: ack committed push cursors: %s", name, committed)
             return {"ok": True, "collector": name, "committed": committed, "errors": []}

@@ -86,13 +86,18 @@ class ObsidianCollector(BaseCollector):
         return []
 
     def has_changes_since(self, watermark: datetime | None) -> bool:
-        if watermark is None:
+        # Compare mtimes against this collector's own delivery position, not the
+        # global watermark: the watermark advances whenever ANY collector
+        # delivers, so with an undelivered backlog and a quiet vault every
+        # note's mtime falls behind it and delivery silently stalls.
+        cursor = self.get_push_cursor() or watermark
+        if cursor is None:
             return True
         for path in self._vault_path.rglob("*.md"):
             if not path.is_file():
                 continue
             try:
-                if datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) > watermark:
+                if datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) > cursor:
                     return True
             except OSError:
                 pass

@@ -649,3 +649,53 @@ class TestRouter:
         resp = tc.get("/calendar/events", params={"since": "2030-01-01T00:00:00+00:00"})
         assert resp.status_code == 200
         assert resp.json() == []
+
+
+# ---------------------------------------------------------------------------
+# NULL ZLASTMODIFIED handling (_row_to_dict)
+# ---------------------------------------------------------------------------
+
+class TestNullLastModified:
+    """NULL ZLASTMODIFIED must map to the Apple epoch, never now().
+
+    Mapping to now() jumped the push cursor past the entire backlog on first
+    load (apply_push_paging advances the cursor to the page's max timestamp).
+    These tests are date-independent (no fixture window).
+    """
+
+    def _row(self, modified_ts):
+        from context_helpers.collectors.calendar.collector import _row_to_dict
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT 'uid-null' AS id, 'Event' AS title, NULL AS notes, "
+            "NULL AS location, 0.0 AS start_ts, 3600.0 AS end_ts, "
+            "0 AS is_all_day, ? AS modified_ts, 0 AS status, NULL AS url, "
+            "'Cal' AS calendar_name",
+            (modified_ts,),
+        ).fetchone()
+        return _row_to_dict(row, attendees=[], recurrence=None)
+
+    def test_null_modified_maps_to_apple_epoch(self):
+        d = self._row(None)
+        assert d["lastModified"] == "2001-01-01T00:00:00+00:00"
+
+    def test_null_modified_is_not_now(self):
+        d = self._row(None)
+        parsed = datetime.fromisoformat(d["lastModified"])
+        assert parsed < datetime.now(timezone.utc) - timedelta(days=365)
+
+    def test_real_modified_ts_unaffected(self):
+        ts = _to_apple_ts("2026-03-25T08:00:00+00:00")
+        d = self._row(ts)
+        assert d["lastModified"] == "2026-03-25T08:00:00+00:00"
+
+    def test_epoch_never_outranks_real_timestamps_in_push_paging(self):
+        """A NULL-modified row sorts first and cannot advance the push cursor
+        past real timestamps (max() of the page prefers real timestamps)."""
+        null_row = self._row(None)
+        real_row = self._row(_to_apple_ts("2026-03-25T08:00:00+00:00"))
+        rows = [real_row, null_row]
+        rows.sort(key=lambda r: r["lastModified"])
+        assert rows[0]["id"] == null_row["id"] or rows[0]["lastModified"] == "2001-01-01T00:00:00+00:00"
+        assert max(r["lastModified"] for r in rows) == "2026-03-25T08:00:00+00:00"

@@ -113,9 +113,12 @@ class FilesystemCollector(PagedCollector):
         self._scan_wake = threading.Event()
         self._scan_lock = threading.Lock()  # serialise concurrent scan_now() calls
 
-        # Max seq examined by the most recent page — used to advance the cursor
-        # past skipped (binary/oversized) files and to stage the commit-ack seq.
-        self._page_max_seq: int | None = None
+        # Max seq examined by the page currently sitting in the stash (guarded
+        # by _stash_lock, set by fill_stash, cleared by consume_stash). This is
+        # deliberately NOT shared with the /fetch request path: each /fetch
+        # request carries its own page max through return values so overlapping
+        # requests can never clobber each other's commit position.
+        self._stash_page_max: int | None = None
         # Commit-ack staging (mirrors BaseCollector's push-cursor staging but for
         # the integer seq cursor this collector uses).
         self._staged_seq: int | None = None
@@ -367,6 +370,10 @@ class FilesystemCollector(PagedCollector):
         past every examined row (including skipped binary/oversized files), so
         progress is never blocked. The trailing sentinel is
         ``{"__meta__": True, "has_more": bool, "next_cursor": str}``.
+
+        The page's max examined seq travels ONLY in the sentinel's
+        ``next_cursor`` (as a per-request local) — never through instance
+        state — so concurrent requests cannot commit each other's page max.
         """
         override_exts = {e.lower() for e in extensions} if extensions else self._allowlist
         max_mb = max_size_mb if max_size_mb is not None else self._config.max_file_size_mb
@@ -427,7 +434,6 @@ class FilesystemCollector(PagedCollector):
             if content_bytes >= max_content_bytes:
                 break
 
-        self._page_max_seq = page_max
         has_more = self._index.has_changes(page_max)
         yield {"__meta__": True, "has_more": has_more, "next_cursor": str(page_max)}
 
@@ -437,16 +443,23 @@ class FilesystemCollector(PagedCollector):
         limit: int,
         extensions: list[str] | None = None,
         max_size_mb: float | None = None,
-    ) -> tuple[list[dict], bool]:
-        """Materialise one page: (content+tombstone dicts, has_more)."""
+    ) -> tuple[list[dict], bool, int]:
+        """Materialise one page: (content+tombstone dicts, has_more, page_max_seq).
+
+        *page_max_seq* is the max seq examined by THIS call; the caller passes
+        it to commit_page() explicitly, so concurrent fetches each commit their
+        own page max instead of racing over shared instance state.
+        """
         items: list[dict] = []
         has_more = False
+        page_max = after or 0
         for obj in self.iter_page(after, limit, extensions, max_size_mb):
             if obj.get("__meta__"):
                 has_more = bool(obj["has_more"])
+                page_max = int(obj["next_cursor"])
                 break
             items.append(obj)
-        return items, has_more
+        return items, has_more, page_max
 
     # ------------------------------------------------------------------
     # Cursor (integer seq) + commit-ack
@@ -508,19 +521,51 @@ class FilesystemCollector(PagedCollector):
     # ------------------------------------------------------------------
 
     def fill_stash(self, limit: int) -> None:
-        super().fill_stash(limit)
+        # Full override (not super()) so the fetched page's max seq is captured
+        # locally and stored WITH the stash under the stash lock, instead of on
+        # an instance attribute a concurrent /fetch request could clobber.
+        with self._stash_lock:
+            if self._stash or self._loading:
+                return
+            self._loading = True
+        try:
+            cursor = self.get_cursor()
+            items, has_more, page_max = self.fetch_page(after=cursor, limit=limit)
+        except Exception as e:
+            logger.error("filesystem: fill_stash() failed: %s", e)
+            items, has_more, page_max = [], False, None
+        finally:
+            with self._stash_lock:
+                self._loading = False
+        with self._stash_lock:
+            self._stash = items
+            self._has_more = has_more
+            self._stash_page_max = page_max
         # All-skipped page leaves the stash empty and consume_stash is never
         # called, so advance the cursor here to avoid re-examining skipped files.
-        if not self.has_pending() and self._page_max_seq is not None:
-            self._persist_seq(self._page_max_seq)
+        if not items and page_max is not None:
+            with self._stash_lock:
+                self._stash_page_max = None
+            self._persist_seq(page_max)
 
     def consume_stash(self) -> list[dict]:
         with self._stash_lock:
             items = self._stash
+            page_max = self._stash_page_max
             self._stash = []
-        if self._page_max_seq is not None:
-            self._persist_seq(self._page_max_seq)
+            self._stash_page_max = None
+        # Only commit the seq recorded for THIS stash fill; never touch the
+        # /fetch request path's cursor position (page maxes there flow through
+        # fetch_page return values, not instance state).
+        if page_max is not None:
+            self._persist_seq(page_max)
         return items
+
+    def discard_stash(self) -> None:
+        with self._stash_lock:
+            self._stash = []
+            self._has_more = False
+            self._stash_page_max = None
 
     # ------------------------------------------------------------------
     # Backward-compatible direct API (GET /filesystem/documents)
@@ -592,5 +637,6 @@ class FilesystemCollector(PagedCollector):
         cleared.append("file_index")
         with self._seq_stage_lock:
             self._staged_seq = None
-        self._page_max_seq = None
+        with self._stash_lock:
+            self._stash_page_max = None
         return cleared

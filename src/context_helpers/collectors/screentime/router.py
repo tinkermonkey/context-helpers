@@ -35,13 +35,17 @@ def make_screentime_router(collector: "ScreenTimeCollector") -> APIRouter:
         Only complete days are returned (today's partial data is excluded).
         Items are ordered by date ASC then durationSeconds DESC.
 
+        Pages always end on a complete day boundary (see
+        ScreenTimeCollector.page_app_usage): the day-granularity cursor would
+        otherwise skip the remainder of a split day.  A page may exceed
+        push_page_size when a single day alone has more rows than the limit.
+
         On the push-trigger path, the push cursor (not the global watermark) is used
         as the lower bound so each delivery resumes from where it left off.
         """
-        items = collector.fetch_app_usage(
+        return collector.page_app_usage(
             since=collector.resolve_push_since(since, _CURSOR_APP_USAGE)
         )
-        return collector.apply_push_paging(items, "date", _CURSOR_APP_USAGE)
 
     @router.get("/screentime/focus")
     def get_focus(

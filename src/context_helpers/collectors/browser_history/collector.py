@@ -209,6 +209,10 @@ def _iso_to_chrome_ts(iso: str | None) -> int | None:
 # SQL queries
 # ---------------------------------------------------------------------------
 
+# OFFSET supports internal batching in _scan_visits: blocked URLs are dropped
+# after the SQL fetch, so scanning must be able to continue past an
+# all-blocked batch within a single fetch (see _scan_visits).
+
 _SAFARI_QUERY = """
 SELECT
     hi.url         AS url,
@@ -221,7 +225,7 @@ WHERE hv.load_successful = 1
   AND hv.visit_time > 0
   AND (? IS NULL OR hv.visit_time > ?)
 ORDER BY hv.visit_time ASC
-LIMIT ?
+LIMIT ? OFFSET ?
 """
 
 _FIREFOX_QUERY = """
@@ -235,7 +239,7 @@ JOIN moz_places p ON v.place_id = p.id
 WHERE v.visit_date > 0
   AND (? IS NULL OR v.visit_date > ?)
 ORDER BY v.visit_date ASC
-LIMIT ?
+LIMIT ? OFFSET ?
 """
 
 _CHROME_QUERY = """
@@ -249,7 +253,7 @@ JOIN urls u ON v.url = u.id
 WHERE v.visit_time > 0
   AND (? IS NULL OR v.visit_time > ?)
 ORDER BY v.visit_time ASC
-LIMIT ?
+LIMIT ? OFFSET ?
 """
 
 # ---------------------------------------------------------------------------
@@ -549,6 +553,53 @@ class BrowserHistoryCollector(BaseCollector):
             "visitCount": int(visit_count or 1),
         }
 
+    def _scan_visits(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        after_ts: "float | int | None",
+        ts_column: str,
+        ts_to_iso,
+        browser: str,
+    ) -> list[dict]:
+        """Scan history rows in visit-time order, dropping blocked URLs.
+
+        Returns up to push_page_size + 1 visits: apply_push_paging slices to
+        the limit and needs the extra item to signal has_more (slicing here
+        would make every full page look final and throttle catch-up to one
+        page per poll interval).
+
+        Internal batching: blocked URLs are dropped AFTER the SQL fetch, so a
+        single LIMIT-bounded query could return an all-blocked batch — an
+        empty page whose cursor never advances, stalling every deliverable
+        visit behind it.  Instead, keep scanning further batches (same ORDER
+        BY, advancing an OFFSET) until the page is full or the rows are
+        exhausted.  Blocked visits that lie before the max visitedAt of the
+        served page end up behind the advanced cursor and are never rescanned
+        (intended — they are permanently excluded anyway).  If the entire
+        remainder is blocked the result may be empty; the cursor then stays
+        put and the blocked run is re-scanned on the next poll, but has_more
+        stays False so there is no delivery loop.
+        """
+        target = self._config.push_page_size + 1
+        results: list[dict] = []
+        offset = 0
+        while len(results) < target:
+            rows = conn.execute(query, (after_ts, after_ts, target, offset)).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                visited_at = ts_to_iso(row[ts_column])
+                visit = self._make_visit(
+                    row["url"], row["title"], visited_at, browser, row["visit_count"]
+                )
+                if visit is not None:
+                    results.append(visit)
+            if len(rows) < target:
+                break
+            offset += len(rows)
+        return results
+
     # ------------------------------------------------------------------
     # Fetch methods
     # ------------------------------------------------------------------
@@ -558,6 +609,8 @@ class BrowserHistoryCollector(BaseCollector):
 
         since=None  → all visits.
         since=<ISO> → visits with visit_time strictly after this timestamp.
+
+        Returns up to push_page_size + 1 visits (see _scan_visits).
         """
         if not self._safari_db.exists():
             return []
@@ -565,29 +618,21 @@ class BrowserHistoryCollector(BaseCollector):
         try:
             with _open_db(self._safari_db) as conn:
                 conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    _SAFARI_QUERY,
-                    (after_ts, after_ts, self._config.push_page_size + 1),
-                ).fetchall()
+                return self._scan_visits(
+                    conn, _SAFARI_QUERY, after_ts, "visited_ts",
+                    _safari_ts_to_iso, "safari",
+                )
         except sqlite3.OperationalError as e:
             logger.warning("browser_history: Safari DB error: %s", e)
             return []
-
-        results = []
-        for row in rows[: self._config.push_page_size]:
-            visited_at = _safari_ts_to_iso(row["visited_ts"])
-            visit = self._make_visit(
-                row["url"], row["title"], visited_at, "safari", row["visit_count"]
-            )
-            if visit is not None:
-                results.append(visit)
-        return results
 
     def fetch_firefox(self, since: str | None) -> list[dict]:
         """Return Firefox history visits ordered by visit_date ASC.
 
         since=None  → all visits.
         since=<ISO> → visits with visit_date strictly after this timestamp.
+
+        Returns up to push_page_size + 1 visits (see _scan_visits).
         """
         ff_db = self._find_firefox_db()
         if ff_db is None:
@@ -596,23 +641,13 @@ class BrowserHistoryCollector(BaseCollector):
         try:
             with _open_db(ff_db) as conn:
                 conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    _FIREFOX_QUERY,
-                    (after_ts, after_ts, self._config.push_page_size + 1),
-                ).fetchall()
+                return self._scan_visits(
+                    conn, _FIREFOX_QUERY, after_ts, "visited_ts_us",
+                    _firefox_ts_to_iso, "firefox",
+                )
         except sqlite3.OperationalError as e:
             logger.warning("browser_history: Firefox DB error: %s", e)
             return []
-
-        results = []
-        for row in rows[: self._config.push_page_size]:
-            visited_at = _firefox_ts_to_iso(row["visited_ts_us"])
-            visit = self._make_visit(
-                row["url"], row["title"], visited_at, "firefox", row["visit_count"]
-            )
-            if visit is not None:
-                results.append(visit)
-        return results
 
     def fetch_chrome(self, since: str | None) -> list[dict]:
         """Return Chrome history visits ordered by visit_time ASC.
@@ -622,6 +657,8 @@ class BrowserHistoryCollector(BaseCollector):
 
         Opens the database with an immutable fallback for when Chrome holds
         the write lock.
+
+        Returns up to push_page_size + 1 visits (see _scan_visits).
         """
         if not self._chrome_history.exists():
             return []
@@ -629,23 +666,13 @@ class BrowserHistoryCollector(BaseCollector):
         try:
             with _open_db(self._chrome_history) as conn:
                 conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    _CHROME_QUERY,
-                    (after_ts, after_ts, self._config.push_page_size + 1),
-                ).fetchall()
+                return self._scan_visits(
+                    conn, _CHROME_QUERY, after_ts, "visited_ts_us",
+                    _chrome_ts_to_iso, "chrome",
+                )
         except sqlite3.OperationalError as e:
             logger.warning("browser_history: Chrome DB error: %s", e)
             return []
-
-        results = []
-        for row in rows[: self._config.push_page_size]:
-            visited_at = _chrome_ts_to_iso(row["visited_ts_us"])
-            visit = self._make_visit(
-                row["url"], row["title"], visited_at, "chrome", row["visit_count"]
-            )
-            if visit is not None:
-                results.append(visit)
-        return results
 
     def fetch_tabs(self) -> list[dict]:
         """Return currently open tabs from Safari and Chrome via JXA.
