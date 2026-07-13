@@ -24,6 +24,23 @@ logger = logging.getLogger(__name__)
 # Does not require Full Disk Access; stat() works with Automation permission.
 _ADDRESSBOOK_DIR = Path.home() / "Library" / "Application Support" / "AddressBook"
 
+# Sentinel modifiedAt for contacts with no usable modification date: sorts
+# before any real timestamp in push paging, so such contacts deliver once on
+# the first sync and never drag the push cursor around.
+_EPOCH_ISO = "1970-01-01T00:00:00+00:00"
+
+
+def _parse_modified_at(contact: dict) -> datetime | None:
+    """Return the contact's modifiedAt as an aware datetime, or None if unusable."""
+    modified_at = contact.get("modifiedAt")
+    if not modified_at:
+        return None
+    try:
+        mod_dt = datetime.fromisoformat(str(modified_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return mod_dt if mod_dt.tzinfo else mod_dt.replace(tzinfo=timezone.utc)
+
 # Bulk-fetch every property up front using JXA array-specifier form
 # (app.people.name(), etc.) — one Apple Events round-trip per property regardless
 # of contact count.  Crucially this includes emails/phones: app.people.emails.value()
@@ -226,8 +243,16 @@ class ContactsCollector(BaseCollector):
         """
         contacts = self._get_cached()
 
-        if since is None:
-            return contacts
+        if not since:
+            # Full export / first sync: include contacts with no parseable
+            # modifiedAt, but stamp them with the Unix epoch so they sort first
+            # in push paging, deliver exactly once, and never influence the
+            # push cursor (max() of the page always prefers real timestamps).
+            return [
+                c if _parse_modified_at(c) is not None
+                else {**c, "modifiedAt": _EPOCH_ISO}
+                for c in contacts
+            ]
 
         since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
         if since_dt.tzinfo is None:
@@ -235,17 +260,18 @@ class ContactsCollector(BaseCollector):
 
         filtered = []
         for contact in contacts:
-            modified_at = contact.get("modifiedAt")
-            if not modified_at:
-                filtered.append(contact)  # include contacts with unknown mtime
+            mod_dt = _parse_modified_at(contact)
+            if mod_dt is None:
+                # Missing/unparseable mtime: already delivered on the first
+                # sync (since falsy) with an epoch timestamp. Including it here
+                # would re-deliver it on EVERY push and starve the front of
+                # every page (it sorts first and never advances the cursor).
+                # Tradeoff: a null-mtime contact that is edited later without
+                # gaining an mtime will not re-deliver — acceptable versus
+                # permanent re-delivery/starvation; a contact whose mtime
+                # appears later is picked up by the normal filter below.
                 continue
-            try:
-                mod_dt = datetime.fromisoformat(modified_at.replace("Z", "+00:00"))
-                if mod_dt.tzinfo is None:
-                    mod_dt = mod_dt.replace(tzinfo=timezone.utc)
-                if mod_dt > since_dt:
-                    filtered.append(contact)
-            except ValueError:
-                filtered.append(contact)  # include on parse failure
+            if mod_dt > since_dt:
+                filtered.append(contact)
 
         return filtered

@@ -93,21 +93,21 @@ class TestWalkFiltering:
         (tmp_path / "a.md").write_text("# A")
         (tmp_path / "b.py").write_text("print(1)")
         c = _collector(tmp_path)
-        items, _ = c.fetch_page(after=None, limit=50)
+        items, _, page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md", f"{_label(tmp_path)}/b.py"]
 
     def test_known_binary_extension_excluded(self, tmp_path):
         (tmp_path / "img.jpg").write_bytes(b"binary")
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        items, _ = c.fetch_page(after=None, limit=50)
+        items, _, page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
     def test_hidden_file_excluded(self, tmp_path):
         (tmp_path / ".secret").write_text("hidden")
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        items, _ = c.fetch_page(after=None, limit=50)
+        items, _, page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
     def test_hidden_directory_pruned(self, tmp_path):
@@ -116,7 +116,7 @@ class TestWalkFiltering:
         (gitdir / "config").write_text("text")
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        items, _ = c.fetch_page(after=None, limit=50)
+        items, _, page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
     def test_node_modules_pruned(self, tmp_path):
@@ -125,27 +125,27 @@ class TestWalkFiltering:
         (nm / "readme.md").write_text("# pkg")
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        items, _ = c.fetch_page(after=None, limit=50)
+        items, _, page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
     def test_include_hidden_toggle(self, tmp_path):
         (tmp_path / ".envrc").write_text("export X=1")
         c = _collector(tmp_path, include_hidden=True)
-        items, _ = c.fetch_page(after=None, limit=50)
+        items, _, page_max = c.fetch_page(after=None, limit=50)
         assert f"{_label(tmp_path)}/.envrc" in _ids(items)
 
     def test_exclude_globs(self, tmp_path):
         (tmp_path / "keep.md").write_text("# keep")
         (tmp_path / "skip.md").write_text("# skip")
         c = _collector(tmp_path, exclude_globs=["skip.*"])
-        items, _ = c.fetch_page(after=None, limit=50)
+        items, _, page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/keep.md"]
 
     def test_extension_allowlist(self, tmp_path):
         (tmp_path / "a.md").write_text("# A")
         (tmp_path / "b.py").write_text("print(1)")
         c = _collector(tmp_path, extensions=[".md"])
-        items, _ = c.fetch_page(after=None, limit=50)
+        items, _, page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
     def test_nested_relative_source_id(self, tmp_path):
@@ -153,7 +153,7 @@ class TestWalkFiltering:
         sub.mkdir(parents=True)
         (sub / "note.md").write_text("# nested")
         c = _collector(tmp_path)
-        items, _ = c.fetch_page(after=None, limit=50)
+        items, _, page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/sub/deep/note.md"]
 
 
@@ -166,7 +166,7 @@ class TestMultiRoot:
         (r1 / "README.md").write_text("# one")
         (r2 / "README.md").write_text("# two")
         c = _collector(tmp_path, roots=[r1, r2])
-        items, _ = c.fetch_page(after=None, limit=50)
+        items, _, page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == ["repo1/README.md", "repo2/README.md"]
 
     def test_colliding_basenames_deduped(self, tmp_path):
@@ -190,7 +190,7 @@ class TestPaging:
         for i in range(5):
             (tmp_path / f"f{i}.md").write_text(f"# {i}")
         c = _collector(tmp_path, page_size=3)
-        items, has_more = c.fetch_page(after=None, limit=3)
+        items, has_more, page_max = c.fetch_page(after=None, limit=3)
         assert len(items) == 3
         assert has_more is True
 
@@ -198,9 +198,9 @@ class TestPaging:
         for i in range(5):
             (tmp_path / f"f{i}.md").write_text(f"# {i}")
         c = _collector(tmp_path)
-        first, _ = c.fetch_page(after=None, limit=3)
-        c.commit_page(c._page_max_seq)
-        second, has_more = c.fetch_page(after=c.get_cursor(), limit=3)
+        first, _, page_max = c.fetch_page(after=None, limit=3)
+        c.commit_page(page_max)
+        second, has_more, page_max = c.fetch_page(after=c.get_cursor(), limit=3)
         assert set(_ids(first)) & set(_ids(second)) == set()
         assert len(first) + len(second) == 5
         assert has_more is False
@@ -208,10 +208,10 @@ class TestPaging:
     def test_no_redelivery_after_full_drain(self, tmp_path):
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        items, _ = c.fetch_page(after=None, limit=50)
-        c.commit_page(c._page_max_seq)
+        items, _, page_max = c.fetch_page(after=None, limit=50)
+        c.commit_page(page_max)
         assert len(items) == 1
-        again, has_more = c.fetch_page(after=c.get_cursor(), limit=50)
+        again, has_more, page_max = c.fetch_page(after=c.get_cursor(), limit=50)
         assert again == []
         assert has_more is False
 
@@ -219,23 +219,23 @@ class TestPaging:
         (tmp_path / "empty.md").write_text("   \n  ")
         (tmp_path / "real.md").write_text("real")
         c = _collector(tmp_path)
-        items, _ = c.fetch_page(after=None, limit=50)
+        items, _, page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/real.md"]
 
     def test_oversized_file_skipped_but_cursor_advances(self, tmp_path):
         (tmp_path / "big.txt").write_bytes(b"x" * 4000)
         (tmp_path / "small.md").write_text("ok")
         c = _collector(tmp_path, max_file_size_mb=0.001)  # ~1KB cap
-        items, has_more = c.fetch_page(after=None, limit=50)
+        items, has_more, page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/small.md"]
-        c.commit_page(c._page_max_seq)
+        c.commit_page(page_max)
         assert c.has_changes_since(None) is False  # big file's seq was passed
 
     def test_content_budget_stops_page(self, tmp_path):
         for i in range(5):
             (tmp_path / f"f{i}.md").write_text("x" * 100)
         c = _collector(tmp_path, max_response_mb=0.0002)  # ~209 bytes
-        items, has_more = c.fetch_page(after=None, limit=50)
+        items, has_more, page_max = c.fetch_page(after=None, limit=50)
         assert len(items) < 5
         assert has_more is True
 
@@ -249,9 +249,9 @@ class TestPaging:
         delivered = []
         cursor = None
         for _ in range(10):
-            items, has_more = c.fetch_page(after=cursor, limit=2)
+            items, has_more, page_max = c.fetch_page(after=cursor, limit=2)
             delivered.extend(_ids(items))
-            c.commit_page(c._page_max_seq)
+            c.commit_page(page_max)
             cursor = c.get_cursor()
             if not has_more:
                 break
@@ -262,8 +262,45 @@ class TestPaging:
     def test_cursor_beyond_max_restarts(self, tmp_path):
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        items, _ = c.fetch_page(after=10_000, limit=50)  # cursor past end → restart
+        items, _, page_max = c.fetch_page(after=10_000, limit=50)  # cursor past end → restart
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
+
+    def test_overlapping_fetches_commit_their_own_page_max(self, tmp_path):
+        """Overlapping requests must not clobber each other's page max.
+
+        Previously the served page's max seq was stored on the shared instance
+        attribute _page_max_seq: request B (larger page) overwrote request A's
+        value, so committing "A's" page jumped the cursor past files only B had
+        examined — files that were then never delivered.
+        """
+        all_ids = set()
+        for i in range(5):
+            (tmp_path / f"f{i}.md").write_text(f"# {i}")
+            all_ids.add(f"{_label(tmp_path)}/f{i}.md")
+        c = _collector(tmp_path)
+        items_a, _, page_max_a = c.fetch_page(after=None, limit=2)
+        # Request B overlaps: examines the whole backlog before A commits.
+        items_b, _, page_max_b = c.fetch_page(after=None, limit=50)
+        assert page_max_b > page_max_a
+        c.commit_page(page_max_a)  # A commits only what A served
+        assert c.get_cursor() == page_max_a
+        # Everything beyond A's page is still deliverable — nothing skipped.
+        rest, _, _ = c.fetch_page(after=c.get_cursor(), limit=50)
+        assert set(_ids(items_a)) | set(_ids(rest)) == all_ids
+
+    def test_consume_stash_commits_only_stash_page_max(self, tmp_path):
+        """A concurrent /fetch must not change what consume_stash commits."""
+        for i in range(5):
+            (tmp_path / f"f{i}.md").write_text(f"# {i}")
+        c = _collector(tmp_path)
+        c.fill_stash(limit=2)
+        # Concurrent /fetch request drains the whole backlog (uncommitted).
+        _, _, page_max_all = c.fetch_page(after=None, limit=50)
+        items = c.consume_stash()
+        assert len(items) == 2
+        # Cursor reflects the stash's own page, not the concurrent request's.
+        assert c.get_cursor() is not None
+        assert c.get_cursor() < page_max_all
 
 
 # ---------------------------------------------------------------------------
@@ -274,37 +311,37 @@ class TestRescan:
     def test_modified_file_redelivered(self, tmp_path):
         (tmp_path / "a.md").write_text("v1")
         c = _collector(tmp_path)
-        c.fetch_page(after=None, limit=50)
-        c.commit_page(c._page_max_seq)
+        _, _, page_max = c.fetch_page(after=None, limit=50)
+        c.commit_page(page_max)
         time.sleep(0.01)
         (tmp_path / "a.md").write_text("v2 changed")
         c.scan_now()
-        items, _ = c.fetch_page(after=c.get_cursor(), limit=50)
+        items, _, page_max = c.fetch_page(after=c.get_cursor(), limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
         assert items[0]["markdown"] == "v2 changed"
 
     def test_unchanged_file_not_redelivered(self, tmp_path):
         (tmp_path / "a.md").write_text("v1")
         c = _collector(tmp_path)
-        c.fetch_page(after=None, limit=50)
-        c.commit_page(c._page_max_seq)
+        _, _, page_max = c.fetch_page(after=None, limit=50)
+        c.commit_page(page_max)
         c.scan_now()  # no change
-        items, _ = c.fetch_page(after=c.get_cursor(), limit=50)
+        items, _, page_max = c.fetch_page(after=c.get_cursor(), limit=50)
         assert items == []
 
     def test_deleted_file_emits_tombstone(self, tmp_path):
         (tmp_path / "a.md").write_text("v1")
         (tmp_path / "b.md").write_text("v2")
         c = _collector(tmp_path)
-        c.fetch_page(after=None, limit=50)
-        c.commit_page(c._page_max_seq)
+        _, _, page_max = c.fetch_page(after=None, limit=50)
+        c.commit_page(page_max)
         (tmp_path / "a.md").unlink()
         c.scan_now()
-        items, _ = c.fetch_page(after=c.get_cursor(), limit=50)
+        items, _, page_max = c.fetch_page(after=c.get_cursor(), limit=50)
         tombstones = [i for i in items if i.get("__deleted__")]
         assert len(tombstones) == 1
         assert tombstones[0]["source_id"] == f"{_label(tmp_path)}/a.md"
-        c.commit_page(c._page_max_seq)
+        c.commit_page(page_max)
         # Tombstone pruned after delivery.
         assert c._index.stats()["deleted"] == 0
 
@@ -321,8 +358,8 @@ class TestCommitAck:
         c = _collector(tmp_path)
         token = push_ack_mode.set(True)
         try:
-            c.fetch_page(after=None, limit=50)
-            c.commit_page(c._page_max_seq)
+            _, _, page_max = c.fetch_page(after=None, limit=50)
+            c.commit_page(page_max)
             # Staged, not persisted.
             assert c.get_cursor() is None
             committed = c.commit_push_cursors()
@@ -334,8 +371,8 @@ class TestCommitAck:
     def test_non_ack_persists_immediately(self, tmp_path):
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        c.fetch_page(after=None, limit=50)
-        c.commit_page(c._page_max_seq)
+        _, _, page_max = c.fetch_page(after=None, limit=50)
+        c.commit_page(page_max)
         assert c.get_cursor() is not None
 
     def test_failed_ingest_reserves_page(self, tmp_path):
@@ -345,10 +382,10 @@ class TestCommitAck:
         c = _collector(tmp_path)
         token = push_ack_mode.set(True)
         try:
-            first, _ = c.fetch_page(after=None, limit=50)
-            c.commit_page(c._page_max_seq)
+            first, _, page_max = c.fetch_page(after=None, limit=50)
+            c.commit_page(page_max)
             # Consumer "crashes" without acking → cursor still None → re-served.
-            second, _ = c.fetch_page(after=c.get_cursor(), limit=50)
+            second, _, page_max = c.fetch_page(after=c.get_cursor(), limit=50)
             assert _ids(first) == _ids(second)
         finally:
             push_ack_mode.reset(token)
@@ -370,15 +407,15 @@ class TestInterface:
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
         assert c.has_changes_since(None) is True
-        c.fetch_page(after=None, limit=50)
-        c.commit_page(c._page_max_seq)
+        _, _, page_max = c.fetch_page(after=None, limit=50)
+        c.commit_page(page_max)
         assert c.has_changes_since(None) is False
 
     def test_reset_state_clears_index(self, tmp_path):
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        c.fetch_page(after=None, limit=50)
-        c.commit_page(c._page_max_seq)
+        _, _, page_max = c.fetch_page(after=None, limit=50)
+        c.commit_page(page_max)
         cleared = c.reset_state()
         assert "file_index" in cleared
         assert c.get_cursor() is None

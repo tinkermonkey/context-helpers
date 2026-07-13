@@ -601,7 +601,10 @@ class TestFetchHeartRate:
             c.fetch_heart_rate(since=f"{recent_since}Z")
         assert captured[0]["start_datetime"] == recent_since
 
-    def test_since_older_than_max_days_is_capped(self):
+    def test_stale_cursor_walks_forward_without_gap(self):
+        """Progressive catch-up: a cursor >30 days behind serves
+        [cursor, cursor+30d] — the START is never clamped forward (which
+        silently skipped the middle of the backlog), the END is capped."""
         c = make_collector()
         captured = []
 
@@ -609,13 +612,48 @@ class TestFetchHeartRate:
             captured.append(params)
             return {"data": [], "next_token": None}
 
-        # A since value 60 days ago should be capped to ~30 days ago
         old_since = (datetime.now(timezone.utc) - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S")
         with patch.object(c, "_get", side_effect=fake_get):
             c.fetch_heart_rate(since=f"{old_since}Z")
+        # Start is exactly the cursor — no data between cursor and now-30d skipped.
+        assert captured[0]["start_datetime"] == old_since
+        # End is cursor + 30d (well before now), so the window never exceeds
+        # the API's 30-day limit and the cursor can only advance into the window.
         start = datetime.fromisoformat(captured[0]["start_datetime"])
-        age = datetime.now(timezone.utc).replace(tzinfo=None) - start
-        assert age.days <= 30
+        end = datetime.fromisoformat(captured[0]["end_datetime"])
+        assert timedelta(days=29) <= end - start <= timedelta(days=30)
+
+    def test_recent_cursor_window_ends_at_now(self):
+        """A cursor within the last 30 days serves [cursor, now]."""
+        c = make_collector()
+        captured = []
+
+        def fake_get(path, params=None):
+            captured.append(params)
+            return {"data": [], "next_token": None}
+
+        recent_since = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+        with patch.object(c, "_get", side_effect=fake_get):
+            c.fetch_heart_rate(since=f"{recent_since}Z")
+        assert captured[0]["start_datetime"] == recent_since
+        end = datetime.fromisoformat(captured[0]["end_datetime"]).replace(tzinfo=timezone.utc)
+        assert datetime.now(timezone.utc) - end < timedelta(minutes=1)
+
+    def test_no_cursor_defaults_to_last_max_days(self):
+        """Without a cursor the default lookback (last 30 days) is unchanged."""
+        c = make_collector()
+        captured = []
+
+        def fake_get(path, params=None):
+            captured.append(params)
+            return {"data": [], "next_token": None}
+
+        with patch.object(c, "_get", side_effect=fake_get):
+            c.fetch_heart_rate(since=None)
+        start = datetime.fromisoformat(captured[0]["start_datetime"]).replace(tzinfo=timezone.utc)
+        end = datetime.fromisoformat(captured[0]["end_datetime"]).replace(tzinfo=timezone.utc)
+        assert timedelta(days=29) <= end - start <= timedelta(days=30)
+        assert datetime.now(timezone.utc) - end < timedelta(minutes=1)
 
 
 class TestFetchSpo2:

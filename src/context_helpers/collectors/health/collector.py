@@ -9,7 +9,7 @@ import os
 import sqlite3
 import threading
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -40,6 +40,38 @@ _SLEEP_ASLEEP_UNSPECIFIED = {"HKCategoryValueSleepAnalysisAsleepUnspecified", "H
 _SLEEP_IN_BED = "HKCategoryValueSleepAnalysisInBed"
 _SLEEP_AWAKE = "HKCategoryValueSleepAnalysisAwake"
 _SLEEP_ANY = {_SLEEP_DEEP, _SLEEP_REM, _SLEEP_CORE} | _SLEEP_ASLEEP_UNSPECIFIED
+
+def _parse_hk_ts(value: str | None) -> datetime | None:
+    """Parse a healthkit-to-sqlite timestamp to an aware datetime, or None.
+
+    The export DB stores local-offset strings like "2018-11-09 06:35:11 -0400";
+    cursors come back as ISO 8601. fromisoformat handles both (3.11+). Naive
+    values are assumed UTC.
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _since_window_date(since: str | None) -> str | None:
+    """Date prefix one day before *since*, for widened SQL windows.
+
+    The export stores LOCAL-offset timestamps while cursors are ISO (often a
+    different offset), so comparing them as strings in SQL is wrong at day
+    boundaries — the old exact filters silently dropped the rest of any day the
+    page boundary split. SQL now pre-filters on a date prefix one day wide of
+    the cursor (cheap, index-friendly) and the exact ``> since`` comparison is
+    applied in Python on parsed timestamps.
+    """
+    dt = _parse_hk_ts(since)
+    if dt is None:
+        return None
+    return (dt - timedelta(days=1)).date().isoformat()
+
 
 # Persistent SQLite cache location
 _CACHE_DIR = Path.home() / ".local" / "share" / "context-helpers"
@@ -268,7 +300,7 @@ class HealthCollector(BaseCollector):
         """Return workouts from the latest Health export.
 
         Args:
-            since: Optional ISO 8601 timestamp — only workouts with startDate > since.
+            since: Optional ISO 8601 timestamp — only workouts strictly after this instant.
             activity_type: Optional filter by activity type string.
 
         Returns:
@@ -279,17 +311,26 @@ class HealthCollector(BaseCollector):
         """
         db_path = self._get_export_db()
 
+        # Widened SQL window + exact Python filter: the DB stores local-offset
+        # strings, the cursor is ISO — a direct string comparison drops
+        # same-day rows after the cursor (see _since_window_date).
+        since_dt = _parse_hk_ts(since)
         since_clause = ""
         params: list = []
-        if since:
-            since_clause = "AND startDate > ?"
-            params.append(since)
+        if since_dt is not None:
+            since_clause = "AND substr(startDate, 1, 10) >= ?"
+            params.append(_since_window_date(since))
 
         sql = _WORKOUTS_SQL.format(since_clause=since_clause)
 
         with sqlite3.connect(str(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(sql, params).fetchall()
+            if since_dt is not None:
+                rows = [
+                    r for r in rows
+                    if (d := _parse_hk_ts(dict(r)["startDate"])) is not None and d > since_dt
+                ]
 
             # Build per-workout lookups for energy, distance, and heart rate.
             # Limit stats computation to the delivery batch (oldest push_page_size
@@ -299,7 +340,8 @@ class HealthCollector(BaseCollector):
             distance_m: dict[str, float] = {}
             avg_hr: dict[str, float] = {}
 
-            sorted_rows = sorted(rows, key=lambda r: dict(r)["startDate"])
+            _epoch = datetime.min.replace(tzinfo=timezone.utc)
+            sorted_rows = sorted(rows, key=lambda r: _parse_hk_ts(dict(r)["startDate"]) or _epoch)
             stats_batch = sorted_rows[: self.get_push_limit()]
             fetched_ids = [dict(r)["id"] for r in stats_batch]
 
@@ -450,7 +492,8 @@ class HealthCollector(BaseCollector):
         rStepCount (daily step totals), and rDistanceWalkingRunning (daily distance).
 
         Args:
-            since: Optional ISO 8601 timestamp — only days with date > since[:10].
+            since: Optional ISO 8601 timestamp — days >= the cursor day (the cursor
+                day is re-served so late-arriving same-day data flows through).
 
         Returns:
             List of activity dicts sorted descending by date, each with:
@@ -476,7 +519,7 @@ class HealthCollector(BaseCollector):
                 )
                 params: list = []
                 if since_date:
-                    sql += " WHERE dateComponents > ?"
+                    sql += " WHERE dateComponents >= ?"
                     params.append(since_date)
                 sql += " ORDER BY dateComponents DESC"
                 for row in conn.execute(sql, params).fetchall():
@@ -505,7 +548,7 @@ class HealthCollector(BaseCollector):
                 )
                 params = []
                 if since_date:
-                    sql += " WHERE substr(startDate, 1, 10) > ?"
+                    sql += " WHERE substr(startDate, 1, 10) >= ?"
                     params.append(since_date)
                 sql += " GROUP BY date ORDER BY date DESC"
                 for row in conn.execute(sql, params).fetchall():
@@ -530,7 +573,7 @@ class HealthCollector(BaseCollector):
                 )
                 params = []
                 if since_date:
-                    sql += " WHERE substr(startDate, 1, 10) > ?"
+                    sql += " WHERE substr(startDate, 1, 10) >= ?"
                     params.append(since_date)
                 dist_by_date: dict[str, float] = defaultdict(float)
                 for row in conn.execute(sql, params).fetchall():
@@ -549,7 +592,8 @@ class HealthCollector(BaseCollector):
         of the bedtime (startDate) into total/deep/REM/light minutes per night.
 
         Args:
-            since: Optional ISO 8601 timestamp — only nights with date > since[:10].
+            since: Optional ISO 8601 timestamp — nights >= the cursor day (re-served
+                so late-arriving same-day data flows through).
 
         Returns:
             List of sleep summary dicts sorted descending by date, each with:
@@ -572,7 +616,7 @@ class HealthCollector(BaseCollector):
             )
             params: list = []
             if since_date:
-                sql += " WHERE substr(startDate, 1, 10) > ?"
+                sql += " WHERE substr(startDate, 1, 10) >= ?"
                 params.append(since_date)
             sql += " ORDER BY startDate"
             rows = conn.execute(sql, params).fetchall()
@@ -620,14 +664,18 @@ class HealthCollector(BaseCollector):
         adapter groups these into hourly windows server-side.
 
         Args:
-            since: Optional ISO 8601 timestamp — only samples with date >= since[:10].
+            since: Optional ISO 8601 timestamp — only samples strictly after this instant.
 
         Returns:
             List of heart rate sample dicts sorted ascending by timestamp, each with:
               timestamp, bpm, source.
         """
         db_path = self._get_export_db()
-        since_date = since[:10] if since else None
+        # Widened SQL window + exact Python filter (see _since_window_date):
+        # the old date-granularity strict ">" skipped the rest of any day the
+        # page boundary split — with >200 samples/day that lost most heart data.
+        since_dt = _parse_hk_ts(since)
+        window = _since_window_date(since)
 
         with sqlite3.connect(str(db_path)) as conn:
             conn.row_factory = sqlite3.Row
@@ -642,9 +690,9 @@ class HealthCollector(BaseCollector):
                 " FROM rHeartRate"
             )
             params: list = []
-            if since_date:
-                sql += " WHERE substr(startDate, 1, 10) > ?"
-                params.append(since_date)
+            if window:
+                sql += " WHERE substr(startDate, 1, 10) >= ?"
+                params.append(window)
             sql += " ORDER BY startDate ASC"
             rows = conn.execute(sql, params).fetchall()
 
@@ -656,6 +704,10 @@ class HealthCollector(BaseCollector):
             }
             for row in rows
             if row["bpm"] is not None
+            and (
+                since_dt is None
+                or ((d := _parse_hk_ts(row["timestamp"])) is not None and d > since_dt)
+            )
         ]
 
     def fetch_spo2(self, since: str | None) -> list[dict]:
@@ -665,7 +717,8 @@ class HealthCollector(BaseCollector):
         Apple Health stores SpO2 with unit "%" and values like 97.0 (percentage).
 
         Args:
-            since: Optional ISO 8601 timestamp — only days with date > since[:10].
+            since: Optional ISO 8601 timestamp — days >= the cursor day (the cursor
+                day is re-served so late-arriving same-day data flows through).
 
         Returns:
             List of SpO2 summary dicts sorted descending by date, each with:
@@ -688,7 +741,7 @@ class HealthCollector(BaseCollector):
             )
             params: list = []
             if since_date:
-                sql += " WHERE substr(startDate, 1, 10) > ?"
+                sql += " WHERE substr(startDate, 1, 10) >= ?"
                 params.append(since_date)
             sql += " GROUP BY date ORDER BY date DESC"
             rows = conn.execute(sql, params).fetchall()
@@ -713,14 +766,16 @@ class HealthCollector(BaseCollector):
         """Return mindfulness/meditation sessions from the latest Health export.
 
         Args:
-            since: Optional ISO 8601 timestamp — only sessions with date >= since[:10].
+            since: Optional ISO 8601 timestamp — only sessions strictly after this instant.
 
         Returns:
             List of mindfulness session dicts sorted descending by startDate, each with:
               id, startDate, endDate, durationSeconds, sessionType.
         """
         db_path = self._get_export_db()
-        since_date = since[:10] if since else None
+        # Widened SQL window + exact Python filter (see _since_window_date).
+        since_dt = _parse_hk_ts(since)
+        window = _since_window_date(since)
 
         with sqlite3.connect(str(db_path)) as conn:
             conn.row_factory = sqlite3.Row
@@ -735,9 +790,9 @@ class HealthCollector(BaseCollector):
                 " FROM rMindfulSession"
             )
             params: list = []
-            if since_date:
-                sql += " WHERE substr(startDate, 1, 10) > ?"
-                params.append(since_date)
+            if window:
+                sql += " WHERE substr(startDate, 1, 10) >= ?"
+                params.append(window)
             sql += " ORDER BY startDate DESC"
             rows = conn.execute(sql, params).fetchall()
 
@@ -745,6 +800,15 @@ class HealthCollector(BaseCollector):
         for row in rows:
             start = row["startDate"] or ""
             end = row["endDate"] or ""
+            if not start:
+                # A session with no startDate can never advance the push cursor
+                # and would occupy the front of every page; skip it loudly.
+                logger.warning("health: skipping rMindfulSession row with no startDate")
+                continue
+            if since_dt is not None:
+                d = _parse_hk_ts(start)
+                if d is None or d <= since_dt:
+                    continue
             # Generate a stable ID from start+end
             session_id = hashlib.sha256(f"{start}:{end}".encode()).hexdigest()[:16]
             result.append({

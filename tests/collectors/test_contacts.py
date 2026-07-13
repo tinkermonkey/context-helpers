@@ -158,14 +158,60 @@ class TestFetchContacts:
         assert len(results) == 1
         assert results[0]["id"] == "abc-123"
 
-    def test_includes_contacts_with_null_modified_at(self, tmp_path, monkeypatch):
+    def test_excludes_contacts_with_null_modified_at_on_incremental(self, tmp_path, monkeypatch):
+        # Null-mtime contacts were delivered on the first (since-less) sync;
+        # re-including them here re-delivered them on every push and starved
+        # the front of every page.
         monkeypatch.setattr(
             "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
         )
         contacts = [{"id": "x", "displayName": "X", "modifiedAt": None, "emails": [], "phones": []}]
         with patch("subprocess.run", return_value=_osascript_ok(json.dumps(contacts))):
             results = _collector().fetch_contacts(since="2026-01-01T00:00:00Z")
-        assert len(results) == 1
+        assert results == []
+
+    def test_excludes_unparseable_modified_at_on_incremental(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
+        )
+        contacts = [{"id": "x", "displayName": "X", "modifiedAt": "not-a-date", "emails": [], "phones": []}]
+        with patch("subprocess.run", return_value=_osascript_ok(json.dumps(contacts))):
+            results = _collector().fetch_contacts(since="2026-01-01T00:00:00Z")
+        assert results == []
+
+    def test_null_modified_at_included_with_epoch_on_full_export(self, tmp_path, monkeypatch):
+        # First sync (since falsy): null-mtime contacts deliver once, stamped
+        # with the Unix epoch so they sort first in push paging and can never
+        # advance the push cursor past the backlog.
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
+        )
+        contacts = [
+            {"id": "x", "displayName": "X", "modifiedAt": None, "emails": [], "phones": []},
+            {"id": "y", "displayName": "Y", "modifiedAt": "bogus", "emails": [], "phones": []},
+        ]
+        with patch("subprocess.run", return_value=_osascript_ok(json.dumps(contacts))):
+            results = _collector().fetch_contacts(since=None)
+        assert len(results) == 2
+        assert all(r["modifiedAt"] == "1970-01-01T00:00:00+00:00" for r in results)
+
+    def test_full_export_epoch_mapping_does_not_mutate_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
+        )
+        collector = _collector()
+        contacts = [{"id": "x", "displayName": "X", "modifiedAt": None, "emails": [], "phones": []}]
+        with patch("subprocess.run", return_value=_osascript_ok(json.dumps(contacts))):
+            collector.fetch_contacts(since=None)
+        assert collector._cache[0]["modifiedAt"] is None
+
+    def test_real_modified_at_untouched_on_full_export(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
+        )
+        with patch("subprocess.run", return_value=_osascript_ok(json.dumps(SAMPLE_CONTACTS))):
+            results = _collector().fetch_contacts(since=None)
+        assert [r["modifiedAt"] for r in results] == [c["modifiedAt"] for c in SAMPLE_CONTACTS]
 
     def test_raises_on_osascript_failure(self, tmp_path, monkeypatch):
         monkeypatch.setattr(

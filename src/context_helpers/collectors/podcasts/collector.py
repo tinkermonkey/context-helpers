@@ -158,6 +158,9 @@ ORDER BY e.ZPLAYSTATELASTMODIFIEDDATE ASC
 LIMIT ?
 """
 
+# OFFSET supports internal batching in _fetch_apple_transcripts: episodes whose
+# transcript JSON file is missing yield no item, so scanning must be able to
+# continue past them within a single fetch (see _fetch_apple_transcripts).
 _QUERY_TRANSCRIPTS = """
 SELECT
     e.Z_PK                                AS pk,
@@ -182,7 +185,7 @@ WHERE (
 )
   AND (? IS NULL OR e.ZPLAYSTATELASTMODIFIEDDATE > ?)
 ORDER BY e.ZPLAYSTATELASTMODIFIEDDATE ASC
-LIMIT ?
+LIMIT ? OFFSET ?
 """
 
 # Completed episodes with a downloaded audio file but no Apple transcript.
@@ -421,12 +424,28 @@ def _listen_event_from_row(row: sqlite3.Row, min_played_fraction: float) -> dict
     )
 
     # listenedAt: prefer play_state_ts (updated on every play interaction),
-    # fall back to last_played_ts.
+    # fall back to last_played_ts.  Kept in the payload for consumers.
     listened_ts = row["play_state_ts"] or row["last_played_ts"]
     listened_at = (
         _apple_ts_to_iso(listened_ts)
         if listened_ts
         else datetime.now(tz=timezone.utc).isoformat()
+    )
+
+    # playStateModifiedAt mirrors the SQL filter column
+    # (ZPLAYSTATELASTMODIFIEDDATE) so the push cursor and the WHERE clause
+    # operate in the same time domain — paging on listenedAt (which can fall
+    # back to last_played_ts or now()) would advance the cursor past rows the
+    # query never filtered out, or vice versa.  Rows with a NULL play-state
+    # timestamp map to the Apple epoch: they are delivered once on the first
+    # (cursor-less) sync and never re-queried (`col > cursor` is false for
+    # NULL).  Mapping them to now() instead would drag the cursor to the
+    # present and skip any pending backlog.
+    play_state_ts = row["play_state_ts"]
+    play_state_modified_at = (
+        _apple_ts_to_iso(play_state_ts)
+        if play_state_ts
+        else "2001-01-01T00:00:00+00:00"
     )
 
     return {
@@ -436,6 +455,7 @@ def _listen_event_from_row(row: sqlite3.Row, min_played_fraction: float) -> dict
         "episodeGuid": row["episode_guid"] or "",
         "feedUrl": row["feed_url"] or None,
         "listenedAt": listened_at,
+        "playStateModifiedAt": play_state_modified_at,
         "durationSeconds": int(duration),
         "playedSeconds": played_seconds,
         "completed": completed,
@@ -655,9 +675,13 @@ class PodcastsCollector(BaseCollector):
                 (after_ts, after_ts, self._config.push_page_size + 1),
             ).fetchall()
 
+        # Return ALL fetched rows (push_page_size + 1): apply_push_paging
+        # slices to the limit and needs the extra row to signal has_more.
+        # Slicing here would make every full page look final and throttle
+        # catch-up to one page per poll interval.
         return [
             _listen_event_from_row(row, self._config.min_played_fraction)
-            for row in rows[: self._config.push_page_size]
+            for row in rows
         ]
 
     def fetch_transcripts(self, since: str | None) -> list[dict]:
@@ -689,21 +713,45 @@ class PodcastsCollector(BaseCollector):
         return merged
 
     def _fetch_apple_transcripts(self, since: str | None) -> list[dict]:
-        """Return Apple-provided transcript items filtered by since."""
-        after_ts = _since_to_apple_ts(since)
+        """Return Apple-provided transcript items filtered by since.
 
+        Internal batching: _transcript_from_row returns None for episodes
+        whose transcript JSON file is missing, so a single LIMIT-bounded query
+        could return an all-missing batch — an empty page whose cursor never
+        advances, stalling every deliverable transcript behind it
+        (head-of-line stall).  Instead, keep scanning further batches (same
+        ORDER BY, advancing an OFFSET) until the page holds push_page_size + 1
+        file-backed items (the +1 lets apply_push_paging signal has_more) or
+        the rows are exhausted.
+
+        Tradeoff (intended): the push cursor advances to the max play-state ts
+        of the SERVED items, so missing-file episodes scanned past that lie
+        before that ts are skipped permanently.  A transcript file that never
+        materialises must not stall delivery of everything behind it.  If the
+        entire remainder lacks files the result may be empty; has_more stays
+        False, so there is no delivery loop.
+        """
+        after_ts = _since_to_apple_ts(since)
+        limit = self._config.push_page_size
+        batch = limit + 1
+
+        results: list[dict] = []
+        offset = 0
         with self._open() as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                _QUERY_TRANSCRIPTS,
-                (after_ts, after_ts, self._config.push_page_size + 1),
-            ).fetchall()
-
-        results = []
-        for row in rows[: self._config.push_page_size]:
-            doc = _transcript_from_row(row, self._transcripts_dir)
-            if doc is not None:
-                results.append(doc)
+            while len(results) <= limit:
+                rows = conn.execute(
+                    _QUERY_TRANSCRIPTS, (after_ts, after_ts, batch, offset)
+                ).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    doc = _transcript_from_row(row, self._transcripts_dir)
+                    if doc is not None:
+                        results.append(doc)
+                if len(rows) < batch:
+                    break
+                offset += len(rows)
         return results
 
     def _fetch_whisper_transcripts(self, since: str | None) -> list[dict]:

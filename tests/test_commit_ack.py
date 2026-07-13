@@ -151,3 +151,171 @@ class TestAckEndToEnd:
         client = _client(_PushCollector(), tmp_path / "cursors")
         r = client.post("/collectors/push/ack", headers=_auth())
         assert r.status_code == 200 and r.json()["committed"] == []
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-keyed acks: commit only the requested cursor keys
+# ---------------------------------------------------------------------------
+
+class _MultiEndpointCollector(BaseCollector):
+    """Two-endpoint collector (like health/oura) for keyed-ack tests."""
+
+    @property
+    def name(self) -> str:
+        return "multi"
+
+    def push_cursor_keys(self) -> list[str]:
+        return ["multi_a", "multi_b"]
+
+    def get_router(self) -> APIRouter:
+        router = APIRouter()
+
+        @router.get("/multi/a")
+        def get_a(since: str | None = Query(default=None)) -> list[dict]:
+            return self.apply_push_paging([dict(i) for i in _ITEMS], "ts", "multi_a")
+
+        @router.get("/multi/b")
+        def get_b(since: str | None = Query(default=None)) -> list[dict]:
+            return self.apply_push_paging([dict(i) for i in _ITEMS], "ts", "multi_b")
+
+        return router
+
+    def health_check(self) -> dict:
+        return {"status": "ok", "message": "ok"}
+
+    def check_permissions(self) -> list[str]:
+        return []
+
+
+class TestKeyedAck:
+    def test_keyed_ack_commits_only_requested_keys(self, tmp_path):
+        cursors = tmp_path / "cursors"
+        c = _MultiEndpointCollector()
+        with patch("context_helpers.collectors.base._CURSORS_DIR", cursors):
+            c.apply_push_paging([dict(i) for i in _ITEMS], "ts", "multi_a", defer_commit=True)
+            c.apply_push_paging([dict(i) for i in _ITEMS], "ts", "multi_b", defer_commit=True)
+
+            committed = c.commit_push_cursors(keys=["multi_a"])
+            assert committed == ["multi_a"]
+            assert c.get_push_cursor("multi_a").isoformat() == _MAX_TS
+            # multi_b stays STAGED (re-served, not skipped) …
+            assert c.get_push_cursor("multi_b") is None
+            # … and a later unkeyed ack still commits it.
+            assert c.commit_push_cursors() == ["multi_b"]
+            assert c.get_push_cursor("multi_b").isoformat() == _MAX_TS
+
+    def test_keyed_ack_ignores_unknown_keys(self, tmp_path):
+        cursors = tmp_path / "cursors"
+        c = _MultiEndpointCollector()
+        with patch("context_helpers.collectors.base._CURSORS_DIR", cursors):
+            c.apply_push_paging([dict(i) for i in _ITEMS], "ts", "multi_a", defer_commit=True)
+            assert c.commit_push_cursors(keys=["nope"]) == []
+            assert c.get_push_cursor("multi_a") is None
+
+    def test_ack_endpoint_accepts_keys_body(self, tmp_path):
+        cursors = tmp_path / "cursors"
+        collector = _MultiEndpointCollector()
+        client = _client(collector, cursors)
+        with patch("context_helpers.collectors.base._CURSORS_DIR", cursors):
+            client.get("/multi/a?ack=true", headers=_auth())
+            client.get("/multi/b?ack=true", headers=_auth())
+
+            ack = client.post(
+                "/collectors/multi/ack", headers=_auth(), json={"keys": ["multi_b"]}
+            )
+            assert ack.status_code == 200
+            assert ack.json()["committed"] == ["multi_b"]
+            assert collector.get_push_cursor("multi_b") is not None
+            assert collector.get_push_cursor("multi_a") is None  # still staged
+
+    def test_ack_endpoint_without_body_commits_all(self, tmp_path):
+        cursors = tmp_path / "cursors"
+        collector = _MultiEndpointCollector()
+        client = _client(collector, cursors)
+        with patch("context_helpers.collectors.base._CURSORS_DIR", cursors):
+            client.get("/multi/a?ack=true", headers=_auth())
+            client.get("/multi/b?ack=true", headers=_auth())
+            ack = client.post("/collectors/multi/ack", headers=_auth())
+            assert sorted(ack.json()["committed"]) == ["multi_a", "multi_b"]
+
+
+# ---------------------------------------------------------------------------
+# PagedCollector: consume_stash honours commit-ack (reminders/calendar path)
+# ---------------------------------------------------------------------------
+
+from context_helpers.collectors.base import PagedCollector, push_ack_mode  # noqa: E402
+
+
+class _PagedStub(PagedCollector):
+    @property
+    def name(self) -> str:
+        return "paged"
+
+    cursor_field = "ts"
+
+    def fetch_page(self, after, limit):
+        return [dict(i) for i in _ITEMS], False
+
+    def get_router(self) -> APIRouter:
+        return APIRouter()
+
+    def health_check(self) -> dict:
+        return {"status": "ok", "message": "ok"}
+
+    def check_permissions(self) -> list[str]:
+        return []
+
+
+class TestPagedCollectorAck:
+    def test_consume_stash_without_ack_persists_immediately(self, tmp_path):
+        c = _PagedStub()
+        with patch("context_helpers.collectors.base._CURSORS_DIR", tmp_path / "cursors"):
+            c.fill_stash(limit=10)
+            items = c.consume_stash()
+            assert len(items) == 3
+            assert c.get_cursor().isoformat() == _MAX_TS
+
+    def test_consume_stash_with_ack_stages_until_commit(self, tmp_path):
+        c = _PagedStub()
+        with patch("context_helpers.collectors.base._CURSORS_DIR", tmp_path / "cursors"):
+            c.fill_stash(limit=10)
+            token = push_ack_mode.set(True)
+            try:
+                items = c.consume_stash()
+            finally:
+                push_ack_mode.reset(token)
+            assert len(items) == 3
+            # Served but not committed: page cursor must NOT have advanced —
+            # this was the reminders/calendar at-most-once loss.
+            assert c.get_cursor() is None
+
+            committed = c.commit_push_cursors()
+            assert "paged_page" in committed
+            assert c.get_cursor().isoformat() == _MAX_TS
+
+    def test_keyed_ack_can_defer_page_cursor(self, tmp_path):
+        c = _PagedStub()
+        with patch("context_helpers.collectors.base._CURSORS_DIR", tmp_path / "cursors"):
+            c.fill_stash(limit=10)
+            token = push_ack_mode.set(True)
+            try:
+                c.consume_stash()
+            finally:
+                push_ack_mode.reset(token)
+            # A keyed ack that doesn't name the page key leaves it staged.
+            assert c.commit_push_cursors(keys=["something_else"]) == []
+            assert c.get_cursor() is None
+            assert "paged_page" in c.commit_push_cursors(keys=["paged_page"])
+
+    def test_reset_clears_staged_page_cursor(self, tmp_path):
+        c = _PagedStub()
+        with patch("context_helpers.collectors.base._CURSORS_DIR", tmp_path / "cursors"):
+            c.fill_stash(limit=10)
+            token = push_ack_mode.set(True)
+            try:
+                c.consume_stash()
+            finally:
+                push_ack_mode.reset(token)
+            c.reset_state()
+            assert c.commit_push_cursors() == []
+            assert c.get_cursor() is None

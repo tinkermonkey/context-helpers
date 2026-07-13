@@ -327,21 +327,33 @@ class OuraCollector(BaseCollector):
     # ------------------------------------------------------------------
 
     def _datetime_range(self, since: str | None, max_days: int | None = None) -> tuple[str, str]:
-        """Convert ISO since timestamp to (start_datetime, end_datetime) ISO 8601 strings."""
+        """Convert ISO since timestamp to (start_datetime, end_datetime) ISO 8601 strings.
+
+        With *max_days* and a cursor (*since*), the window is the progressive
+        catch-up range [since, min(since + max_days, now)]: successive polls
+        walk the cursor forward max_days at a time with no gap. Clamping the
+        START to now - max_days instead (the old behaviour) silently skipped
+        everything between a stale cursor and now - max_days, and then jumped
+        the cursor into the present.
+
+        Without a cursor the default lookback (last max_days) is kept as-is.
+        """
         now = datetime.now(timezone.utc)
-        end = now.strftime("%Y-%m-%dT%H:%M:%S")
         if since:
             dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            end_dt = now
             if max_days is not None:
-                floor = now - timedelta(days=max_days)
-                dt = max(dt, floor)
+                end_dt = min(dt + timedelta(days=max_days), now)
             start = dt.strftime("%Y-%m-%dT%H:%M:%S")
         else:
             lookback = getattr(self._config, "initial_lookback_days", _DEFAULT_LOOKBACK_DAYS)
             if max_days is not None:
                 lookback = min(lookback, max_days)
             start = (now - timedelta(days=lookback)).strftime("%Y-%m-%dT%H:%M:%S")
-        return start, end
+            end_dt = now
+        return start, end_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
     def _date_range(self, since: str | None) -> tuple[str, str]:
         """Convert ISO since timestamp to (start_date, end_date) YYYY-MM-DD strings."""

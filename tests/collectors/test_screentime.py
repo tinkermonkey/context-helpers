@@ -132,7 +132,7 @@ class TestFetchAppUsageInitialLoad:
     def test_returns_aggregated_rows(self, tmp_db):
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since=None)
+        items, _has_more = c.fetch_app_usage(since=None)
         # Expect 3 rows: Safari/day-1, Terminal/day-1, Safari/day-2
         assert len(items) == 3
 
@@ -156,20 +156,20 @@ class TestFetchAppUsageInitialLoad:
             )
         c = _collector()
         _patch_db(c, db_path)
-        items = c.fetch_app_usage(since=None)
+        items, _has_more = c.fetch_app_usage(since=None)
         assert items == []
 
     def test_excludes_noise_streams(self, tmp_db):
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since=None)
+        items, _has_more = c.fetch_app_usage(since=None)
         assert all(i["bundleId"] in ("com.apple.Safari", "com.apple.Terminal")
                    for i in items)
 
     def test_fields_present(self, tmp_db):
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since=None)
+        items, _has_more = c.fetch_app_usage(since=None)
         for item in items:
             assert "date" in item
             assert "bundleId" in item
@@ -179,7 +179,7 @@ class TestFetchAppUsageInitialLoad:
     def test_duration_aggregated_correctly(self, tmp_db):
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since=None)
+        items, _has_more = c.fetch_app_usage(since=None)
         # Safari on day-1: 3600s
         safari_day1 = next(
             i for i in items
@@ -190,14 +190,14 @@ class TestFetchAppUsageInitialLoad:
     def test_appname_derived(self, tmp_db):
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since=None)
+        items, _has_more = c.fetch_app_usage(since=None)
         safari = next(i for i in items if i["bundleId"] == "com.apple.Safari")
         assert safari["appName"] == "Safari"
 
     def test_ordered_by_date_asc(self, tmp_db):
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since=None)
+        items, _has_more = c.fetch_app_usage(since=None)
         dates = [i["date"] for i in items]
         assert dates == sorted(dates)
 
@@ -205,15 +205,19 @@ class TestFetchAppUsageInitialLoad:
         """A lookback shorter than the oldest session should exclude it."""
         c = _collector(lookback_days=1)
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since=None)
+        items, _has_more = c.fetch_app_usage(since=None)
         # Only day-1 rows should appear (day-2 is 2 days ago, outside 1-day window)
         assert all(i["date"] == _DAY_MINUS_1 for i in items)
 
     def test_push_page_size_respected(self, tmp_db):
+        """With page size 1, only the oldest complete day (1 row) is returned."""
         c = _collector(push_page_size=1)
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since=None)
+        items, has_more = c.fetch_app_usage(since=None)
+        # day-2 has exactly one row (Safari); day-1 (2 rows) is held back whole.
         assert len(items) == 1
+        assert items[0]["date"] == _DAY_MINUS_2
+        assert has_more is True
 
     def test_empty_when_db_missing(self, tmp_path):
         c = _collector()
@@ -229,7 +233,7 @@ class TestFetchAppUsageInitialLoad:
             conn.execute("CREATE TABLE DUMMY (x INTEGER)")
         c = _collector()
         _patch_db(c, db_path)
-        items = c.fetch_app_usage(since=None)
+        items, _has_more = c.fetch_app_usage(since=None)
         assert items == []
 
 
@@ -243,7 +247,7 @@ class TestFetchAppUsageIncremental:
         since = f"{_DAY_MINUS_2}T00:00:00+00:00"
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since=since)
+        items, _has_more = c.fetch_app_usage(since=since)
         assert all(i["date"] == _DAY_MINUS_1 for i in items)
 
     def test_since_day1_returns_empty(self, tmp_db):
@@ -251,20 +255,20 @@ class TestFetchAppUsageIncremental:
         since = f"{_DAY_MINUS_1}T00:00:00+00:00"
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since=since)
+        items, _has_more = c.fetch_app_usage(since=since)
         assert items == []
 
     def test_since_very_old_returns_all(self, tmp_db):
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since="2000-01-01T00:00:00+00:00")
+        items, _has_more = c.fetch_app_usage(since="2000-01-01T00:00:00+00:00")
         assert len(items) == 3
 
     def test_since_z_suffix_accepted(self, tmp_db):
         since = f"{_DAY_MINUS_2}T00:00:00Z"
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since=since)
+        items, _has_more = c.fetch_app_usage(since=since)
         assert all(i["date"] == _DAY_MINUS_1 for i in items)
 
     def test_cursor_boundary_no_redelivery(self, tmp_db):
@@ -273,8 +277,139 @@ class TestFetchAppUsageIncremental:
         since = f"{_DAY_MINUS_2}T00:00:00+00:00"
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_app_usage(since=since)
+        items, _has_more = c.fetch_app_usage(since=since)
         assert not any(i["date"] == _DAY_MINUS_2 for i in items)
+
+
+# ---------------------------------------------------------------------------
+# Complete-day paging invariants
+# ---------------------------------------------------------------------------
+
+def _make_usage_db(tmp_path, rows):
+    """Create a knowledgeC.db with the given (day_iso_ts, bundle_id) app sessions."""
+    db_path = tmp_path / "kc_paging.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript("""
+            CREATE TABLE ZOBJECT (
+                Z_PK INTEGER PRIMARY KEY, ZUUID VARCHAR, ZSTREAMNAME VARCHAR,
+                ZSTARTDATE REAL, ZENDDATE REAL, ZVALUESTRING VARCHAR,
+                ZVALUEINTEGER INTEGER
+            );
+        """)
+        for i, (ts_iso, bundle) in enumerate(rows, start=1):
+            start = _to_apple_ts(ts_iso)
+            conn.execute(
+                "INSERT INTO ZOBJECT VALUES (?,?,'/app/usage',?,?,?,NULL)",
+                (i, f"u{i}", start, start + 60 * i, bundle),
+            )
+    return db_path
+
+
+class TestCompleteDayPaging:
+    """Invariant: a page never splits a day; has_more is True iff whole days
+    were held back.  Splitting a day would advance the day-granularity cursor
+    past the split day's remaining apps, losing them permanently."""
+
+    @pytest.fixture
+    def multi_day_db(self, tmp_path):
+        # day-3: 1 app; day-2: 2 apps; day-1: 2 apps
+        return _make_usage_db(tmp_path, [
+            (_TS_MINUS_3, "com.apple.Safari"),
+            (_TS_MINUS_2, "com.apple.Safari"),
+            (_TS_MINUS_2, "com.apple.Terminal"),
+            (_TS_MINUS_1, "com.apple.Safari"),
+            (_TS_MINUS_1, "com.apple.Mail"),
+        ])
+
+    def test_first_page_stops_before_day_that_would_overflow(self, multi_day_db):
+        c = _collector(push_page_size=2)
+        _patch_db(c, multi_day_db)
+        items, has_more = c.fetch_app_usage(since=None)
+        # day-3 (1 row) fits; adding day-2 (2 rows) would exceed 2 → held back
+        assert [i["date"] for i in items] == [_DAY_MINUS_3]
+        assert has_more is True
+
+    def test_next_page_is_next_complete_day(self, multi_day_db):
+        c = _collector(push_page_size=2)
+        _patch_db(c, multi_day_db)
+        items, has_more = c.fetch_app_usage(since=f"{_DAY_MINUS_3}T00:00:00+00:00")
+        assert len(items) == 2
+        assert {i["date"] for i in items} == {_DAY_MINUS_2}
+        assert has_more is True
+
+    def test_final_page_has_more_false(self, multi_day_db):
+        c = _collector(push_page_size=2)
+        _patch_db(c, multi_day_db)
+        items, has_more = c.fetch_app_usage(since=f"{_DAY_MINUS_2}T00:00:00+00:00")
+        assert {i["date"] for i in items} == {_DAY_MINUS_1}
+        assert has_more is False
+
+    def test_single_day_larger_than_limit_served_whole(self, multi_day_db):
+        """A day with more rows than push_page_size is served in full
+        (oversized page) rather than split across pages."""
+        c = _collector(push_page_size=1)
+        _patch_db(c, multi_day_db)
+        items, has_more = c.fetch_app_usage(since=f"{_DAY_MINUS_2}T00:00:00+00:00")
+        assert len(items) == 2  # exceeds push_page_size on purpose
+        assert {i["date"] for i in items} == {_DAY_MINUS_1}
+        assert has_more is False
+
+    def test_page_app_usage_never_slices_oversized_day(self, multi_day_db, tmp_path, monkeypatch):
+        """page_app_usage must not let apply_push_paging's limit slice split a day."""
+        from context_helpers.collectors import base as base_mod
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+
+        c = _collector(push_page_size=1)
+        _patch_db(c, multi_day_db)
+        page = c.page_app_usage(since=f"{_DAY_MINUS_2}T00:00:00+00:00")
+        assert len(page) == 2
+        assert {i["date"] for i in page} == {_DAY_MINUS_1}
+        assert c.has_push_more(_CURSOR_APP_USAGE) is False
+        # The temporary limit override must not leak.
+        assert getattr(c, "_push_limit_override", None) is None
+
+    def test_endpoint_walk_delivers_every_row_exactly_once(self, multi_day_db, tmp_path, monkeypatch):
+        """Chained pages via the real cursor deliver all (day, app) rows once,
+        each page ending on a day boundary and has_more correct throughout."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+
+        c = _collector(push_page_size=2)
+        _patch_db(c, multi_day_db)
+        app = FastAPI()
+        app.include_router(c.get_router())
+        client = TestClient(app)
+
+        delivered: list[tuple] = []
+        # First call: full export path (no since); later calls: push path.
+        pages = 0
+        since_param = ""
+        while True:
+            url = "/screentime/app-usage" + (f"?since={since_param}" if since_param else "")
+            page = client.get(url).json()
+            pages += 1
+            if not page:
+                break
+            # Invariant: a page never contains a partial day — all rows of
+            # each date in the page must be present in the same page.
+            delivered.extend((i["date"], i["bundleId"]) for i in page)
+            if not c.has_push_more(_CURSOR_APP_USAGE):
+                break
+            since_param = "2000-01-01T00:00:00%2B00:00"  # any non-empty since; cursor wins
+            assert pages < 10, "paging did not terminate"
+
+        expected = {
+            (_DAY_MINUS_3, "com.apple.Safari"),
+            (_DAY_MINUS_2, "com.apple.Safari"),
+            (_DAY_MINUS_2, "com.apple.Terminal"),
+            (_DAY_MINUS_1, "com.apple.Safari"),
+            (_DAY_MINUS_1, "com.apple.Mail"),
+        }
+        assert set(delivered) == expected
+        assert len(delivered) == len(expected), "a row was delivered more than once"
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +454,16 @@ class TestFetchFocusEvents:
         _patch_db(c, tmp_db)
         items = c.fetch_focus_events(since="2099-01-01T00:00:00Z")
         assert items == []
+
+    def test_returns_limit_plus_one_for_has_more_signaling(self, tmp_db):
+        """fetch returns push_page_size + 1 rows so apply_push_paging can
+        signal has_more; slicing to the limit here would make every full page
+        look final and throttle catch-up to one page per poll interval."""
+        c = _collector(push_page_size=1)
+        _patch_db(c, tmp_db)
+        items = c.fetch_focus_events(since=None)
+        # 2 focus events in tmp_db; limit 1 → limit + 1 = 2 returned
+        assert len(items) == 2
 
     def test_returns_empty_on_operational_error(self, tmp_path):
         db_path = tmp_path / "empty.db"
