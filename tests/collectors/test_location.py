@@ -244,11 +244,52 @@ class TestFetchVisitsIncremental:
         items = c.fetch_visits(since="2000-01-01T00:00:00+00:00")
         assert len(items) == 3
 
-    def test_push_page_size_respected(self, tmp_db):
+    def test_returns_page_size_plus_one_for_has_more(self, tmp_db):
+        """fetch returns push_page_size + 1 rows so apply_push_paging can
+        signal has_more; slicing to the limit here would make every full page
+        look final and throttle catch-up to one page per poll interval."""
         c = _collector(push_page_size=1)
         _patch_db(c, tmp_db)
-        items = c.fetch_visits(since=None)
-        assert len(items) == 1
+        items = c.fetch_visits(since="2000-01-01T00:00:00+00:00")
+        assert len(items) == 2  # limit + 1 (3 visits exist)
+
+    def test_full_page_chains_via_has_more(self, tmp_db, tmp_path, monkeypatch):
+        """Regression: with push_page_size=1, chained pages via the push
+        cursor must deliver all visits — previously the fetch sliced off the
+        +1 row, apply_push_paging saw exactly `limit` items, has_more stayed
+        False, and delivery crawled one page per poll interval."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+
+        c = _collector(push_page_size=1)
+        _patch_db(c, tmp_db)
+        # Seed the push cursor so resolve_push_since takes the incremental
+        # path (the initial-load lookback window is relative to today and the
+        # fixture timestamps are fixed in time).
+        c._save_push_cursor(datetime(2000, 1, 1, tzinfo=timezone.utc), _PUSH_CURSOR_KEY)
+
+        app = FastAPI()
+        app.include_router(c.get_router())
+        client = TestClient(app)
+
+        delivered: list[str] = []
+        for _ in range(10):
+            page = client.get(
+                "/location/visits?since=2000-01-01T00:00:00%2B00:00"
+            ).json()
+            if not page:
+                break
+            assert len(page) == 1
+            delivered.extend(i["id"] for i in page)
+            if not c.has_push_more(_PUSH_CURSOR_KEY):
+                break
+        else:
+            pytest.fail("paging did not terminate")
+
+        assert delivered == ["uuid-a", "uuid-b", "uuid-c"]
 
     def test_since_z_suffix_accepted(self, tmp_db):
         c = _collector()

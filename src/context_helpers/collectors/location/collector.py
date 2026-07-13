@@ -302,7 +302,11 @@ class LocationCollector(BaseCollector):
                 logger.warning("LocationCollector: visits query failed: %s", e)
                 return []
 
-        return [_row_to_dict(r) for r in rows[: self._config.push_page_size]]
+        # Return ALL fetched rows (push_page_size + 1): apply_push_paging
+        # slices to the limit and needs the extra row to signal has_more.
+        # Slicing here would make every full page look final (len == limit)
+        # and throttle catch-up to one page per poll interval.
+        return [_row_to_dict(r) for r in rows]
 
     def fetch_current_location(self) -> dict | None:
         """Read the most-recent known location from the helper JSON file.

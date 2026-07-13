@@ -18,6 +18,11 @@ _tracer = tel.get_tracer("context_helpers.collectors.notes")
 
 logger = logging.getLogger(__name__)
 
+# Sentinel modified_at for notes with no updated timestamp: sorts before any
+# real timestamp in push paging, so such notes deliver once on the first sync
+# and never drag the push cursor around.
+_EPOCH_ISO = "1970-01-01T00:00:00+00:00"
+
 _HAS_APPLE_NOTES = False
 try:
     from apple_notes_to_sqlite.cli import extract_notes  # type: ignore
@@ -125,7 +130,19 @@ class NotesCollector(BaseCollector):
                     continue
 
                 updated_str = raw.get("updated") or ""
-                if since_dt and updated_str:
+                if not updated_str:
+                    # Note with no updated timestamp: deliver it once on the
+                    # first sync (since falsy) with an epoch modified_at so it
+                    # sorts first in push paging and never advances the push
+                    # cursor. On incremental fetches exclude it — including it
+                    # would re-deliver it on EVERY push and starve the front of
+                    # every page. Tradeoff: such a note edited later without
+                    # gaining a timestamp will not re-deliver — acceptable
+                    # versus permanent re-delivery/starvation.
+                    if since_dt:
+                        continue
+                    updated_str = _EPOCH_ISO
+                elif since_dt:
                     try:
                         updated_dt = datetime.fromisoformat(updated_str)
                         if updated_dt.tzinfo is None:
@@ -141,6 +158,9 @@ class NotesCollector(BaseCollector):
                     "body_markdown": raw.get("body") or "",
                     "folder": folder,
                     "created_at": raw.get("created") or "",
+                    # The notes router pages on "modified_at" (apply_push_paging
+                    # ts_field) — keep this the field that carries the epoch
+                    # sentinel for timestamp-less notes.
                     "modified_at": updated_str,
                 })
 

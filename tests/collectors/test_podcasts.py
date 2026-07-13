@@ -233,11 +233,14 @@ class TestFetchListenHistory:
         dates = [i["listenedAt"] for i in items]
         assert dates == sorted(dates)
 
-    def test_respects_push_page_size(self, tmp_db):
+    def test_returns_page_size_plus_one_for_has_more(self, tmp_db):
+        """fetch returns push_page_size + 1 rows so apply_push_paging can
+        signal has_more; slicing to the limit here would make every full page
+        look final and throttle catch-up to one page per poll interval."""
         c = _collector(push_page_size=2)
         _patch_db(c, tmp_db)
         items = c.fetch_listen_history(since=None)
-        assert len(items) <= 2
+        assert len(items) == 3  # limit + 1 (5 played episodes exist)
 
     def test_empty_when_nothing_after_cursor(self, tmp_db):
         c = _collector()
@@ -283,6 +286,111 @@ class TestListenEventContract:
         items = c.fetch_listen_history(since=None)
         item = next(i for i in items if i["id"] == "guid-1")
         assert item["durationSeconds"] == 3600
+
+
+# ---------------------------------------------------------------------------
+# playStateModifiedAt — cursor-domain field for listen-history paging
+# ---------------------------------------------------------------------------
+
+class TestPlayStateModifiedAt:
+    """The listen-history push cursor must operate in the same time domain as
+    the SQL filter column (ZPLAYSTATELASTMODIFIEDDATE).  listenedAt falls back
+    to last_played_ts or now(), so paging on it advances the cursor past rows
+    the query never filtered out."""
+
+    def _row(self, **overrides) -> dict:
+        base = {
+            "pk": 1,
+            "episode_id": "guid-x",
+            "episode_guid": "guid-x",
+            "episode_title": "Ep",
+            "play_count": 1,
+            "play_head": 0.0,
+            "duration": 100.0,
+            "last_played_ts": None,
+            "play_state_ts": None,
+            "has_been_played": 1,
+            "mark_as_played": 0,
+            "pub_date_ts": None,
+            "enclosure_url": None,
+            "show_title": "Show",
+            "feed_url": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_field_present_in_fetch_output(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        items = c.fetch_listen_history(since=None)
+        assert all("playStateModifiedAt" in i for i in items)
+
+    def test_mirrors_play_state_column(self, tmp_db):
+        c = _collector()
+        _patch_db(c, tmp_db)
+        items = c.fetch_listen_history(since=None)
+        item = next(i for i in items if i["id"] == "guid-1")
+        assert item["playStateModifiedAt"] == _TS_MOD1
+
+    def test_null_play_state_maps_to_apple_epoch(self):
+        row = self._row(play_state_ts=None, last_played_ts=_to_apple_ts(_TS_MOD2))
+        event = _listen_event_from_row(row, 0.9)
+        # NOT now(): epoch → delivered once on the first cursor-less sync,
+        # never re-delivered (SQL `col > cursor` is false for NULL).
+        assert event["playStateModifiedAt"] == "2001-01-01T00:00:00+00:00"
+        # listenedAt keeps its fallback for consumers.
+        assert event["listenedAt"] == _TS_MOD2
+
+    def test_null_play_state_row_delivered_once_on_first_sync(self, tmp_db):
+        """A NULL-play-state row appears on the cursor-less sync and is
+        excluded once any cursor exists."""
+        with sqlite3.connect(str(tmp_db)) as conn:
+            conn.execute(
+                "INSERT INTO ZMTEPISODE VALUES "
+                "(99,'guid-null','uuid-null','No PlayState',1,1,0,600,"
+                "NULL,NULL,1,0,NULL,NULL,NULL,NULL,NULL)"
+            )
+        c = _collector()
+        _patch_db(c, tmp_db)
+        first = {i["id"] for i in c.fetch_listen_history(since=None)}
+        assert "guid-null" in first
+        later = {i["id"] for i in c.fetch_listen_history(since="2001-01-02T00:00:00+00:00")}
+        assert "guid-null" not in later
+
+    def test_router_pages_listen_history_in_play_state_domain(self, tmp_db, tmp_path, monkeypatch):
+        """Chained pages via the real push cursor deliver every played episode
+        exactly once — the cursor advances on playStateModifiedAt, matching
+        the SQL filter column."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+
+        c = _collector(push_page_size=3)
+        _patch_db(c, tmp_db)
+        app = FastAPI()
+        app.include_router(c.get_router())
+        client = TestClient(app)
+
+        delivered: list[str] = []
+        since_param = ""
+        for _ in range(10):
+            url = "/podcasts/listen-history" + (
+                f"?since={since_param}" if since_param else ""
+            )
+            page = client.get(url).json()
+            if not page:
+                break
+            assert len(page) <= 3
+            delivered.extend(i["id"] for i in page)
+            if not c.has_push_more("podcasts_listen_history"):
+                break
+            since_param = "2000-01-01T00:00:00%2B00:00"  # non-empty; cursor wins
+        else:
+            pytest.fail("paging did not terminate")
+
+        assert sorted(delivered) == ["guid-1", "guid-2", "guid-3", "guid-5", "guid-6"]
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +507,56 @@ class TestFetchTranscripts:
         c._transcripts_dir = transcripts_dir
         items = c.fetch_transcripts(since=None)
         assert all(i["transcriptSource"] == "apple" for i in items)
+
+
+class TestTranscriptHeadOfLineStall:
+    """Missing transcript files must not stall delivery: the fetch keeps
+    scanning further batches (advancing an internal offset) until the page is
+    full or rows are exhausted.  Previously, if the first >= page_size
+    episodes lacked files, the page was empty and the cursor never advanced,
+    permanently blocking every deliverable transcript behind them."""
+
+    def test_missing_files_do_not_stall_later_transcripts(self, tmp_db, tmp_path):
+        # Only ep-6's transcript file exists; ep-7 (earliest play state) and
+        # ep-5 lack files.  With push_page_size=1 the old code would scan just
+        # 2 rows and could return an empty page forever.
+        tdir = tmp_path / "caches_partial"
+        tdir.mkdir()
+        (tdir / "transcript-def.json").write_text(json.dumps({
+            "transcriptions": [{"text": "Dark matter is fascinating."}]
+        }))
+
+        c = _collector(push_page_size=1)
+        _patch_db(c, tmp_db)
+        c._transcripts_dir = tdir
+
+        items = c.fetch_transcripts(since=None)
+        assert {i["id"] for i in items} == {"guid-6"}
+
+    def test_all_missing_returns_empty_without_looping(self, tmp_db, tmp_path):
+        """If the entire remainder lacks files, the page is empty and no
+        has_more is signaled — no infinite delivery loop."""
+        tdir = tmp_path / "caches_empty"
+        tdir.mkdir()
+        c = _collector(push_page_size=1)
+        _patch_db(c, tmp_db)
+        c._transcripts_dir = tdir
+        items = c.fetch_transcripts(since=None)
+        assert items == []
+        page = c.apply_push_paging(
+            items, "playStateTs", "podcasts_transcripts", defer_commit=True
+        )
+        assert page == []
+        assert c.has_push_more("podcasts_transcripts") is False
+
+    def test_returns_page_size_plus_one_for_has_more(self, tmp_db, transcripts_dir):
+        """With all files present, the fetch returns limit + 1 items so
+        apply_push_paging can signal has_more."""
+        c = _collector(push_page_size=2)
+        _patch_db(c, tmp_db)
+        c._transcripts_dir = transcripts_dir
+        items = c.fetch_transcripts(since=None)
+        assert len(items) == 3  # ep-5, ep-6, ep-7 all have files
 
 
 # ---------------------------------------------------------------------------

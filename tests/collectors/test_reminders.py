@@ -1,7 +1,7 @@
 """Tests for RemindersCollector — SQLite-backed, filtering, health check."""
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -411,3 +411,83 @@ class TestBaseInterface:
         paths = c.watch_paths()
         # Returns empty list on machines where the store dir doesn't exist, or the dir
         assert isinstance(paths, list)
+
+
+# ---------------------------------------------------------------------------
+# NULL ZLASTMODIFIEDDATE handling (_row_to_dict)
+# ---------------------------------------------------------------------------
+
+class TestNullModifiedDate:
+    """NULL ZLASTMODIFIEDDATE must map to the Apple epoch, never now().
+
+    Mapping to now() jumped the push cursor past the entire backlog on first
+    load (apply_push_paging / consume_stash advance the cursor to the page's
+    max timestamp). With the epoch the row sorts first, delivers once, and
+    max() of real timestamps always wins.
+    """
+
+    @pytest.fixture
+    def null_db(self, tmp_path) -> Path:
+        db_path = tmp_path / "Data-NULL.sqlite"
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript("""
+                CREATE TABLE ZREMCDBASELIST (Z_PK INTEGER PRIMARY KEY, ZNAME VARCHAR);
+                CREATE TABLE ZREMCDREMINDER (
+                    Z_PK INTEGER PRIMARY KEY, ZCKIDENTIFIER VARCHAR, ZTITLE VARCHAR,
+                    ZNOTES VARCHAR, ZCOMPLETED INTEGER DEFAULT 0, ZPRIORITY INTEGER DEFAULT 0,
+                    ZLASTMODIFIEDDATE TIMESTAMP, ZDUEDATE TIMESTAMP,
+                    ZCOMPLETIONDATE TIMESTAMP, ZLIST INTEGER, ZMARKEDFORDELETION INTEGER DEFAULT 0
+                );
+                INSERT INTO ZREMCDBASELIST VALUES (1, 'Inbox');
+                INSERT INTO ZREMCDREMINDER VALUES (
+                    1, 'rem-null', 'No modified date', NULL, 0, 0,
+                    NULL, NULL, NULL, 1, 0
+                );
+                INSERT INTO ZREMCDREMINDER VALUES (
+                    2, 'rem-real', 'Has modified date', NULL, 0, 0,
+                    {ts_real}, NULL, NULL, 1, 0
+                );
+            """.format(ts_real=_to_apple_ts("2026-03-07T10:00:00+00:00")))
+        return db_path
+
+    def test_null_modified_maps_to_apple_epoch(self, null_db):
+        c = _collector()
+        _patch_db(c, null_db)
+        result = c.fetch_reminders(since=None, list_filter=None)
+        item = next(r for r in result if r["id"] == "rem-null")
+        assert item["modifiedAt"] == "2001-01-01T00:00:00+00:00"
+
+    def test_null_modified_is_not_now(self, null_db):
+        c = _collector()
+        _patch_db(c, null_db)
+        result = c.fetch_reminders(since=None, list_filter=None)
+        item = next(r for r in result if r["id"] == "rem-null")
+        parsed = datetime.fromisoformat(item["modifiedAt"])
+        assert parsed < datetime.now(timezone.utc) - timedelta(days=365)
+
+    def test_null_modified_sorts_first_in_initial_page(self, null_db):
+        c = _collector()
+        _patch_db(c, null_db)
+        items, _ = c.fetch_page(after=None, limit=200)
+        # SQLite orders NULLs first ASC; the epoch item leads the page.
+        assert items[0]["id"] == "rem-null"
+
+    def test_page_max_timestamp_is_real_not_epoch_or_now(self, null_db):
+        """Cursor advancement (max of the page) must land on the real
+        timestamp — a NULL row can neither hold it back nor jump it to now."""
+        c = _collector()
+        _patch_db(c, null_db)
+        items, _ = c.fetch_page(after=None, limit=200)
+        max_ts = max(i["modifiedAt"] for i in items)
+        assert max_ts == "2026-03-07T10:00:00+00:00"
+
+    def test_null_modified_excluded_from_incremental_fetch(self, null_db):
+        """After the cursor advances, the NULL row does not re-deliver
+        (ZLASTMODIFIEDDATE > cursor is never true for NULL)."""
+        c = _collector()
+        _patch_db(c, null_db)
+        after = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        items, _ = c.fetch_page(after=after, limit=200)
+        ids = [r["id"] for r in items]
+        assert "rem-null" not in ids
+        assert "rem-real" in ids

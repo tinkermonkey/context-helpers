@@ -62,25 +62,36 @@ def _appname_from_bundle_id(bundle_id: str) -> str:
 # App usage queries group by UTC date (derived from ZSTARTDATE) and bundle ID.
 # DATE(ZSTARTDATE + epoch, 'unixepoch') converts Apple epoch → Unix → UTC date string.
 # DATE('now') excludes today's partial data so only complete days are delivered.
+#
+# The app-usage cursor field is a day string with MANY rows per day (one per
+# app), so pages must always end on a complete day boundary: a page that split
+# a day would advance the cursor to that day and the next fetch (`day > cursor`)
+# would permanently skip the rest of that day's apps.  fetch_app_usage therefore
+# lists candidate days first and then loads each day's rows in full.
 
-_QUERY_APP_USAGE_INCREMENTAL = f"""
-SELECT
-    DATE(ZSTARTDATE + {_APPLE_EPOCH_OFFSET}, 'unixepoch') AS day,
-    ZVALUESTRING                                           AS bundle_id,
-    CAST(SUM(
-        CASE WHEN ZENDDATE > ZSTARTDATE THEN ZENDDATE - ZSTARTDATE ELSE 0 END
-    ) AS INTEGER)                                          AS duration_seconds
+_QUERY_APP_USAGE_DAYS_INCREMENTAL = f"""
+SELECT DISTINCT DATE(ZSTARTDATE + {_APPLE_EPOCH_OFFSET}, 'unixepoch') AS day
 FROM ZOBJECT
 WHERE ZSTREAMNAME = '/app/usage'
   AND ZVALUESTRING IS NOT NULL
   AND DATE(ZSTARTDATE + {_APPLE_EPOCH_OFFSET}, 'unixepoch') > ?
   AND DATE(ZSTARTDATE + {_APPLE_EPOCH_OFFSET}, 'unixepoch') < DATE('now')
-GROUP BY day, bundle_id
-ORDER BY day ASC, duration_seconds DESC
+ORDER BY day ASC
 LIMIT ?
 """
 
-_QUERY_APP_USAGE_INITIAL = f"""
+_QUERY_APP_USAGE_DAYS_INITIAL = f"""
+SELECT DISTINCT DATE(ZSTARTDATE + {_APPLE_EPOCH_OFFSET}, 'unixepoch') AS day
+FROM ZOBJECT
+WHERE ZSTREAMNAME = '/app/usage'
+  AND ZVALUESTRING IS NOT NULL
+  AND DATE(ZSTARTDATE + {_APPLE_EPOCH_OFFSET}, 'unixepoch') >= ?
+  AND DATE(ZSTARTDATE + {_APPLE_EPOCH_OFFSET}, 'unixepoch') < DATE('now')
+ORDER BY day ASC
+LIMIT ?
+"""
+
+_QUERY_APP_USAGE_FOR_DAY = f"""
 SELECT
     DATE(ZSTARTDATE + {_APPLE_EPOCH_OFFSET}, 'unixepoch') AS day,
     ZVALUESTRING                                           AS bundle_id,
@@ -90,11 +101,9 @@ SELECT
 FROM ZOBJECT
 WHERE ZSTREAMNAME = '/app/usage'
   AND ZVALUESTRING IS NOT NULL
-  AND DATE(ZSTARTDATE + {_APPLE_EPOCH_OFFSET}, 'unixepoch') >= ?
-  AND DATE(ZSTARTDATE + {_APPLE_EPOCH_OFFSET}, 'unixepoch') < DATE('now')
+  AND DATE(ZSTARTDATE + {_APPLE_EPOCH_OFFSET}, 'unixepoch') = ?
 GROUP BY day, bundle_id
-ORDER BY day ASC, duration_seconds DESC
-LIMIT ?
+ORDER BY duration_seconds DESC
 """
 
 # Focus events: device lock/unlock state changes.
@@ -290,31 +299,88 @@ class ScreenTimeCollector(BaseCollector):
     # Data fetching
     # ------------------------------------------------------------------
 
-    def fetch_app_usage(self, since: str | None) -> list[dict]:
-        """Fetch per-app screen time aggregated by day.
+    def fetch_app_usage(self, since: str | None) -> tuple[list[dict], bool]:
+        """Fetch per-app screen time aggregated by day, in complete days only.
 
         since=None   → initial load (lookback_days window, complete days only)
         since=<ISO>  → incremental: days strictly after the date in since
+
+        Complete-day paging: the cursor field is a day string with many rows
+        per day (one per app), so a page must never split a day — the cursor
+        would land on the split day and `day > cursor` would skip its
+        remaining apps forever.  Days are accumulated whole, stopping at the
+        last complete day that fits within push_page_size items.  At least one
+        full day is always included, even if that single day alone exceeds
+        push_page_size (the page is then oversized rather than split).
+
+        Returns:
+            (items, has_more) — items always end on a day boundary; has_more
+            is True iff at least one further complete day was held back.
         """
-        limit = self._config.push_page_size + 1
+        limit = self._config.push_page_size
+        items: list[dict] = []
+        has_more = False
         with self._open() as conn:
             conn.row_factory = sqlite3.Row
             try:
                 if since:
-                    after_date = self._since_to_date_str(since)
-                    rows = conn.execute(
-                        _QUERY_APP_USAGE_INCREMENTAL, (after_date, limit)
+                    day_rows = conn.execute(
+                        _QUERY_APP_USAGE_DAYS_INCREMENTAL,
+                        (self._since_to_date_str(since), limit + 1),
                     ).fetchall()
                 else:
-                    cutoff_date = self._lookback_date_str()
-                    rows = conn.execute(
-                        _QUERY_APP_USAGE_INITIAL, (cutoff_date, limit)
+                    day_rows = conn.execute(
+                        _QUERY_APP_USAGE_DAYS_INITIAL,
+                        (self._lookback_date_str(), limit + 1),
                     ).fetchall()
+                days = [r["day"] for r in day_rows]
+                for day in days:
+                    rows = conn.execute(_QUERY_APP_USAGE_FOR_DAY, (day,)).fetchall()
+                    if items and len(items) + len(rows) > limit:
+                        # This whole day would overflow the page — hold it
+                        # (and everything after it) back for the next page.
+                        has_more = True
+                        break
+                    items.extend(_app_usage_from_row(r) for r in rows)
+                else:
+                    # All listed days consumed; more may exist beyond the
+                    # truncated day listing (defensive — each day has >= 1
+                    # row, so a full listing normally breaks out above).
+                    has_more = len(days) > limit
             except sqlite3.OperationalError as e:
                 logger.warning("ScreenTimeCollector: app_usage query failed: %s", e)
-                return []
+                return [], False
 
-        return [_app_usage_from_row(r) for r in rows[: self._config.push_page_size]]
+        return items, has_more
+
+    def page_app_usage(self, since: str | None) -> list[dict]:
+        """Serve one complete-day page of app usage and advance the cursor.
+
+        Mechanism: apply_push_paging() slices at get_push_limit(), which would
+        re-split a day whenever fetch_app_usage returns an oversized
+        single-day page.  To guarantee that (a) pages always end on a day
+        boundary, (b) has_more is signaled correctly, and (c) the limit slice
+        never splits a day, the effective push limit is temporarily raised to
+        the length of the day-bounded list (so apply_push_paging never
+        slices), and the has_more flag computed by fetch_app_usage — which
+        knows whether whole days were held back — overwrites the one derived
+        by apply_push_paging (always False under the raised limit).
+        """
+        items, has_more = self.fetch_app_usage(since)
+        had_override = hasattr(self, "_push_limit_override")
+        prev = getattr(self, "_push_limit_override", None)
+        self._push_limit_override = max(len(items), 1)
+        try:
+            page = self.apply_push_paging(items, "date", _CURSOR_APP_USAGE)
+        finally:
+            if had_override and prev is not None:
+                self._push_limit_override = prev
+            else:
+                del self._push_limit_override
+        if not hasattr(self, "_has_push_more_by_key"):
+            self._has_push_more_by_key = {}
+        self._has_push_more_by_key[_CURSOR_APP_USAGE] = has_more
+        return page
 
     def fetch_focus_events(self, since: str | None) -> list[dict]:
         """Fetch device lock/unlock events.
@@ -340,4 +406,8 @@ class ScreenTimeCollector(BaseCollector):
                 logger.warning("ScreenTimeCollector: focus query failed: %s", e)
                 return []
 
-        return [_focus_event_from_row(r) for r in rows[: self._config.push_page_size]]
+        # Return ALL fetched rows (push_page_size + 1): apply_push_paging
+        # slices to the limit and needs the extra row to signal has_more.
+        # Slicing here would make every full page look final and throttle
+        # catch-up to one page per poll interval.
+        return [_focus_event_from_row(r) for r in rows]

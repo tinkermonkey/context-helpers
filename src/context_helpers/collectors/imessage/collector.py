@@ -34,8 +34,8 @@ LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
 LEFT JOIN chat c ON c.ROWID = cmj.chat_id
 WHERE m.text IS NOT NULL
 {since_clause}
-ORDER BY m.date DESC
-LIMIT 5000
+ORDER BY m.date ASC
+LIMIT ?
 """
 
 _RECIPIENTS_SQL = """
@@ -92,12 +92,17 @@ class iMessageCollector(BaseCollector):
             return ["Full Disk Access (System Settings → Privacy & Security → Full Disk Access)"]
 
     def has_changes_since(self, watermark: datetime | None) -> bool:
-        if watermark is None:
+        # Compare against this collector's own delivery position, not the
+        # global watermark: the watermark advances whenever ANY collector
+        # delivers, so a backlog here would go silent behind it (the source
+        # can be quiet while undelivered messages remain).
+        cursor = self.get_push_cursor() or watermark
+        if cursor is None:
             return True
         if not self._db_path.exists():
             return False
         try:
-            unix_ts = watermark.timestamp()
+            unix_ts = cursor.timestamp()
             apple_ns = int((unix_ts - _APPLE_EPOCH_OFFSET) * 1_000_000_000)
             with sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True) as conn:
                 row = conn.execute(
@@ -108,11 +113,19 @@ class iMessageCollector(BaseCollector):
         except sqlite3.OperationalError:
             return True  # conservative: assume changed if we can't check
 
-    def fetch_messages(self, since: str | None) -> list[dict]:
-        """Read messages from chat.db.
+    def fetch_messages(self, since: str | None, limit: int | None = None) -> list[dict]:
+        """Read messages from chat.db, oldest first.
+
+        Rows are fetched in ascending date order bounded to one push page
+        (plus one row so apply_push_paging can signal has_more). Fetching the
+        OLDEST matching rows is what makes backlog paging correct: the cursor
+        advances through history page by page. The previous newest-first
+        LIMIT window made anything older than the window permanently
+        unreachable once the cursor moved past it.
 
         Args:
             since: Optional ISO 8601 timestamp; return only messages after this time
+            limit: Max rows to fetch; defaults to the push page size + 1
 
         Returns:
             List of message dicts matching the API contract
@@ -133,6 +146,7 @@ class iMessageCollector(BaseCollector):
             since_clause = "AND m.date > ?"
             params.append(apple_ns)
 
+        params.append(limit if limit is not None else self.get_push_limit() + 1)
         sql = _MESSAGES_SQL.format(since_clause=since_clause)
 
         try:
