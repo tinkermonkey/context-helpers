@@ -368,6 +368,27 @@ class TestCommitAck:
         finally:
             push_ack_mode.reset(token)
 
+    def test_keyed_ack_signature_regression(self, tmp_path):
+        """The base-class contract passes keys positionally — the override must
+        accept it (a mismatch here 500'd every /collectors/filesystem/ack in
+        production, so the drain cursor never committed)."""
+        from context_helpers.collectors.base import push_ack_mode
+
+        (tmp_path / "a.md").write_text("# A")
+        c = _collector(tmp_path)
+        token = push_ack_mode.set(True)
+        try:
+            _, _, page_max = c.fetch_page(after=None, limit=50)
+            c.commit_page(page_max)
+            # Keyed ack naming a different key leaves the seq staged
+            assert c.commit_push_cursors(["some_other_key"]) == []
+            assert c.get_cursor() is None
+            # Keyed ack naming the filesystem cursor commits it
+            assert c.commit_push_cursors(["filesystem_cursor"]) == ["filesystem_cursor"]
+            assert c.get_cursor() is not None
+        finally:
+            push_ack_mode.reset(token)
+
     def test_non_ack_persists_immediately(self, tmp_path):
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)

@@ -636,8 +636,16 @@ class FilesystemCollector(PagedCollector):
             self._save_cursor(seq)
         self._index.prune_deleted(seq)
 
-    def commit_push_cursors(self) -> list[str]:  # type: ignore[override]
-        """Commit the staged seq cursor (the ?ack=true confirmation)."""
+    def commit_push_cursors(self, keys: list[str] | None = None) -> list[str]:  # type: ignore[override]
+        """Commit the staged seq cursor (the ?ack=true confirmation).
+
+        Accepts the endpoint-keyed ack signature (base class contract): the seq
+        cursor commits when *keys* is None (commit-everything, what
+        RemoteAdapter.ack sends) or when it names "filesystem_cursor";
+        otherwise the seq stays staged and the pages re-serve.
+        """
+        if keys is not None and "filesystem_cursor" not in keys:
+            return []
         with self._seq_stage_lock:
             seq = self._staged_seq
             self._staged_seq = None
