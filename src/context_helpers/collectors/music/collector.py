@@ -74,6 +74,11 @@ class MusicCollector(BaseCollector):
     special permissions required beyond Automation access to Music.app.
     """
 
+    # Delivery is driven by the context-library poller (background_poll=True
+    # there); the push trigger must not deliver or chain for this collector.
+    pull_owned = True
+
+
     def __init__(self, config: MusicConfig) -> None:
         self._config = config
 

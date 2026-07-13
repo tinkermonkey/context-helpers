@@ -39,6 +39,18 @@ class BaseCollector(ABC):
     - Reports missing macOS permissions
     """
 
+    # Delivery ownership. When True, the context-library poller drives delivery
+    # for this collector by pulling its endpoints on its own schedule; the push
+    # trigger must not deliver, pre-fill stashes, or chain cycles for it. The
+    # library's broadcast /ingest/helpers route skips these adapters anyway
+    # (background_poll=True there), so push-triggering them only produces empty
+    # deliveries that advance the global watermark — and a pre-filled stash that
+    # nothing consumes keeps has_pending() true forever, causing the push loop
+    # to spin continuously. MUST mirror the adapters marked background_poll=True
+    # in context-library (filesystem_helper, obsidian_helper, oura,
+    # apple_music_library).
+    pull_owned: bool = False
+
     @property
     @abstractmethod
     def name(self) -> str:

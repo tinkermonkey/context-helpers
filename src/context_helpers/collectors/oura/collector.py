@@ -67,6 +67,11 @@ class OuraTokenStore:
 class OuraCollector(BaseCollector):
     """Fetches daily sleep, readiness, activity, and workout data from the Oura API."""
 
+    # Delivery is driven by the context-library poller (background_poll=True
+    # there); the push trigger must not deliver or chain for this collector.
+    pull_owned = True
+
+
     def __init__(self, config: OuraConfig, token_store: OuraTokenStore | None = None) -> None:
         self._config = config
         self._token_store = token_store or OuraTokenStore()

@@ -38,6 +38,11 @@ except ImportError:
 class ObsidianCollector(BaseCollector):
     """Collector that reads an Obsidian vault and serves notes over HTTP."""
 
+    # Delivery is driven by the context-library poller (background_poll=True
+    # there); the push trigger must not deliver or chain for this collector.
+    pull_owned = True
+
+
     def __init__(self, config: ObsidianConfig) -> None:
         self._config = config
         self._vault_path = Path(config.vault_path).expanduser().resolve()
