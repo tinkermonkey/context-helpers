@@ -315,3 +315,31 @@ class TestCollectorConversion:
         assert len(docs2) == 1
         texts = (docs[0]["markdown"] + docs2[0]["markdown"])
         assert "Document A" in texts and "Document B" in texts
+
+
+class TestLegacyXls:
+    def test_xls_converts(self, tmp_path):
+        xlwt = pytest.importorskip("xlwt", reason="xlwt needed to write the fixture")
+        wb = xlwt.Workbook()
+        ws = wb.add_sheet("Taxes")
+        ws.write(0, 0, "Category")
+        ws.write(0, 1, "Amount")
+        ws.write(1, 0, "Consulting income")
+        ws.write(1, 1, 125000)
+        f = tmp_path / "tax-details.xls"
+        wb.save(str(f))
+        md = convert_to_markdown(f)
+        assert "Consulting income" in md
+
+    def test_xls_delivered_through_collector(self, tmp_path):
+        xlwt = pytest.importorskip("xlwt", reason="xlwt needed to write the fixture")
+        wb = xlwt.Workbook()
+        ws = wb.add_sheet("Sheet1")
+        ws.write(0, 0, "Quarterly estimated payments")
+        f = tmp_path / "estimates.xls"
+        wb.save(str(f))
+        c = _collector(tmp_path)
+        items, _, _ = _fetch_all(c)
+        docs = [i for i in items if not i.get("op")]
+        assert len(docs) == 1
+        assert "Quarterly estimated payments" in docs[0]["markdown"]

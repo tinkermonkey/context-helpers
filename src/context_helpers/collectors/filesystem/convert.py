@@ -25,7 +25,7 @@ from pathlib import Path
 IWORK_EXTENSIONS = {".pages", ".numbers", ".key"}
 
 # Formats MarkItDown converts directly.
-MARKITDOWN_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".pptx"}
+MARKITDOWN_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".pptx", ".xls"}
 
 CONVERTIBLE_EXTENSIONS = IWORK_EXTENSIONS | MARKITDOWN_EXTENSIONS
 
