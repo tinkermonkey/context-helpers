@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Query
 
+from context_helpers.collectors.email.collector import push_cursor_key
+
 if TYPE_CHECKING:
     from context_helpers.collectors.email.collector import EmailCollector
 
@@ -33,7 +35,7 @@ def make_email_router(collector: EmailCollector) -> APIRouter:
         all_items: list[dict] = []
 
         for account in collector._config.accounts:
-            cursor_key = f"email:{account.alias}"
+            cursor_key = push_cursor_key(account.alias)
             account_since = collector.resolve_push_since(since, cursor_key)
             items = collector.fetch_messages(account, account_since)
             all_items += collector.apply_push_paging(items, "timestamp", cursor_key)

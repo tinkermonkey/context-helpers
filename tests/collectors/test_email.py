@@ -194,7 +194,7 @@ class TestPushCursorKeys:
         collector = EmailCollector(
             EmailConfig(enabled=True, accounts=[_account("work"), _account("personal")])
         )
-        assert collector.push_cursor_keys() == ["email:work", "email:personal"]
+        assert collector.push_cursor_keys() == ["email_work", "email_personal"]
 
 
 class TestCheckPermissions:
@@ -821,8 +821,8 @@ class TestRouter:
         client = self._app_client(collector)
         client.get("/email/messages")
 
-        work_cursor = collector.get_push_cursor("email:work")
-        personal_cursor = collector.get_push_cursor("email:personal")
+        work_cursor = collector.get_push_cursor("email_work")
+        personal_cursor = collector.get_push_cursor("email_personal")
         assert work_cursor is not None
         assert personal_cursor is not None
 
@@ -877,8 +877,8 @@ class TestRouter:
         items = resp.json()
         assert len(items) == 1
         assert items[0]["message_id"] == "<work@example.com>"
-        assert collector.get_push_cursor("email:work") is not None
-        assert collector.get_push_cursor("email:broken") is None
+        assert collector.get_push_cursor("email_work") is not None
+        assert collector.get_push_cursor("email_broken") is None
 
 
 class _FakeTokenResponse:

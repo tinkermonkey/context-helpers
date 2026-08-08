@@ -128,7 +128,7 @@ class TestRegistryEmailCollector:
         collectors = build_collector_registry(config)
         assert len(collectors) == 1
         assert collectors[0].name == "email"
-        assert collectors[0].push_cursor_keys() == ["email:work", "email:personal"]
+        assert collectors[0].push_cursor_keys() == ["email_work", "email_personal"]
 
     def test_email_disabled_not_in_result(self):
         config = _config(email=EmailConfig(enabled=False))

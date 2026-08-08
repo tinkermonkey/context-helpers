@@ -42,6 +42,15 @@ _TOKEN_STORE_DIR = Path.home() / ".local" / "share" / "context-helpers"
 # Refresh when less than this many minutes remain on the access token.
 _EXPIRY_BUFFER_MINUTES = 5
 
+
+def push_cursor_key(alias: str) -> str:
+    """Build a per-account push cursor key.
+
+    Uses the same "<collector-name>_<suffix>" convention as the other
+    multi-cursor collectors, so /status can strip the "email_" prefix.
+    """
+    return f"email_{alias}"
+
 GMAIL_PRESET = {
     "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
     "token_url": "https://oauth2.googleapis.com/token",
@@ -145,7 +154,7 @@ class EmailCollector(BaseCollector):
         return []  # No macOS permissions needed; IMAP is a network protocol
 
     def push_cursor_keys(self) -> list[str]:
-        return [f"email:{acct.alias}" for acct in self._config.accounts]
+        return [push_cursor_key(acct.alias) for acct in self._config.accounts]
 
     # ------------------------------------------------------------------
     # Health
