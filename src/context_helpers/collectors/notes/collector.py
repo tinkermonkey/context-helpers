@@ -74,7 +74,7 @@ class NotesCollector(BaseCollector):
         try:
             result = subprocess.run(
                 ["osascript", "-e", 'tell application "Notes" to count of notes'],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, check=False,
             )
             if result.returncode != 0 and "not authorized" in result.stderr.lower():
                 return ["Automation permission for Notes.app (System Settings → Privacy & Security → Automation)"]

@@ -128,7 +128,7 @@ def _is_blocked_url(url: str, blocklist_domains: list[str]) -> bool:
                 d = domain.lower()
                 if hostname == d or hostname.endswith(f".{d}"):
                     return True
-    except Exception:
+    except (ValueError, AttributeError):
         return True
     return False
 
@@ -144,7 +144,7 @@ def _sanitize_url(url: str) -> str:
         if len(cleaned) == len(params):
             return url
         return urlunparse(parsed._replace(query=urlencode(cleaned)))
-    except Exception:
+    except (ValueError, AttributeError, TypeError):
         return url
 
 
@@ -347,7 +347,7 @@ class BrowserHistoryCollector(BaseCollector):
                         "SELECT COUNT(*) FROM history_items"
                     ).fetchone()
                 parts.append(f"Safari: {count:,} URLs")
-            except Exception as e:
+            except (sqlite3.Error, OSError) as e:
                 parts.append(f"Safari: error ({e})")
 
         if self._config.firefox_enabled:
@@ -359,7 +359,7 @@ class BrowserHistoryCollector(BaseCollector):
                             "SELECT COUNT(*) FROM moz_places"
                         ).fetchone()
                     parts.append(f"Firefox: {count:,} URLs")
-                except Exception as e:
+                except (sqlite3.Error, OSError) as e:
                     parts.append(f"Firefox: error ({e})")
 
         if self._config.chrome_enabled and self._chrome_history.exists():
@@ -367,7 +367,7 @@ class BrowserHistoryCollector(BaseCollector):
                 with _open_db(self._chrome_history) as conn:
                     (count,) = conn.execute("SELECT COUNT(*) FROM urls").fetchone()
                 parts.append(f"Chrome: {count:,} URLs")
-            except Exception as e:
+            except (sqlite3.Error, OSError) as e:
                 parts.append(f"Chrome: error ({e})")
 
         if not parts:
@@ -422,9 +422,8 @@ class BrowserHistoryCollector(BaseCollector):
         oldest_cursor: datetime | None = None
         for key in self.push_cursor_keys():
             cursor = self.get_push_cursor(key)
-            if cursor is not None:
-                if oldest_cursor is None or cursor < oldest_cursor:
-                    oldest_cursor = cursor
+            if cursor is not None and (oldest_cursor is None or cursor < oldest_cursor):
+                oldest_cursor = cursor
 
         compare_against = oldest_cursor or watermark
         if compare_against is None:
@@ -489,8 +488,8 @@ class BrowserHistoryCollector(BaseCollector):
             cp = configparser.ConfigParser()
             try:
                 cp.read(str(ini_path))
-            except Exception:
-                pass
+            except (OSError, configparser.Error) as e:
+                logger.debug("browser_history: failed to read profiles.ini: %s", e)
             else:
                 # Modern Firefox: Install* section Default key points to active profile
                 for section in cp.sections():
@@ -724,6 +723,7 @@ def _fetch_jxa_tabs(app_label: str, browser: str, script: str) -> list[dict]:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                check=False,
             )
             if result.returncode != 0:
                 logger.debug(
@@ -748,6 +748,6 @@ def _fetch_jxa_tabs(app_label: str, browser: str, script: str) -> list[dict]:
     except subprocess.TimeoutExpired:
         logger.debug("browser_history: %s tabs script timed out", app_label)
         return []
-    except Exception as e:
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError, KeyError) as e:
         logger.debug("browser_history: %s tabs error: %s", app_label, e)
         return []

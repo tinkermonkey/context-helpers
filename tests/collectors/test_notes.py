@@ -2,6 +2,7 @@
 
 import subprocess
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -122,7 +123,7 @@ class TestFetchNotesSinceFilter:
     are excluded from incremental fetches — previously they bypassed the
     since-filter and re-delivered on every push, starving the page front."""
 
-    RAW_NOTES = [
+    RAW_NOTES: ClassVar[list[dict]] = [
         {"id": 1, "title": "No timestamp", "body": "b1", "created": "", "updated": ""},
         {"id": 2, "title": "Old note", "body": "b2",
          "created": "2026-01-01T00:00:00+00:00", "updated": "2026-01-02T00:00:00+00:00"},

@@ -268,8 +268,8 @@ class FilesystemCollector(PagedCollector):
         while not self._scan_stop.is_set():
             try:
                 self.scan_now()
-            except Exception as e:
-                logger.error("filesystem: scan failed: %s", e, exc_info=True)
+            except Exception:
+                logger.exception("filesystem: scan failed")
             self._scan_wake.wait(timeout=self._config.scan_interval_sec)
             self._scan_wake.clear()
 
@@ -466,6 +466,7 @@ class FilesystemCollector(PagedCollector):
                     capture_output=True,
                     text=True,
                     timeout=self._config.convert_timeout_sec,
+                    check=False,
                 )
             except subprocess.TimeoutExpired:
                 span.set_attribute("filesystem.convert.result", "timeout")
@@ -760,7 +761,9 @@ class FilesystemCollector(PagedCollector):
         try:
             cursor = self.get_cursor()
             items, has_more, page_max = self.fetch_page(after=cursor, limit=limit)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - last-resort guard so a failed
+            # background stash fill (DB/index errors of any kind) can't take
+            # down the push-trigger poll loop; degrade to an empty page.
             logger.error("filesystem: fill_stash() failed: %s", e)
             items, has_more, page_max = [], False, None
         finally:

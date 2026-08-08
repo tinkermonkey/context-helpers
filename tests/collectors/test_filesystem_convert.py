@@ -192,6 +192,7 @@ class TestSubprocessEntrypoint:
             capture_output=True,
             text=True,
             timeout=120,
+            check=False,
         )
         assert result.returncode == 0
         assert "Subprocess conversion works" in result.stdout
@@ -203,6 +204,7 @@ class TestSubprocessEntrypoint:
             capture_output=True,
             text=True,
             timeout=120,
+            check=False,
         )
         assert result.returncode == 1
         assert result.stderr.strip()

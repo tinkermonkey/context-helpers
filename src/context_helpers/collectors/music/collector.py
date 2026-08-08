@@ -99,7 +99,7 @@ class MusicCollector(BaseCollector):
             result = subprocess.run(
                 ["osascript", "-l", "JavaScript", "-e",
                  "Application('Music').tracks.id().length"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=15, check=False,
             )
             if result.returncode != 0:
                 return {"status": "error", "message": result.stderr.strip()}
@@ -114,7 +114,7 @@ class MusicCollector(BaseCollector):
             result = subprocess.run(
                 ["osascript", "-l", "JavaScript", "-e",
                  "Application('Music').tracks.id().length"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=15, check=False,
             )
             if result.returncode != 0 and "not authorized" in result.stderr.lower():
                 return ["Automation permission for Music.app (System Settings → Privacy & Security → Automation)"]
@@ -131,7 +131,7 @@ class MusicCollector(BaseCollector):
         try:
             result = subprocess.run(
                 ["osascript", "-l", "JavaScript", "-e", _JXA_HAS_CHANGES_SCRIPT],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=15, check=False,
             )
             if result.returncode != 0:
                 return True
@@ -139,7 +139,9 @@ class MusicCollector(BaseCollector):
             if max_dt.tzinfo is None:
                 max_dt = max_dt.replace(tzinfo=timezone.utc)
             return max_dt > compare_against
-        except Exception:
+        except (subprocess.SubprocessError, OSError, ValueError):
+            # Any failure to determine "has changed" should default to True
+            # per the has_changes_since() contract (uncertain => assume changes).
             return True
 
     def fetch_tracks(self, since: str | None) -> list[dict]:
@@ -167,7 +169,7 @@ class MusicCollector(BaseCollector):
             try:
                 result = subprocess.run(
                     ["osascript", "-l", "JavaScript", "-e", script],
-                    capture_output=True, text=True, timeout=120,
+                    capture_output=True, text=True, timeout=120, check=False,
                 )
             except subprocess.TimeoutExpired:
                 raise RuntimeError("Music.app JXA query timed out after 120s")

@@ -259,8 +259,8 @@ class HealthCollector(BaseCollector):
                 span.set_attribute("health.export_path", str(export_zip))
                 try:
                     span.set_attribute("health.export_size_bytes", os.path.getsize(export_zip))
-                except Exception:
-                    pass
+                except OSError as e:
+                    logger.debug("Health: could not stat export zip for size attribute: %s", e)
                 t0 = _time.monotonic()
 
                 with _zipfile.ZipFile(export_zip) as zf:

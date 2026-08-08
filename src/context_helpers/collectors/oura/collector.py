@@ -8,7 +8,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -103,7 +103,9 @@ class OuraCollector(BaseCollector):
             if e.code == 401:
                 return {"status": "error", "message": "Invalid or expired token (401); check credentials"}
             return {"status": "error", "message": f"Oura API HTTP {e.code}: {e.reason}"}
-        except Exception as e:
+        except (OSError, ValueError) as e:
+            # OSError covers urllib.error.URLError/network failures; ValueError
+            # covers json.JSONDecodeError from a malformed API response.
             return {"status": "error", "message": f"Oura API unreachable: {e}"}
 
     def check_permissions(self) -> list[str]:
@@ -120,7 +122,7 @@ class OuraCollector(BaseCollector):
         that endpoint has never delivered, and a cursor from a previous day means
         new daily data may be available (Oura syncs once per day).
         """
-        today = date.today()
+        today = datetime.now(timezone.utc).date()
         for key in self.push_cursor_keys():
             cursor = self.get_push_cursor(key)
             if cursor is None or cursor.date() < today:
@@ -209,7 +211,10 @@ class OuraCollector(BaseCollector):
         if refresh_token and self._config.client_id and self._config.client_secret:
             try:
                 return self._do_refresh(refresh_token)
-            except Exception as e:
+            except (OSError, ValueError, KeyError) as e:
+                # OSError: network failure talking to the token endpoint.
+                # ValueError: malformed JSON response (json.JSONDecodeError).
+                # KeyError: response JSON missing access_token/refresh_token.
                 logger.warning("Oura: token refresh failed: %s", e)
                 if stored_access:
                     return stored_access
@@ -223,41 +228,40 @@ class OuraCollector(BaseCollector):
         Thread-safe: acquires a lock and re-checks the store before posting,
         in case a concurrent thread already refreshed using the same token.
         """
-        with _tracer.start_as_current_span("oura.token_refresh") as span:
-            with self._refresh_lock:
-                # Re-check: another thread may have already refreshed
-                stored = self._token_store.load()
-                stored_refresh = stored.get("refresh_token")
-                if stored_refresh and stored_refresh != refresh_token:
-                    # Another thread already consumed this refresh token; use their result
-                    return stored.get("access_token", "")
+        with _tracer.start_as_current_span("oura.token_refresh") as span, self._refresh_lock:
+            # Re-check: another thread may have already refreshed
+            stored = self._token_store.load()
+            stored_refresh = stored.get("refresh_token")
+            if stored_refresh and stored_refresh != refresh_token:
+                # Another thread already consumed this refresh token; use their result
+                return stored.get("access_token", "")
 
-                data = urllib.parse.urlencode(
-                    {
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh_token,
-                        "client_id": self._config.client_id,
-                        "client_secret": self._config.client_secret,
-                    }
-                ).encode()
-                req = urllib.request.Request(self._config.token_url, data=data, method="POST")
-                req.add_header("Content-Type", "application/x-www-form-urlencoded")
-                try:
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        payload = json.loads(resp.read().decode())
-                except Exception as exc:
-                    span.record_exception(exc)
-                    tel._set_error(span)
-                    raise
+            data = urllib.parse.urlencode(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": self._config.client_id,
+                    "client_secret": self._config.client_secret,
+                }
+            ).encode()
+            req = urllib.request.Request(self._config.token_url, data=data, method="POST")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    payload = json.loads(resp.read().decode())
+            except Exception as exc:
+                span.record_exception(exc)
+                tel._set_error(span)
+                raise
 
-                access_token = payload["access_token"]
-                new_refresh = payload["refresh_token"]
-                expires_in = payload.get("expires_in", 2592000)  # default 30 days
-                expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+            access_token = payload["access_token"]
+            new_refresh = payload["refresh_token"]
+            expires_in = payload.get("expires_in", 2592000)  # default 30 days
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-                self._token_store.save(access_token, new_refresh, expires_at)
-                logger.info("Oura: token refreshed, expires at %s", expires_at.isoformat())
-                return access_token
+            self._token_store.save(access_token, new_refresh, expires_at)
+            logger.info("Oura: token refreshed, expires at %s", expires_at.isoformat())
+            return access_token
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -291,7 +295,10 @@ class OuraCollector(BaseCollector):
                             self._do_refresh(refresh_token)
                             span.set_attribute("oura.result_count", -1)
                             return self._get(path, params, _retry=False)
-                        except Exception as refresh_err:
+                        except (OSError, ValueError, KeyError) as refresh_err:
+                            # OSError/ValueError/KeyError: the same failure modes as
+                            # _do_refresh (network, bad JSON, missing token fields);
+                            # fall through to raising the original 401 below.
                             logger.warning("Oura: forced refresh on 401 failed: %s", refresh_err)
                 span.record_exception(e)
                 tel._set_error(span)
@@ -357,13 +364,13 @@ class OuraCollector(BaseCollector):
 
     def _date_range(self, since: str | None) -> tuple[str, str]:
         """Convert ISO since timestamp to (start_date, end_date) YYYY-MM-DD strings."""
-        end = date.today().isoformat()
+        end = datetime.now(timezone.utc).date().isoformat()
         if since:
             dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
             start = dt.date().isoformat()
         else:
             lookback = getattr(self._config, "initial_lookback_days", _DEFAULT_LOOKBACK_DAYS)
-            start = (date.today() - timedelta(days=lookback)).isoformat()
+            start = (datetime.now(timezone.utc).date() - timedelta(days=lookback)).isoformat()
         return start, end
 
     # ------------------------------------------------------------------

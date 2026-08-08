@@ -204,7 +204,7 @@ class LocationCollector(BaseCollector):
                     f"current location file {'present' if current_available else 'absent'}"
                 ),
             }
-        except Exception as e:
+        except sqlite3.Error as e:
             return {"status": "error", "message": str(e)}
 
     def check_permissions(self) -> list[str]:
@@ -212,7 +212,7 @@ class LocationCollector(BaseCollector):
             with self._open():
                 pass
             return []
-        except Exception:
+        except sqlite3.OperationalError:
             return [
                 (f"Read access to {self._db_path} "
                 "(grant Full Disk Access to Terminal in "

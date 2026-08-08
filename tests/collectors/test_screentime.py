@@ -219,7 +219,7 @@ class TestFetchAppUsageInitialLoad:
         c = _collector()
         c._db_path = tmp_path / "missing.db"
         # Connection will fail; should raise (not silently return [])
-        with pytest.raises(Exception):
+        with pytest.raises(sqlite3.OperationalError):
             c.fetch_app_usage(since=None)
 
     def test_returns_empty_list_on_operational_error(self, tmp_path):

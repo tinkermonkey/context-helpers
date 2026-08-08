@@ -145,12 +145,15 @@ class ContactsCollector(BaseCollector):
             result = subprocess.run(
                 ["osascript", "-l", "JavaScript", "-e", _JXA_COUNT],
                 capture_output=True, text=True, timeout=10,
+                check=False,
             )
             if result.returncode != 0:
                 return {"status": "error", "message": f"JXA error: {result.stderr.strip()}"}
             count = json.loads(result.stdout.strip())
             return {"status": "ok", "message": f"{count:,} contacts in library"}
-        except Exception as e:
+        except (
+            subprocess.SubprocessError, OSError, json.JSONDecodeError, TypeError, ValueError,
+        ) as e:
             return {"status": "error", "message": f"Contacts check failed: {e}"}
 
     def check_permissions(self) -> list[str]:
@@ -159,6 +162,7 @@ class ContactsCollector(BaseCollector):
             result = subprocess.run(
                 ["osascript", "-l", "JavaScript", "-e", _JXA_COUNT],
                 capture_output=True, text=True, timeout=10,
+                check=False,
             )
             stderr = result.stderr.lower()
             if result.returncode != 0 and ("not authorized" in stderr or "access" in stderr):
@@ -197,12 +201,14 @@ class ContactsCollector(BaseCollector):
 
         Raises:
             RuntimeError: If osascript fails or returns invalid JSON
+            TypeError: If osascript returns valid JSON that isn't a list
         """
         with jxa_span(_tracer, "contacts", "contacts.get_all") as span:
             span.set_attribute("contacts.cache_hit", False)
             result = subprocess.run(
                 ["osascript", "-l", "JavaScript", "-e", _JXA_FETCH_ALL],
                 capture_output=True, text=True, timeout=120,
+                check=False,
             )
             if result.returncode != 0:
                 raise RuntimeError(f"JXA contacts fetch failed: {result.stderr.strip()}")
@@ -211,7 +217,7 @@ class ContactsCollector(BaseCollector):
             except json.JSONDecodeError as e:
                 raise RuntimeError(f"JXA returned invalid JSON: {e}") from e
             if not isinstance(contacts, list):
-                raise RuntimeError(f"JXA returned unexpected type: {type(contacts).__name__}")
+                raise TypeError(f"JXA returned unexpected type: {type(contacts).__name__}")
             span.set_attribute("jxa.contact_count", len(contacts))
         return contacts
 
@@ -240,6 +246,7 @@ class ContactsCollector(BaseCollector):
 
         Raises:
             RuntimeError: If osascript fails or returns invalid JSON
+            TypeError: If osascript returns valid JSON that isn't a list
         """
         contacts = self._get_cached()
 

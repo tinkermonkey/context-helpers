@@ -207,7 +207,7 @@ class ScreenTimeCollector(BaseCollector):
                 "status": "ok",
                 "message": f"knowledgeC.db accessible ({count:,} app usage records)",
             }
-        except Exception as e:
+        except sqlite3.Error as e:
             return {"status": "error", "message": str(e)}
 
     def check_permissions(self) -> list[str]:
@@ -215,7 +215,7 @@ class ScreenTimeCollector(BaseCollector):
             with self._open():
                 pass
             return []
-        except Exception:
+        except sqlite3.OperationalError:
             return [
                 (f"Read access to {self._db_path} "
                 "(grant Full Disk Access to Terminal in "

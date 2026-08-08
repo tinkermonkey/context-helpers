@@ -935,9 +935,11 @@ class TestWhisperHelpers:
         """If json.dump raises, the .tmp file is removed."""
         from unittest import mock
 
-        with mock.patch("json.dump", side_effect=OSError("disk full")):
-            with pytest.raises(OSError, match="disk full"):
-                _write_whisper_transcript(tmp_path, "ep-fail", {}, "text", "base.en")
+        with (
+            mock.patch("json.dump", side_effect=OSError("disk full")),
+            pytest.raises(OSError, match="disk full"),
+        ):
+            _write_whisper_transcript(tmp_path, "ep-fail", {}, "text", "base.en")
 
         # No .tmp left behind.
         assert not list(tmp_path.glob("*.tmp"))

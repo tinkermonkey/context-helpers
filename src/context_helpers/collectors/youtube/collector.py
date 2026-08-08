@@ -71,6 +71,7 @@ class YouTubeCollector(BaseCollector):
                 capture_output=True,
                 text=True,
                 timeout=10,
+                check=False,
             )
             if result.returncode != 0:
                 return {
@@ -216,6 +217,7 @@ class YouTubeCollector(BaseCollector):
                     capture_output=True,
                     text=True,
                     timeout=120,
+                    check=False,
                 )
             except subprocess.TimeoutExpired:
                 raise RuntimeError("yt-dlp timed out after 120 s")

@@ -217,7 +217,7 @@ class TestFetchRemindersErrors:
     def test_missing_db_raises_runtime_error(self):
         c = _collector()
         c._db_path = Path("/nonexistent/path/Data-FAKE.sqlite")
-        with pytest.raises(Exception):
+        with pytest.raises(sqlite3.OperationalError):
             c.fetch_reminders(since=None, list_filter=None)
 
 

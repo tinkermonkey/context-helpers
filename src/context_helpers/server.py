@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -75,7 +76,7 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
         for collector in collectors:
             try:
                 collector.start()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - collector plugin isolation: one bad collector must not crash the server
                 logger.error("collector %s: start() failed: %s", collector.name, e)
 
         # Staleness gauges: cursor age / has_more / watermark age, so a stalled
@@ -84,7 +85,7 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
             from context_helpers.staleness import register_staleness_metrics
 
             register_staleness_metrics(collectors, state_store)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - optional metrics feature must not prevent server startup
             logger.warning("staleness metrics not registered: %s", e)
 
         push_trigger = None
@@ -94,7 +95,7 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
 
                 push_trigger = PushTrigger(config.push, collectors, state_store)
                 push_trigger.start()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - push trigger startup must not crash the server
                 logger.error("PushTrigger failed to start: %s", e)
 
         yield
@@ -102,13 +103,13 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
         if push_trigger is not None:
             try:
                 push_trigger.stop()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - shutdown must proceed even if the push trigger fails to stop cleanly
                 logger.error("PushTrigger failed to stop cleanly: %s", e)
 
         for collector in collectors:
             try:
                 collector.stop()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - collector plugin isolation: one bad collector must not block shutdown
                 logger.error("collector %s: stop() failed: %s", collector.name, e)
 
     app = FastAPI(
@@ -135,7 +136,7 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
         for collector in collectors:
             try:
                 statuses[collector.name] = collector.health_check()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - collector plugin isolation: a failing health_check() must not crash /health
                 statuses[collector.name] = {"status": "error", "message": str(e)}
 
         overall = "ok" if all(s["status"] == "ok" for s in statuses.values()) else "degraded"
@@ -222,7 +223,7 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
             cleared = collector.reset_state()
             logger.info("collector %s: reset state — cleared: %s", name, cleared)
             return {"ok": True, "collector": name, "cleared": cleared, "errors": []}
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - collector plugin isolation: reset_state() may raise arbitrary errors
             logger.error("collector %s: reset_state() failed: %s", name, e)
             return JSONResponse(  # type: ignore[return-value]
                 status_code=500,
@@ -230,7 +231,9 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
             )
 
     @app.post("/collectors/{name}/ack", dependencies=[Depends(auth_dep)])
-    async def ack_collector(name: str, body: AckRequest | None = Body(default=None)) -> dict:
+    async def ack_collector(
+        name: str, body: Annotated[AckRequest | None, Body()] = None
+    ) -> dict:
         """Commit a collector's staged push cursors (commit-ack confirmation).
 
         When a consumer pulls with ``?ack=true`` the collector *stages* its new
@@ -253,7 +256,7 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
             if committed:
                 logger.info("collector %s: ack committed push cursors: %s", name, committed)
             return {"ok": True, "collector": name, "committed": committed, "errors": []}
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - collector plugin isolation: commit_push_cursors() may raise arbitrary errors
             logger.error("collector %s: commit_push_cursors() failed: %s", name, e)
             return JSONResponse(  # type: ignore[return-value]
                 status_code=500,

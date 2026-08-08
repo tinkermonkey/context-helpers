@@ -533,7 +533,7 @@ class PagedCollector(BaseCollector):
             try:
                 cursor = self.get_cursor()
                 items, has_more = self.fetch_page(after=cursor, limit=limit)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - isolate subclass fetch_page() bugs from the push/stash thread
                 logger.error("PagedCollector: fill_stash() failed for %s: %s", self.name, e)
                 span.record_exception(e)
                 tel._set_error(span)

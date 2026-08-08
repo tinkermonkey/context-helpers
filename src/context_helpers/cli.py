@@ -52,7 +52,7 @@ def start(daemon: bool, config: str | None) -> None:
             plist = launchd.install(config_path=config_path)
             click.echo(f"Installed: {plist}")
             click.echo("context-helpers will start on login and restart if it crashes.")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - CLI boundary: report any install failure and exit cleanly
             click.echo(f"Error: {e}", err=True)
             sys.exit(1)
         return
@@ -72,9 +72,10 @@ def start(daemon: bool, config: str | None) -> None:
 
     from context_helpers.telemetry import setup_telemetry
     try:
+        from importlib.metadata import PackageNotFoundError
         from importlib.metadata import version as _pkg_version
         _svc_version = _pkg_version("context-helpers")
-    except Exception:
+    except PackageNotFoundError:
         _svc_version = "unknown"
     setup_telemetry(
         service_name=app_config.telemetry.service_name,
@@ -155,7 +156,7 @@ def status(config: str | None) -> None:
         from context_helpers.config import load_config
 
         app_config = load_config(config_path)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - CLI boundary: report any config error and return cleanly
         click.echo(f"\nConfig error: {e}", err=True)
         return
 
@@ -187,10 +188,11 @@ def setup() -> None:
     # Create config dir
     _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    if _CONFIG_PATH.exists():
-        if not click.confirm(f"Config already exists at {_CONFIG_PATH}. Overwrite?", default=False):
-            click.echo("Keeping existing config.")
-            return
+    if _CONFIG_PATH.exists() and not click.confirm(
+        f"Config already exists at {_CONFIG_PATH}. Overwrite?", default=False
+    ):
+        click.echo("Keeping existing config.")
+        return
 
     # Copy example config
     if _EXAMPLE_CONFIG.exists():
@@ -328,7 +330,7 @@ def oura_auth(config: str | None, port: int) -> None:
         from context_helpers.config import load_config
 
         app_config = load_config(config_path)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - CLI boundary: report any config error and exit cleanly
         click.echo(f"Config error: {e}", err=True)
         sys.exit(1)
 
@@ -439,7 +441,7 @@ def oura_auth(config: str | None, port: int) -> None:
         body = e.read().decode(errors="replace")
         click.echo(f"Token exchange failed (HTTP {e.code}): {body}", err=True)
         sys.exit(1)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - CLI boundary: report any transport/parsing failure and exit cleanly
         click.echo(f"Token exchange failed: {e}", err=True)
         sys.exit(1)
 
