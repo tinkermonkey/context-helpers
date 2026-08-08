@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import email
 import email.policy
+import json
 import logging
 import ssl
+import threading
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from pathlib import Path
 
 import html2text  # type: ignore[import-untyped,import-not-found]
 import imapclient  # type: ignore[import-untyped,import-not-found]
@@ -33,6 +38,83 @@ _HEADER_DECODE_ERRORS = (
     IndexError,
 )
 
+_TOKEN_STORE_DIR = Path.home() / ".local" / "share" / "context-helpers"
+# Refresh when less than this many minutes remain on the access token.
+_EXPIRY_BUFFER_MINUTES = 5
+
+GMAIL_PRESET = {
+    "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+    "token_url": "https://oauth2.googleapis.com/token",
+    "scopes": ["https://mail.google.com/"],
+}
+
+MICROSOFT_PRESET = {
+    "authorize_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+    "token_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    "scopes": ["https://outlook.office.com/IMAP.AccessAsUser.All", "offline_access"],
+}
+
+_PROVIDER_PRESETS = {"gmail": GMAIL_PRESET, "microsoft": MICROSOFT_PRESET}
+
+
+def resolve_oauth_settings(account: EmailAccountConfig) -> dict:
+    """Return {authorize_url, token_url, scopes} for account.provider.
+
+    provider="custom" (or any provider without a preset) uses the account's
+    own authorize_url/token_url/scopes fields as-is, per ADR-4.
+    """
+    preset = _PROVIDER_PRESETS.get(account.provider)
+    if preset is not None:
+        return preset
+    return {
+        "authorize_url": account.authorize_url,
+        "token_url": account.token_url,
+        "scopes": account.scopes,
+    }
+
+
+class EmailTokenError(RuntimeError):
+    """Raised when an OAuth account has no usable token and cannot refresh."""
+
+
+class EmailTokenStore:
+    """Persists OAuth2 tokens for one email account across restarts.
+
+    Each account alias gets its own file so refreshing or re-authorizing one
+    account never touches another's tokens. Atomic writes via temp-file
+    rename ensure the file is never left partially written.
+    """
+
+    def __init__(self, alias: str, path: Path | None = None) -> None:
+        self._alias = alias
+        self._path = path or (_TOKEN_STORE_DIR / f"email_{alias}_tokens.json")
+
+    def load(self) -> dict:
+        if not self._path.exists():
+            return {}
+        try:
+            with open(self._path) as f:
+                return json.load(f) or {}
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("EmailTokenStore: failed to read %s: %s", self._path, e)
+            return {}
+
+    def save(self, access_token: str, refresh_token: str, expires_at: datetime) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(".tmp")
+        data = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": expires_at.isoformat(),
+        }
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+            tmp.replace(self._path)
+        except OSError as e:
+            logger.error("EmailTokenStore: failed to write %s: %s", self._path, e)
+
 
 class EmailCollector(BaseCollector):
     def __init__(self, config: EmailConfig) -> None:
@@ -41,6 +123,14 @@ class EmailCollector(BaseCollector):
         # to detect new mail without a full fetch. In-memory only: on process
         # restart the first probe simply returns True (conservative default).
         self._uidnext_seen: dict[str, int] = {}
+        # One token store + refresh lock per account, so refreshing one
+        # account's tokens never blocks or touches another account's.
+        self._token_stores: dict[str, EmailTokenStore] = {
+            acct.alias: EmailTokenStore(acct.alias) for acct in config.accounts
+        }
+        self._refresh_locks: dict[str, threading.Lock] = {
+            acct.alias: threading.Lock() for acct in config.accounts
+        }
 
     @property
     def name(self) -> str:
@@ -88,15 +178,18 @@ class EmailCollector(BaseCollector):
         return {"status": overall, "message": message, "accounts": accounts}
 
     def _account_health(self, account: EmailAccountConfig) -> dict:
-        if account.auth != "password":
-            return {
-                "status": "error",
-                "message": f"auth={account.auth!r} not yet supported (Phase 3)",
-            }
-        if not account.username or not account.password:
+        token: str | None = None
+        if account.auth == "oauth":
+            if not account.username:
+                return {"status": "error", "message": "username not configured"}
+            try:
+                token = self._get_token(account)
+            except EmailTokenError as e:
+                return {"status": "error", "message": str(e)}
+        elif not account.username or not account.password:
             return {"status": "error", "message": "username/password not configured"}
         try:
-            with _connect(account) as client:
+            with _connect(account, token) as client:
                 probe_folder = (
                     _account_folders(account)[0]
                     if _account_folders(account)
@@ -115,8 +208,6 @@ class EmailCollector(BaseCollector):
 
     def has_changes_since(self, watermark: datetime | None) -> bool:
         for account in self._config.accounts:
-            if account.auth != "password":
-                continue
             if self._account_has_new_mail(account):
                 return True
         return False
@@ -125,9 +216,10 @@ class EmailCollector(BaseCollector):
         folders = _account_folders(account)
         probe_folder = folders[0] if folders else "INBOX"
         try:
-            with _connect(account) as client:
+            token = self._get_token(account) if account.auth == "oauth" else None
+            with _connect(account, token) as client:
                 status = client.folder_status(probe_folder, ["UIDNEXT"])
-        except (imapclient.exceptions.IMAPClientError, OSError) as e:
+        except (imapclient.exceptions.IMAPClientError, OSError, EmailTokenError) as e:
             logger.warning("email: UIDNEXT probe failed for %s: %s", account.alias, e)
             return True  # conservative: assume changed if we can't check
 
@@ -156,14 +248,6 @@ class EmailCollector(BaseCollector):
         get_push_limit() + 1 messages so apply_push_paging() can detect
         has_more.
         """
-        if account.auth != "password":
-            logger.warning(
-                "email: skipping account %s — auth=%r not yet supported (Phase 3)",
-                account.alias,
-                account.auth,
-            )
-            return []
-
         folders = _account_folders(account)
         if not folders:
             return []
@@ -175,7 +259,8 @@ class EmailCollector(BaseCollector):
             span.set_attribute("email.account", account.alias)
             messages: list[dict] = []
             try:
-                with _connect(account) as client:
+                token = self._get_token(account) if account.auth == "oauth" else None
+                with _connect(account, token) as client:
                     for folder in folders:
                         remaining = limit - len(messages)
                         if remaining <= 0:
@@ -185,7 +270,11 @@ class EmailCollector(BaseCollector):
                                 client, account, folder, since_dt, remaining
                             )
                         )
-            except (imapclient.exceptions.IMAPClientError, OSError) as e:
+            except (
+                imapclient.exceptions.IMAPClientError,
+                OSError,
+                EmailTokenError,
+            ) as e:
                 logger.warning(
                     "email: fetch failed for account %s: %s", account.alias, e
                 )
@@ -252,22 +341,127 @@ class EmailCollector(BaseCollector):
 
         return results
 
+    # ------------------------------------------------------------------
+    # Token management
+    # ------------------------------------------------------------------
+
+    def _get_token(self, account: EmailAccountConfig) -> str:
+        """Return a valid access token for *account*, refreshing if near expiry.
+
+        Priority:
+        1. Stored access token if expires_at is more than EXPIRY_BUFFER_MINUTES away.
+        2. Refresh via the stored refresh_token + account client credentials.
+        3. Stale stored access token, if a refresh attempt fails.
+
+        Raises EmailTokenError if no usable token can be produced — the
+        account has never completed the `email-auth` consent flow.
+        """
+        store = self._token_stores[account.alias]
+        stored = store.load()
+        stored_access = stored.get("access_token")
+        expires_at_str = stored.get("expires_at")
+
+        if stored_access and expires_at_str:
+            try:
+                expires_at = datetime.fromisoformat(expires_at_str)
+                if expires_at > datetime.now(timezone.utc) + timedelta(
+                    minutes=_EXPIRY_BUFFER_MINUTES
+                ):
+                    return stored_access
+            except ValueError:
+                logger.warning(
+                    "EmailTokenStore: invalid expires_at value %r for %s",
+                    expires_at_str,
+                    account.alias,
+                )
+
+        refresh_token = stored.get("refresh_token")
+        if refresh_token and account.client_id and account.client_secret:
+            try:
+                return self._do_refresh(account, refresh_token)
+            except (OSError, ValueError, KeyError) as e:
+                # OSError: network failure talking to the token endpoint.
+                # ValueError: malformed JSON response (json.JSONDecodeError).
+                # KeyError: response JSON missing access_token.
+                logger.warning(
+                    "email: token refresh failed for %s: %s", account.alias, e
+                )
+                if stored_access:
+                    return stored_access
+
+        if stored_access:
+            return stored_access
+
+        raise EmailTokenError(
+            f"no OAuth tokens stored for account {account.alias!r}; run "
+            f"`context-helpers email-auth --account {account.alias}` first"
+        )
+
+    def _do_refresh(self, account: EmailAccountConfig, refresh_token: str) -> str:
+        """Exchange refresh_token for a new access_token.
+
+        Thread-safe per account: acquires that account's lock and re-checks
+        its store before posting, in case a concurrent thread already
+        refreshed using the same token.
+        """
+        lock = self._refresh_locks[account.alias]
+        store = self._token_stores[account.alias]
+        with _tracer.start_as_current_span("email.token_refresh") as span, lock:
+            span.set_attribute("email.account", account.alias)
+            # Re-check: another thread may have already refreshed
+            stored = store.load()
+            stored_refresh = stored.get("refresh_token")
+            if stored_refresh and stored_refresh != refresh_token:
+                return stored.get("access_token", "")
+
+            oauth = resolve_oauth_settings(account)
+            data = urllib.parse.urlencode(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": account.client_id,
+                    "client_secret": account.client_secret,
+                }
+            ).encode()
+            req = urllib.request.Request(oauth["token_url"], data=data, method="POST")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    payload = json.loads(resp.read().decode())
+            except Exception as exc:
+                span.record_exception(exc)
+                tel._set_error(span)
+                raise
+
+            access_token = payload["access_token"]
+            # Some providers (e.g. Google) omit refresh_token on refresh responses,
+            # meaning the original refresh_token remains valid and should be kept.
+            new_refresh = payload.get("refresh_token", refresh_token)
+            expires_in = payload.get("expires_in", 3600)
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+
+            store.save(access_token, new_refresh, expires_at)
+            logger.info(
+                "email: token refreshed for %s, expires at %s",
+                account.alias,
+                expires_at.isoformat(),
+            )
+            return access_token
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers (not methods, easier to test and mock)
 # ---------------------------------------------------------------------------
 
 
-def _connect(account: EmailAccountConfig) -> imapclient.IMAPClient:
+def _connect(
+    account: EmailAccountConfig, token: str | None = None
+) -> imapclient.IMAPClient:
     """Open and authenticate an IMAP/TLS connection for *account*.
 
-    Raises NotImplementedError for auth="oauth" accounts (Phase 3).
+    For auth="oauth" accounts, *token* must be a valid access token (obtained
+    via EmailCollector._get_token) and is used with imapclient's XOAUTH2 login.
     """
-    if account.auth != "password":
-        raise NotImplementedError(
-            f"auth={account.auth!r} is not supported until Phase 3 (OAuth)"
-        )
-
     client = imapclient.IMAPClient(
         account.host,
         port=account.port,
@@ -275,7 +469,10 @@ def _connect(account: EmailAccountConfig) -> imapclient.IMAPClient:
         ssl_context=ssl.create_default_context(),
     )
     try:
-        client.login(account.username, account.password)
+        if account.auth == "oauth":
+            client.oauth2_login(account.username, token)
+        else:
+            client.login(account.username, account.password)
     except Exception:
         client.shutdown()
         raise

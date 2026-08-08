@@ -466,6 +466,223 @@ def oura_auth(config: str | None, port: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Email OAuth2 authorization
+# ---------------------------------------------------------------------------
+
+
+@main.command(name="email-auth")
+@click.option("--config", type=click.Path(), default=None, help="Path to config.yaml")
+@click.option(
+    "--account",
+    "alias",
+    required=True,
+    help="Alias of the account to authorize (collectors.email.accounts[].alias)",
+)
+@click.option(
+    "--port",
+    default=7130,
+    show_default=True,
+    help="Local callback port. Must match a redirect URI registered in your OAuth app.",
+)
+def email_auth(config: str | None, alias: str, port: int) -> None:
+    """Run the OAuth2 consent flow for one email account and save its tokens.
+
+    Before running, add the following redirect URI to your OAuth app:
+
+        http://localhost:<PORT>/callback   (default port: 7130)
+
+    Requires an account with auth: "oauth" and client_id/client_secret set
+    in config.yaml, under collectors.email.accounts. Tokens are saved to
+    ~/.local/share/context-helpers/email_<alias>_tokens.json, scoped to that
+    account only, and refreshed automatically from then on.
+    """
+    import json
+    import secrets
+    import threading
+    import urllib.parse
+    import urllib.request
+    import webbrowser
+    from datetime import datetime, timedelta, timezone
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import parse_qs, urlencode, urlparse
+
+    config_path = Path(config) if config else _CONFIG_PATH
+    try:
+        from context_helpers.config import load_config
+
+        app_config = load_config(config_path)
+    except Exception as e:  # noqa: BLE001 - CLI boundary: report any config error and exit cleanly
+        click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
+
+    account = next(
+        (a for a in app_config.collectors.email.accounts if a.alias == alias), None
+    )
+    if account is None:
+        known = (
+            ", ".join(a.alias for a in app_config.collectors.email.accounts)
+            or "(none configured)"
+        )
+        click.echo(
+            f"Error: no account with alias {alias!r} in config.yaml. Known aliases: {known}",
+            err=True,
+        )
+        sys.exit(1)
+    if account.auth != "oauth":
+        click.echo(
+            f'Error: account {alias!r} has auth={account.auth!r}, expected auth: "oauth".',
+            err=True,
+        )
+        sys.exit(1)
+    if not account.client_id or not account.client_secret:
+        click.echo(
+            f"Error: account {alias!r} must set client_id and client_secret in config.yaml.",
+            err=True,
+        )
+        sys.exit(1)
+
+    from context_helpers.collectors.email.collector import (
+        EmailTokenStore,
+        resolve_oauth_settings,
+    )
+
+    oauth = resolve_oauth_settings(account)
+    if not oauth["authorize_url"] or not oauth["token_url"]:
+        click.echo(
+            f'Error: account {alias!r} has provider="custom" but is missing '
+            "authorize_url/token_url in config.yaml.",
+            err=True,
+        )
+        sys.exit(1)
+
+    redirect_uri = f"http://localhost:{port}/callback"
+    state = secrets.token_urlsafe(16)
+    code_holder: dict = {}
+    done_event = threading.Event()
+
+    class _CallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path != "/callback":
+                self.send_response(404)
+                self.end_headers()
+                return
+            params = parse_qs(parsed.query)
+            if params.get("state", [None])[0] != state:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"State mismatch - please retry.")
+                done_event.set()
+                return
+            if "error" in params:
+                code_holder["error"] = params["error"][0]
+            else:
+                code_holder["code"] = params.get("code", [None])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b"<html><body style='font-family:sans-serif;padding:2rem'>"
+                b"<h2>Authorization complete.</h2>"
+                b"<p>You can close this window and return to the terminal.</p>"
+                b"</body></html>"
+            )
+            done_event.set()
+
+        def log_message(self, format, *args):  # silence default access logs
+            pass
+
+    try:
+        server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
+    except OSError as e:
+        click.echo(f"Cannot bind to port {port}: {e}", err=True)
+        sys.exit(1)
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    auth_params = urlencode(
+        {
+            "response_type": "code",
+            "client_id": account.client_id,
+            "redirect_uri": redirect_uri,
+            "scope": " ".join(oauth["scopes"]),
+            "state": state,
+            "access_type": "offline",  # request a refresh_token (Google; harmless elsewhere)
+            "prompt": "consent",
+        }
+    )
+    auth_url = f"{oauth['authorize_url']}?{auth_params}"
+
+    click.echo(
+        f"\nMake sure '{redirect_uri}' is registered as a redirect URI in your OAuth app."
+    )
+    click.echo(f"\nOpening browser for {alias!r} authorization...")
+    click.echo(f"If the browser does not open, visit:\n  {auth_url}\n")
+    webbrowser.open(auth_url)
+
+    if not done_event.wait(timeout=120):
+        server.shutdown()
+        click.echo("\nTimed out waiting for authorization (120s).", err=True)
+        sys.exit(1)
+
+    server.shutdown()
+
+    if "error" in code_holder:
+        click.echo(f"\nAuthorization denied: {code_holder['error']}", err=True)
+        sys.exit(1)
+
+    code = code_holder.get("code")
+    if not code:
+        click.echo("\nNo authorization code received.", err=True)
+        sys.exit(1)
+
+    # Exchange code for tokens
+    click.echo("Exchanging authorization code for tokens...")
+    token_data = urllib.parse.urlencode(
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": account.client_id,
+            "client_secret": account.client_secret,
+        }
+    ).encode()
+    req = urllib.request.Request(oauth["token_url"], data=token_data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        click.echo(f"Token exchange failed (HTTP {e.code}): {body}", err=True)
+        sys.exit(1)
+    except Exception as e:  # noqa: BLE001 - CLI boundary: report any transport/parsing failure and exit cleanly
+        click.echo(f"Token exchange failed: {e}", err=True)
+        sys.exit(1)
+
+    access_token = payload.get("access_token")
+    refresh_token = payload.get("refresh_token")
+    expires_in = payload.get("expires_in", 3600)
+
+    if not access_token or not refresh_token:
+        click.echo(
+            f"Unexpected token response (missing access_token/refresh_token): {payload}",
+            err=True,
+        )
+        sys.exit(1)
+
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+
+    store = EmailTokenStore(alias)
+    store.save(access_token, refresh_token, expires_at)
+
+    click.echo(f"\n✓ Tokens for {alias!r} saved to {store._path}")
+    click.echo(f"  Token expires: {expires_at.strftime('%Y-%m-%d %H:%M UTC')}")
+    click.echo("  Tokens will refresh automatically going forward.")
+
+
+# ---------------------------------------------------------------------------
 # Teardown
 # ---------------------------------------------------------------------------
 

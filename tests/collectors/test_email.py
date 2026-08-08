@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -13,9 +14,12 @@ import imapclient
 import context_helpers.collectors.email.collector as email_mod
 from context_helpers.collectors.email.collector import (
     EmailCollector,
+    EmailTokenError,
+    EmailTokenStore,
     _account_folders,
     _build_message,
     _resolve_since_dt,
+    resolve_oauth_settings,
 )
 from context_helpers.config import EmailAccountConfig, EmailConfig
 
@@ -249,9 +253,18 @@ class TestBuildMessage:
 
 
 class TestFetchMessages:
-    def test_skips_oauth_accounts(self):
-        collector = EmailCollector(EmailConfig(enabled=True, accounts=[]))
+    def test_oauth_account_without_tokens_returns_empty_list(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
         acct = _account("work", auth="oauth")
+
+        def _fail_if_called(account, token=None):
+            raise AssertionError("should not connect without a token")
+
+        monkeypatch.setattr(email_mod, "_connect", _fail_if_called)
+
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
         assert collector.fetch_messages(acct, None) == []
 
     def test_returns_messages_after_since(self, monkeypatch):
@@ -267,7 +280,7 @@ class TestFetchMessages:
             b"INTERNALDATE": datetime(2024, 6, 1, tzinfo=timezone.utc),
         }
         fake = FakeIMAPClient(folders_data={"INBOX": {1: old, 2: new}})
-        monkeypatch.setattr(email_mod, "_connect", lambda account: fake)
+        monkeypatch.setattr(email_mod, "_connect", lambda account, token=None: fake)
 
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
         results = collector.fetch_messages(acct, "2024-01-01T00:00:00+00:00")
@@ -285,7 +298,7 @@ class TestFetchMessages:
                 b"INTERNALDATE": datetime(2024, 1, 1 + i, tzinfo=timezone.utc),
             }
         fake = FakeIMAPClient(folders_data={"INBOX": data})
-        monkeypatch.setattr(email_mod, "_connect", lambda account: fake)
+        monkeypatch.setattr(email_mod, "_connect", lambda account, token=None: fake)
 
         collector = EmailCollector(
             EmailConfig(enabled=True, accounts=[acct], push_page_size=2)
@@ -305,7 +318,7 @@ class TestFetchMessages:
             folders_data={"Archive": {1: archive_msg}},
             fail_select={"INBOX"},
         )
-        monkeypatch.setattr(email_mod, "_connect", lambda account: fake)
+        monkeypatch.setattr(email_mod, "_connect", lambda account, token=None: fake)
 
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
         results = collector.fetch_messages(acct, "2020-01-01T00:00:00+00:00")
@@ -316,7 +329,7 @@ class TestFetchMessages:
     def test_connect_failure_returns_empty_list(self, monkeypatch):
         acct = _account("work")
 
-        def _raise(account):
+        def _raise(account, token=None):
             raise OSError("connection refused")
 
         monkeypatch.setattr(email_mod, "_connect", _raise)
@@ -334,7 +347,7 @@ class TestHasChangesSince:
     def test_true_on_first_probe(self, monkeypatch):
         acct = _account("work")
         fake = FakeIMAPClient(uidnext=100)
-        monkeypatch.setattr(email_mod, "_connect", lambda account: fake)
+        monkeypatch.setattr(email_mod, "_connect", lambda account, token=None: fake)
 
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
         assert collector.has_changes_since(None) is True
@@ -342,7 +355,7 @@ class TestHasChangesSince:
     def test_false_when_uidnext_unchanged(self, monkeypatch):
         acct = _account("work")
         fake = FakeIMAPClient(uidnext=100)
-        monkeypatch.setattr(email_mod, "_connect", lambda account: fake)
+        monkeypatch.setattr(email_mod, "_connect", lambda account, token=None: fake)
 
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
         collector.has_changes_since(None)  # primes _uidnext_seen
@@ -351,7 +364,7 @@ class TestHasChangesSince:
     def test_true_when_uidnext_increases(self, monkeypatch):
         acct = _account("work")
         fake = FakeIMAPClient(uidnext=100)
-        monkeypatch.setattr(email_mod, "_connect", lambda account: fake)
+        monkeypatch.setattr(email_mod, "_connect", lambda account, token=None: fake)
 
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
         collector.has_changes_since(None)
@@ -361,7 +374,7 @@ class TestHasChangesSince:
     def test_true_on_probe_error(self, monkeypatch):
         acct = _account("work")
 
-        def _raise(account):
+        def _raise(account, token=None):
             raise OSError("network unreachable")
 
         monkeypatch.setattr(email_mod, "_connect", _raise)
@@ -369,16 +382,17 @@ class TestHasChangesSince:
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
         assert collector.has_changes_since(None) is True
 
-    def test_skips_oauth_accounts(self, monkeypatch):
+    def test_oauth_account_without_tokens_is_conservative(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
         acct = _account("work", auth="oauth")
 
-        def _fail_if_called(account):
-            raise AssertionError("should not connect for oauth accounts")
+        def _fail_if_called(account, token=None):
+            raise AssertionError("should not connect without a token")
 
         monkeypatch.setattr(email_mod, "_connect", _fail_if_called)
 
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
-        assert collector.has_changes_since(None) is False
+        assert collector.has_changes_since(None) is True
 
 
 class TestHealthCheck:
@@ -391,7 +405,7 @@ class TestHealthCheck:
         acct1 = _account("work")
         acct2 = _account("personal")
         fake = FakeIMAPClient()
-        monkeypatch.setattr(email_mod, "_connect", lambda account: fake)
+        monkeypatch.setattr(email_mod, "_connect", lambda account, token=None: fake)
 
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct1, acct2]))
         result = collector.health_check()
@@ -404,7 +418,7 @@ class TestHealthCheck:
         acct1 = _account("work")
         acct2 = _account("broken")
 
-        def _connect(account):
+        def _connect(account, token=None):
             if account.alias == "broken":
                 raise OSError("connection refused")
             return FakeIMAPClient()
@@ -418,12 +432,13 @@ class TestHealthCheck:
         assert result["accounts"]["work"]["status"] == "ok"
         assert result["accounts"]["broken"]["status"] == "error"
 
-    def test_oauth_account_reports_unsupported(self):
+    def test_oauth_account_without_tokens_is_error(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
         acct = _account("work", auth="oauth")
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
         result = collector.health_check()
         assert result["accounts"]["work"]["status"] == "error"
-        assert "Phase 3" in result["accounts"]["work"]["message"]
+        assert "email-auth" in result["accounts"]["work"]["message"]
 
 
 class TestRouter:
@@ -534,3 +549,188 @@ class TestRouter:
         personal_cursor = collector.get_push_cursor("email:personal")
         assert work_cursor is not None
         assert personal_cursor is not None
+
+
+class _FakeTokenResponse:
+    def __init__(self, payload):
+        self._body = json.dumps(payload).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def read(self):
+        return self._body
+
+
+class _FakeIMAPClientForConnect:
+    def __init__(self, host, port=993, ssl=True, ssl_context=None):
+        self.host = host
+        self.oauth2_login_calls = []
+        self.login_calls = []
+
+    def oauth2_login(self, user, token, mech="XOAUTH2", vendor=None):
+        self.oauth2_login_calls.append((user, token))
+
+    def login(self, username, password):
+        self.login_calls.append((username, password))
+
+    def shutdown(self):
+        pass
+
+
+class TestEmailTokenStore:
+    def test_missing_file_returns_empty_dict(self, tmp_path):
+        store = EmailTokenStore("work", path=tmp_path / "work_tokens.json")
+        assert store.load() == {}
+
+    def test_save_then_load_roundtrip(self, tmp_path):
+        path = tmp_path / "work_tokens.json"
+        store = EmailTokenStore("work", path=path)
+        expires_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        store.save("access-1", "refresh-1", expires_at)
+
+        loaded = store.load()
+        assert loaded["access_token"] == "access-1"
+        assert loaded["refresh_token"] == "refresh-1"
+        assert loaded["expires_at"] == expires_at.isoformat()
+
+    def test_separate_aliases_use_separate_files(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
+        work = EmailTokenStore("work")
+        personal = EmailTokenStore("personal")
+        expires_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+        work.save("work-access", "work-refresh", expires_at)
+        personal.save("personal-access", "personal-refresh", expires_at)
+
+        assert work._path != personal._path
+        assert work.load()["access_token"] == "work-access"
+        assert personal.load()["access_token"] == "personal-access"
+
+
+class TestResolveOauthSettings:
+    def test_gmail_preset(self):
+        acct = _account("work", auth="oauth", provider="gmail")
+        assert resolve_oauth_settings(acct) == email_mod.GMAIL_PRESET
+
+    def test_microsoft_preset(self):
+        acct = _account("work", auth="oauth", provider="microsoft")
+        assert resolve_oauth_settings(acct) == email_mod.MICROSOFT_PRESET
+
+    def test_custom_uses_account_fields(self):
+        acct = _account(
+            "work",
+            auth="oauth",
+            provider="custom",
+            authorize_url="https://example.com/authorize",
+            token_url="https://example.com/token",
+            scopes=["mail.read"],
+        )
+        assert resolve_oauth_settings(acct) == {
+            "authorize_url": "https://example.com/authorize",
+            "token_url": "https://example.com/token",
+            "scopes": ["mail.read"],
+        }
+
+
+class TestGetToken:
+    def _oauth_account(self, alias="work", **overrides):
+        defaults = {
+            "auth": "oauth",
+            "provider": "custom",
+            "client_id": "client-id",
+            "client_secret": "client-secret",
+            "token_url": "https://example.com/token",
+        }
+        defaults.update(overrides)
+        return _account(alias, **defaults)
+
+    def test_returns_stored_token_when_not_near_expiry(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
+        acct = self._oauth_account()
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
+        far_future = datetime.now(timezone.utc) + timedelta(hours=1)
+        collector._token_stores["work"].save("fresh-access", "refresh-1", far_future)
+
+        assert collector._get_token(acct) == "fresh-access"
+
+    def test_refreshes_when_near_expiry(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
+        acct = self._oauth_account()
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
+        near_expiry = datetime.now(timezone.utc) + timedelta(minutes=1)
+        collector._token_stores["work"].save("stale-access", "refresh-1", near_expiry)
+
+        def fake_urlopen(req, timeout=30):
+            return _FakeTokenResponse(
+                {"access_token": "new-access", "expires_in": 3600}
+            )
+
+        monkeypatch.setattr(email_mod.urllib.request, "urlopen", fake_urlopen)
+
+        token = collector._get_token(acct)
+
+        assert token == "new-access"
+        stored = collector._token_stores["work"].load()
+        assert stored["access_token"] == "new-access"
+        # Provider omitted refresh_token in the response, so the original is kept.
+        assert stored["refresh_token"] == "refresh-1"
+
+    def test_raises_when_no_tokens_and_no_refresh_possible(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
+        acct = self._oauth_account()
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
+
+        with pytest.raises(EmailTokenError):
+            collector._get_token(acct)
+
+    def test_refresh_does_not_modify_another_accounts_token_file(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
+        acct = self._oauth_account("work")
+        other = self._oauth_account("other")
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct, other]))
+
+        near_expiry = datetime.now(timezone.utc) + timedelta(minutes=1)
+        far_future = datetime.now(timezone.utc) + timedelta(hours=1)
+        collector._token_stores["work"].save("stale-access", "refresh-1", near_expiry)
+        collector._token_stores["other"].save(
+            "other-access", "other-refresh", far_future
+        )
+
+        def fake_urlopen(req, timeout=30):
+            return _FakeTokenResponse(
+                {"access_token": "new-access", "expires_in": 3600}
+            )
+
+        monkeypatch.setattr(email_mod.urllib.request, "urlopen", fake_urlopen)
+
+        collector._get_token(acct)
+
+        other_stored = collector._token_stores["other"].load()
+        assert other_stored["access_token"] == "other-access"
+        assert other_stored["refresh_token"] == "other-refresh"
+
+
+class TestConnectOAuth:
+    def test_oauth_account_uses_oauth2_login(self, monkeypatch):
+        monkeypatch.setattr(imapclient, "IMAPClient", _FakeIMAPClientForConnect)
+        acct = _account("work", auth="oauth", username="work@example.com")
+
+        client = email_mod._connect(acct, token="access-token-123")
+
+        assert client.oauth2_login_calls == [("work@example.com", "access-token-123")]
+        assert client.login_calls == []
+
+    def test_password_account_uses_login(self, monkeypatch):
+        monkeypatch.setattr(imapclient, "IMAPClient", _FakeIMAPClientForConnect)
+        acct = _account("work")
+
+        client = email_mod._connect(acct)
+
+        assert client.login_calls == [("work@example.com", "app-password")]
+        assert client.oauth2_login_calls == []
