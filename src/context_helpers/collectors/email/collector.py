@@ -1,12 +1,8 @@
-"""EmailCollector: fetch messages from IMAP mail accounts.
-
-This is a config/registration-only stub. IMAP fetch logic, OAuth token
-handling, and the router are added in a later phase.
-"""
+"""EmailCollector: fetch messages from IMAP mail accounts."""
 
 from __future__ import annotations
 
-import imapclient  # type: ignore[import-untyped]  # noqa: F401 -- presence check; fetch logic lands in a later phase
+import imapclient  # type: ignore[import-untyped]  # noqa: F401 -- presence check for optional dependency
 from fastapi import APIRouter
 
 from context_helpers.collectors.base import BaseCollector
@@ -14,10 +10,12 @@ from context_helpers.config import EmailConfig
 
 
 class EmailCollector(BaseCollector):
-    name = "email"
-
     def __init__(self, config: EmailConfig) -> None:
         self._config = config
+
+    @property
+    def name(self) -> str:
+        return "email"
 
     def get_router(self) -> APIRouter:
         return APIRouter()

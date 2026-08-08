@@ -1,9 +1,13 @@
-"""Tests for EmailCollector — config-only stub (Phase 1)."""
+"""Tests for EmailCollector."""
 
 from __future__ import annotations
 
-from context_helpers.collectors.email.collector import EmailCollector
-from context_helpers.config import EmailAccountConfig, EmailConfig
+import pytest
+
+pytest.importorskip("imapclient", reason="[email] extra not installed")
+
+from context_helpers.collectors.email.collector import EmailCollector  # noqa: E402
+from context_helpers.config import EmailAccountConfig, EmailConfig  # noqa: E402
 
 
 def _account(alias: str) -> EmailAccountConfig:
