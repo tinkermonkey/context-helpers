@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -193,6 +193,22 @@ class EmailConfig(BaseSettings):
     enabled: bool = False
     accounts: list[EmailAccountConfig] = []
     push_page_size: int = 200
+
+    @field_validator("accounts")
+    @classmethod
+    def _unique_aliases(cls, accounts: list[EmailAccountConfig]) -> list[EmailAccountConfig]:
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for acct in accounts:
+            if acct.alias in seen:
+                duplicates.add(acct.alias)
+            seen.add(acct.alias)
+        if duplicates:
+            raise ValueError(
+                "email.accounts has duplicate alias(es): "
+                f"{', '.join(sorted(duplicates))}. Each account alias must be unique."
+            )
+        return accounts
 
 
 class ContactsConfig(BaseSettings):

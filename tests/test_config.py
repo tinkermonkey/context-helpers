@@ -5,7 +5,12 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from context_helpers.config import AppConfig, EmailAccountConfig, load_config
+from context_helpers.config import (
+    AppConfig,
+    EmailAccountConfig,
+    EmailConfig,
+    load_config,
+)
 from tests.conftest import TEST_API_KEY, write_config
 
 
@@ -209,6 +214,46 @@ class TestEmailConfig:
         with pytest.raises(ValidationError):
             EmailAccountConfig(
                 alias="work", host="imap.example.com", provider="yahoo"
+            )
+
+    def test_duplicate_alias_raises(self):
+        with pytest.raises(ValidationError, match="duplicate"):
+            EmailConfig(
+                enabled=True,
+                accounts=[
+                    EmailAccountConfig(alias="work", host="imap.example.com"),
+                    EmailAccountConfig(alias="work", host="imap.other.com"),
+                ],
+            )
+
+    def test_duplicate_alias_raises_via_load_config(self, tmp_path):
+        p = write_config(
+            tmp_path / "config.yaml",
+            {
+                "collectors": {
+                    "email": {
+                        "enabled": True,
+                        "accounts": [
+                            {"alias": "work", "host": "imap.example.com", "username": "a@example.com"},
+                            {"alias": "work", "host": "imap.other.com", "username": "b@example.com"},
+                        ],
+                    }
+                }
+            },
+        )
+        with pytest.raises(ValidationError, match="duplicate"):
+            load_config(p)
+
+    def test_three_accounts_two_duplicate_aliases_reports_both(self):
+        with pytest.raises(ValidationError, match="alpha, beta"):
+            EmailConfig(
+                enabled=True,
+                accounts=[
+                    EmailAccountConfig(alias="alpha", host="imap.example.com"),
+                    EmailAccountConfig(alias="alpha", host="imap.example.com"),
+                    EmailAccountConfig(alias="beta", host="imap.example.com"),
+                    EmailAccountConfig(alias="beta", host="imap.example.com"),
+                ],
             )
 
     def test_config_loading_rejects_account_missing_required_fields(self, tmp_path):
