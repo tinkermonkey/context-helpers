@@ -192,6 +192,7 @@ class EmailConfig(BaseSettings):
 
     enabled: bool = False
     accounts: list[EmailAccountConfig] = []
+    push_page_size: int = 200
 
 
 class ContactsConfig(BaseSettings):
