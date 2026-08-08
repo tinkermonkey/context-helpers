@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 def register_staleness_metrics(
-    collectors: "list[BaseCollector]", state_store: "StateStore"
+    collectors: list[BaseCollector], state_store: StateStore
 ) -> None:
     """Register observable gauges that report cursor/watermark staleness.
 

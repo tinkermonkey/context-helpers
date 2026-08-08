@@ -9,10 +9,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from context_helpers.collectors.base import PagedCollector
 from context_helpers import telemetry as tel
+from context_helpers.collectors.base import PagedCollector
 
 _tracer = tel.get_tracer("context_helpers.push")
 
@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 _HAS_WATCHDOG = False
 try:
-    from watchdog.observers import Observer  # type: ignore
     from watchdog.events import FileSystemEventHandler  # type: ignore
+    from watchdog.observers import Observer  # type: ignore
     _HAS_WATCHDOG = True
 except ImportError:
     pass
@@ -70,9 +70,9 @@ class PushTrigger:
 
     def __init__(
         self,
-        config: "PushConfig",
-        collectors: list["BaseCollector"],
-        state_store: "StateStore",
+        config: PushConfig,
+        collectors: list[BaseCollector],
+        state_store: StateStore,
     ) -> None:
         self._config = config
         self._collectors = collectors
@@ -80,7 +80,7 @@ class PushTrigger:
         self._stop_event = threading.Event()
         self._pending = threading.Event()   # set by watchdog to wake poll loop early
         self._poll_thread: threading.Thread | None = None
-        self._observer = None
+        self._observer: Any | None = None
         self._consecutive_timeouts: int = 0
 
     def start(self) -> None:
@@ -131,8 +131,8 @@ class PushTrigger:
 
     def _start_file_watcher(self) -> None:
         """Register watchdog handlers for collectors that expose watch_paths()."""
-        from watchdog.observers import Observer
         from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
 
         observer = Observer()
         watched_any = False

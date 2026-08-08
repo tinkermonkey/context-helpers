@@ -9,36 +9,35 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from context_helpers.collectors.browser_history.collector import (
-    BrowserHistoryCollector,
     _APPLE_EPOCH_OFFSET,
     _WINDOWS_EPOCH_OFFSET_US,
-    _fetch_jxa_tabs,
-    _is_blocked_url,
-    _sanitize_url,
-    _safari_ts_to_iso,
-    _firefox_ts_to_iso,
+    BrowserHistoryCollector,
     _chrome_ts_to_iso,
-    _iso_to_safari_ts,
-    _iso_to_firefox_ts,
+    _fetch_jxa_tabs,
+    _firefox_ts_to_iso,
+    _is_blocked_url,
     _iso_to_chrome_ts,
+    _iso_to_firefox_ts,
+    _iso_to_safari_ts,
+    _safari_ts_to_iso,
+    _sanitize_url,
     _visit_id,
 )
 from context_helpers.config import BrowserHistoryConfig
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _collector(**kwargs) -> BrowserHistoryCollector:
-    defaults = dict(
-        enabled=True,
-        safari_enabled=True,
-        firefox_enabled=True,
-        chrome_enabled=True,
-        push_page_size=200,
-        blocklist_domains=[],
-    )
+    defaults = {
+        "enabled": True,
+        "safari_enabled": True,
+        "firefox_enabled": True,
+        "chrome_enabled": True,
+        "push_page_size": 200,
+        "blocklist_domains": [],
+    }
     defaults.update(kwargs)
     return BrowserHistoryCollector(BrowserHistoryConfig(**defaults))
 
@@ -466,6 +465,7 @@ class TestBlocklistBatching:
         False, and delivery crawled one page per poll interval."""
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from context_helpers.collectors import base as base_mod
 
         monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")

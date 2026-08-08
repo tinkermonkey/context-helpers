@@ -14,9 +14,9 @@ from pathlib import Path
 
 from fastapi import APIRouter
 
+from context_helpers import telemetry as tel
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import HealthConfig
-from context_helpers import telemetry as tel
 
 _tracer = tel.get_tracer("context_helpers.collectors.health")
 
@@ -24,9 +24,10 @@ logger = logging.getLogger(__name__)
 
 _HAS_HEALTHKIT = False
 try:
-    from healthkit_to_sqlite.utils import convert_xml_to_sqlite  # type: ignore
-    import sqlite_utils  # type: ignore
     import zipfile as _zipfile
+
+    import sqlite_utils  # type: ignore
+    from healthkit_to_sqlite.utils import convert_xml_to_sqlite  # type: ignore
 
     _HAS_HEALTHKIT = True
 except ImportError:

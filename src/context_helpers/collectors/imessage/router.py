@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from context_helpers.collectors.imessage.collector import iMessageCollector
 
 
-def make_imessage_router(collector: "iMessageCollector") -> APIRouter:
+def make_imessage_router(collector: iMessageCollector) -> APIRouter:
     """Build and return the iMessage router bound to a collector instance."""
     router = APIRouter()
 

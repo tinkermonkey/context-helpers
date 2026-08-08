@@ -9,9 +9,9 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter
 
+from context_helpers import telemetry as tel
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import MusicConfig
-from context_helpers import telemetry as tel
 from context_helpers.telemetry import jxa_span
 
 _tracer = tel.get_tracer("context_helpers.collectors.music")

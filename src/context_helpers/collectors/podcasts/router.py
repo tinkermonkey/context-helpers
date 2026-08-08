@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from context_helpers.collectors.podcasts.collector import PodcastsCollector
 
 
-def make_podcasts_router(collector: "PodcastsCollector") -> APIRouter:
+def make_podcasts_router(collector: PodcastsCollector) -> APIRouter:
     """Build and return the podcasts router bound to a collector instance."""
     router = APIRouter()
 

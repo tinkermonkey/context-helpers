@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import json as _json
 import logging
-from typing import TYPE_CHECKING, Iterator
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
@@ -59,7 +60,7 @@ class FetchRequest(BaseModel):
     stream: bool = False
 
 
-def make_filesystem_router(collector: "FilesystemCollector") -> APIRouter:
+def make_filesystem_router(collector: FilesystemCollector) -> APIRouter:
     """Build and return the filesystem router bound to a collector instance."""
     router = APIRouter()
 
@@ -151,7 +152,7 @@ def make_filesystem_router(collector: "FilesystemCollector") -> APIRouter:
     return router
 
 
-def _ndjson_stream(page_iter: Iterator[dict], collector: "FilesystemCollector") -> Iterator[str]:
+def _ndjson_stream(page_iter: Iterator[dict], collector: FilesystemCollector) -> Iterator[str]:
     """Yield NDJSON lines from iter_page() output, then commit the page cursor.
 
     The page's max seq arrives in THIS iterator's meta sentinel (a per-request

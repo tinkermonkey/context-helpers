@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from context_helpers.collectors.screentime.collector import ScreenTimeCollector
 
 
-def make_screentime_router(collector: "ScreenTimeCollector") -> APIRouter:
+def make_screentime_router(collector: ScreenTimeCollector) -> APIRouter:
     """Build and return the screentime router bound to a collector instance."""
     router = APIRouter()
 

@@ -18,10 +18,11 @@ import os
 import re
 import threading
 import time
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
 
+from context_helpers import telemetry as tel
 from context_helpers.collectors.base import PagedCollector, push_ack_mode
 from context_helpers.collectors.filesystem.convert import (
     CONVERTIBLE_EXTENSIONS,
@@ -29,7 +30,6 @@ from context_helpers.collectors.filesystem.convert import (
 )
 from context_helpers.collectors.filesystem.index import FileIndex, IndexedFile
 from context_helpers.config import FilesystemConfig
-from context_helpers import telemetry as tel
 
 _HAS_MARKITDOWN = False
 try:  # optional [documents] extra
@@ -413,7 +413,7 @@ class FilesystemCollector(PagedCollector):
         """Format *seq* as the opaque wire token for the current index generation."""
         return f"g{self._index.generation()}-{seq}"
 
-    def resolve_after(self, source_ref: "str | None") -> int:
+    def resolve_after(self, source_ref: str | None) -> int:
         """Map an opaque wire cursor to a starting seq against the current index.
 
         - empty → the committed (ack'd) cursor: the crash-recovery floor
@@ -447,7 +447,7 @@ class FilesystemCollector(PagedCollector):
     # Document conversion (PDF / Office / iWork → markdown)
     # ------------------------------------------------------------------
 
-    def _convert_document(self, path: Path) -> "tuple[str | None, str | None]":
+    def _convert_document(self, path: Path) -> tuple[str | None, str | None]:
         """Convert a document to markdown in a timeout-guarded subprocess.
 
         Returns (markdown, None) on success or (None, error) on failure. A

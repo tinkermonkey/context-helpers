@@ -7,6 +7,7 @@ push page would be filtered out forever by the strictly-greater-than cursor
 (`watched_dt <= since`).
 """
 
+import itertools
 import json
 from datetime import datetime
 
@@ -51,14 +52,14 @@ class TestFirstSeenTimestamps:
         parsed = [datetime.fromisoformat(s) for s in stamps]
         assert parsed == sorted(parsed)
         # Strictly increasing (no ties)
-        assert all(a < b for a, b in zip(parsed, parsed[1:]))
+        assert all(a < b for a, b in itertools.pairwise(parsed))
 
     def test_timestamps_assigned_in_discovery_order(self, collector, monkeypatch):
         monkeypatch.setattr(collector, "_run_ytdlp", lambda: _entries(3))
         collector.fetch_history(since=None)
         stamps = [collector._seen[f"vid-{i:03d}"] for i in range(3)]
         parsed = [datetime.fromisoformat(s) for s in stamps]
-        assert all(a < b for a, b in zip(parsed, parsed[1:]))
+        assert all(a < b for a, b in itertools.pairwise(parsed))
 
     def test_existing_cached_timestamps_unchanged(self, collector, monkeypatch):
         cached_ts = "2026-01-01T00:00:00+00:00"
@@ -89,6 +90,7 @@ class TestPushPagingWalk:
         old identical-timestamp behaviour, pages 2+ were empty forever."""
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from context_helpers.collectors import base as base_mod
 
         monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")

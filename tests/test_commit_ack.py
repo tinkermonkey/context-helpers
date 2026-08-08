@@ -243,7 +243,7 @@ class TestKeyedAck:
 # PagedCollector: consume_stash honours commit-ack (reminders/calendar path)
 # ---------------------------------------------------------------------------
 
-from context_helpers.collectors.base import PagedCollector, push_ack_mode  # noqa: E402
+from context_helpers.collectors.base import PagedCollector, push_ack_mode
 
 
 class _PagedStub(PagedCollector):

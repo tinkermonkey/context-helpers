@@ -188,7 +188,7 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
                 # Multi-endpoint: strip the collector-name prefix for display
                 prefix = collector.name + "_"
                 info["endpoints"] = {
-                    (k[len(prefix):] if k.startswith(prefix) else k): {
+                    (k.removeprefix(prefix)): {
                         "cursor": (c.isoformat() if (c := collector.get_push_cursor(k)) else None),
                         "has_more": collector.has_push_more(k),
                     }

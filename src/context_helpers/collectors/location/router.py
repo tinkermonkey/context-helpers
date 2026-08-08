@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 _PUSH_CURSOR_KEY = "location_visits"
 
 
-def make_location_router(collector: "LocationCollector") -> APIRouter:
+def make_location_router(collector: LocationCollector) -> APIRouter:
     """Build and return the location router bound to a collector instance."""
     router = APIRouter()
 

@@ -8,22 +8,21 @@ from unittest.mock import patch
 import pytest
 
 from context_helpers.collectors.screentime.collector import (
-    ScreenTimeCollector,
     _APPLE_EPOCH_OFFSET,
     _CURSOR_APP_USAGE,
-    _appname_from_bundle_id,
+    ScreenTimeCollector,
     _apple_ts_to_iso,
+    _appname_from_bundle_id,
     _datetime_to_apple_ts,
 )
 from context_helpers.config import ScreenTimeConfig
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _collector(**kwargs) -> ScreenTimeCollector:
-    defaults = dict(enabled=True, push_page_size=200, lookback_days=30)
+    defaults = {"enabled": True, "push_page_size": 200, "lookback_days": 30}
     defaults.update(kwargs)
     return ScreenTimeCollector(ScreenTimeConfig(**defaults))
 
@@ -370,6 +369,7 @@ class TestCompleteDayPaging:
         each page ending on a day boundary and has_more correct throughout."""
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from context_helpers.collectors import base as base_mod
 
         monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
@@ -738,6 +738,7 @@ class TestHTTPEndpoints:
 class TestRegistry:
     def test_screentime_registered_when_enabled(self, tmp_config):
         import yaml
+
         from context_helpers.collectors.registry import build_collector_registry
         from context_helpers.config import load_config
 

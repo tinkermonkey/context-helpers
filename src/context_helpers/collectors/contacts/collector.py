@@ -11,9 +11,9 @@ from pathlib import Path
 
 from fastapi import APIRouter
 
+from context_helpers import telemetry as tel
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import ContactsConfig
-from context_helpers import telemetry as tel
 from context_helpers.telemetry import jxa_span
 
 _tracer = tel.get_tracer("context_helpers.collectors.contacts")
@@ -163,8 +163,8 @@ class ContactsCollector(BaseCollector):
             stderr = result.stderr.lower()
             if result.returncode != 0 and ("not authorized" in stderr or "access" in stderr):
                 return [
-                    "Automation permission for Contacts.app "
-                    "(System Settings → Privacy & Security → Automation)"
+                    ("Automation permission for Contacts.app "
+                    "(System Settings → Privacy & Security → Automation)")
                 ]
             return []
         except (subprocess.TimeoutExpired, FileNotFoundError):

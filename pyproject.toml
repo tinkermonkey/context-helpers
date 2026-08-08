@@ -92,6 +92,14 @@ ignore_missing_imports = true
 module = "yt_dlp.*"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = "imapclient.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "watchdog.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]   # "." makes `tests/` importable as a package (for conftest imports)
 testpaths = ["tests"]

@@ -9,22 +9,21 @@ from unittest.mock import patch
 import pytest
 
 from context_helpers.collectors.location.collector import (
-    LocationCollector,
     _APPLE_EPOCH_OFFSET,
     _PUSH_CURSOR_KEY,
+    LocationCollector,
     _apple_ts_to_iso,
     _datetime_to_apple_ts,
     _duration_minutes,
 )
 from context_helpers.config import LocationConfig
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _collector(**kwargs) -> LocationCollector:
-    defaults = dict(enabled=True, push_page_size=200, lookback_days=90)
+    defaults = {"enabled": True, "push_page_size": 200, "lookback_days": 90}
     defaults.update(kwargs)
     return LocationCollector(LocationConfig(**defaults))
 
@@ -258,6 +257,7 @@ class TestFetchVisitsIncremental:
         False, and delivery crawled one page per poll interval."""
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from context_helpers.collectors import base as base_mod
 
         monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
@@ -502,8 +502,9 @@ class TestHTTPEndpoints:
 class TestRegistry:
     def test_location_registered_when_enabled(self, tmp_config):
         import yaml
-        from context_helpers.config import load_config
+
         from context_helpers.collectors.registry import build_collector_registry
+        from context_helpers.config import load_config
 
         # Patch config to enable location (db path doesn't need to exist for registry)
         raw = yaml.safe_load(tmp_config.read_text())
@@ -516,8 +517,8 @@ class TestRegistry:
         assert "location" in names
 
     def test_location_absent_when_disabled(self, tmp_config):
-        from context_helpers.config import load_config
         from context_helpers.collectors.registry import build_collector_registry
+        from context_helpers.config import load_config
 
         cfg = load_config(tmp_config)
         collectors = build_collector_registry(cfg)

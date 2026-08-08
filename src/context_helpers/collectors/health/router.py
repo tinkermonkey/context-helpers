@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from context_helpers.collectors.health.collector import HealthCollector
 
 
-def make_health_router(collector: "HealthCollector") -> APIRouter:
+def make_health_router(collector: HealthCollector) -> APIRouter:
     """Build and return the health router bound to a collector instance."""
     router = APIRouter()
 

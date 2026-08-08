@@ -7,21 +7,20 @@ from pathlib import Path
 import pytest
 
 from context_helpers.collectors.calendar.collector import (
-    CalendarCollector,
     _APPLE_EPOCH_OFFSET,
+    CalendarCollector,
     _apple_ts_to_datetime,
     _datetime_to_apple_ts,
     _parse_recurrence,
 )
 from context_helpers.config import CalendarConfig
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _collector(**kwargs) -> CalendarCollector:
-    defaults = dict(enabled=True, past_days=90, future_days=60, push_page_size=200)
+    defaults = {"enabled": True, "past_days": 90, "future_days": 60, "push_page_size": 200}
     defaults.update(kwargs)
     return CalendarCollector(CalendarConfig(**defaults))
 

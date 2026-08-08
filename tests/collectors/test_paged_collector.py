@@ -6,9 +6,7 @@ import json
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-
 from context_helpers.collectors.base import PagedCollector
-
 
 # ---------------------------------------------------------------------------
 # Concrete subclass for testing

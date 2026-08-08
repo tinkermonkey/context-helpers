@@ -34,8 +34,8 @@ def minimal_pdf(text: str = "Quarterly report for Linkage Labs") -> bytes:
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-        b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>"),
         None,
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
@@ -251,7 +251,7 @@ class TestCollectorConversion:
     def test_conversion_cached_and_reused(self, tmp_path, monkeypatch):
         (tmp_path / "report.pdf").write_bytes(minimal_pdf("Cache me once"))
         c = _collector(tmp_path)
-        items, _, page_max = _fetch_all(c)
+        items, _, _page_max = _fetch_all(c)
         assert "Cache me once" in items[0]["markdown"]
 
         # Second serve from cursor 0 must come from the cache — no subprocess.

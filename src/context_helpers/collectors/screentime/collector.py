@@ -217,9 +217,9 @@ class ScreenTimeCollector(BaseCollector):
             return []
         except Exception:
             return [
-                f"Read access to {self._db_path} "
+                (f"Read access to {self._db_path} "
                 "(grant Full Disk Access to Terminal in "
-                "System Settings → Privacy & Security)"
+                "System Settings → Privacy & Security)")
             ]
 
     # ------------------------------------------------------------------

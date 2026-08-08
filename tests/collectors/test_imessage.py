@@ -11,7 +11,6 @@ from context_helpers.collectors.imessage.collector import (
 )
 from context_helpers.config import iMessageConfig
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

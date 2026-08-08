@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import imapclient  # type: ignore[import-untyped]  # noqa: F401 -- presence check for optional dependency
+import imapclient  # type: ignore[import-untyped,import-not-found]  # noqa: F401 -- presence check for optional dependency
 from fastapi import APIRouter
 
 from context_helpers.collectors.base import BaseCollector

@@ -188,8 +188,8 @@ class RemindersCollector(PagedCollector):
             return []
         except Exception:
             return [
-                f"Read access to Reminders database in {_REMINDERS_STORE_DIR} "
-                "(grant Full Disk Access to Terminal in System Settings → Privacy & Security)"
+                (f"Read access to Reminders database in {_REMINDERS_STORE_DIR} "
+                "(grant Full Disk Access to Terminal in System Settings → Privacy & Security)")
             ]
 
     def watch_paths(self) -> list[Path]:

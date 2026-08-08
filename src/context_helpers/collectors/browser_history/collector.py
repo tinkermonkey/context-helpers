@@ -46,9 +46,9 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from fastapi import APIRouter
 
+from context_helpers import telemetry as tel
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import BrowserHistoryConfig
-from context_helpers import telemetry as tel
 from context_helpers.telemetry import jxa_span
 
 _tracer = tel.get_tracer("context_helpers.collectors.browser_history")
@@ -557,7 +557,7 @@ class BrowserHistoryCollector(BaseCollector):
         self,
         conn: sqlite3.Connection,
         query: str,
-        after_ts: "float | int | None",
+        after_ts: float | None,
         ts_column: str,
         ts_to_iso,
         browser: str,

@@ -240,9 +240,9 @@ class CalendarCollector(PagedCollector):
             return []
         except Exception:
             return [
-                f"Read access to Calendar Cache at {self._db_path} "
+                (f"Read access to Calendar Cache at {self._db_path} "
                 "(grant Full Disk Access to Terminal in "
-                "System Settings → Privacy & Security)"
+                "System Settings → Privacy & Security)")
             ]
 
     # ------------------------------------------------------------------

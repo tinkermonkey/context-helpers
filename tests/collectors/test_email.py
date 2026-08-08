@@ -6,8 +6,8 @@ import pytest
 
 pytest.importorskip("imapclient", reason="[email] extra not installed")
 
-from context_helpers.collectors.email.collector import EmailCollector  # noqa: E402
-from context_helpers.config import EmailAccountConfig, EmailConfig  # noqa: E402
+from context_helpers.collectors.email.collector import EmailCollector
+from context_helpers.config import EmailAccountConfig, EmailConfig
 
 
 def _account(alias: str) -> EmailAccountConfig:

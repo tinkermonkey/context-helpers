@@ -32,9 +32,9 @@ from pathlib import Path
 
 from fastapi import APIRouter
 
+from context_helpers import telemetry as tel
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import LocationConfig
-from context_helpers import telemetry as tel
 
 _tracer = tel.get_tracer("context_helpers.collectors.location")
 
@@ -214,9 +214,9 @@ class LocationCollector(BaseCollector):
             return []
         except Exception:
             return [
-                f"Read access to {self._db_path} "
+                (f"Read access to {self._db_path} "
                 "(grant Full Disk Access to Terminal in "
-                "System Settings → Privacy & Security)"
+                "System Settings → Privacy & Security)")
             ]
 
     # ------------------------------------------------------------------

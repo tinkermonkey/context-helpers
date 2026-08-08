@@ -11,10 +11,10 @@ import pytest
 from fastapi import APIRouter
 
 from context_helpers.collectors.oura.collector import (
-    OuraCollector,
-    OuraTokenStore,
     _DEFAULT_LOOKBACK_DAYS,
     _EXPIRY_BUFFER_MINUTES,
+    OuraCollector,
+    OuraTokenStore,
 )
 from context_helpers.config import OuraConfig
 

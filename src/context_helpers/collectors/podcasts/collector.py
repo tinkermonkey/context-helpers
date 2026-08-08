@@ -42,9 +42,9 @@ from pathlib import Path
 
 from fastapi import APIRouter
 
+from context_helpers import telemetry as tel
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import PodcastsConfig
-from context_helpers import telemetry as tel
 from context_helpers.telemetry import subprocess_span
 
 _tracer = tel.get_tracer("context_helpers.collectors.podcasts")
@@ -583,8 +583,8 @@ class PodcastsCollector(BaseCollector):
             return []
         except Exception:
             return [
-                f"Read access to Podcasts database at {self._db_path} "
-                "(ensure Podcasts.app has synced at least once)"
+                (f"Read access to Podcasts database at {self._db_path} "
+                "(ensure Podcasts.app has synced at least once)")
             ]
 
     # ------------------------------------------------------------------
