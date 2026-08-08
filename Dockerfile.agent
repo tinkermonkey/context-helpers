@@ -28,8 +28,7 @@ COPY pyproject.toml ./
 RUN mkdir -p src/context_helpers && \
     touch src/context_helpers/__init__.py && \
     pip install --no-cache-dir \
-        -e ".[dev,server,telemetry,email,documents,push,obsidian,youtube]" \
-        types-PyYAML && \
+        -e ".[dev,server,telemetry,email,documents,push,obsidian,youtube]" && \
     rm -rf src/
 
 # ============================================================================
@@ -42,6 +41,12 @@ USER orchestrator
 # ============================================================================
 RUN claude --version && \
     git --version && \
-    gh --version
+    gh --version && \
+    python3 -c "\
+from opentelemetry import trace, metrics; \
+from opentelemetry.sdk.trace import TracerProvider; \
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor; \
+import fastapi, uvicorn, yaml, click, jinja2, markitdown; \
+print('Python imports OK')"
 
 CMD ["/bin/bash"]

@@ -45,6 +45,7 @@ dev = [
     "httpx",
     "ruff",
     "mypy",
+    "types-PyYAML",
     "xlwt",  # writes legacy .xls test fixtures
     # needed to import server/auth/cli without installing extras
     "fastapi",
