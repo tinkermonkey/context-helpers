@@ -65,6 +65,33 @@ context-helpers = "context_helpers.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/context_helpers"]
 
+[tool.mypy]
+ignore_missing_imports = false
+
+[[tool.mypy.overrides]]
+module = "mlx_whisper"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "obsidiantools.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "frontmatter"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "healthkit_to_sqlite.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "apple_notes_to_sqlite.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "yt_dlp.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]   # "." makes `tests/` importable as a package (for conftest imports)
 testpaths = ["tests"]

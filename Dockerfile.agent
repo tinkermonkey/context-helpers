@@ -1,0 +1,47 @@
+# ============================================================================
+# context-helpers agent environment
+# ============================================================================
+FROM switchyard-orchestrator:latest
+
+USER root
+
+# ============================================================================
+# System dependencies
+# ============================================================================
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        libffi-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# ============================================================================
+# Python dependencies — pre-install all extras used by dev/CI
+# Source code is mounted at runtime; only install dependencies here.
+# ============================================================================
+WORKDIR /workspace/context-helpers
+
+COPY pyproject.toml ./
+
+# Create a minimal src layout so pip can resolve the editable install,
+# then remove the stub after deps are cached.
+RUN mkdir -p src/context_helpers && \
+    touch src/context_helpers/__init__.py && \
+    pip install --no-cache-dir \
+        -e ".[dev,server,telemetry,email,documents,push,obsidian,youtube]" \
+        types-PyYAML && \
+    rm -rf src/
+
+# ============================================================================
+# Switch to runtime user
+# ============================================================================
+USER orchestrator
+
+# ============================================================================
+# Verification
+# ============================================================================
+RUN claude --version && \
+    git --version && \
+    gh --version
+
+CMD ["/bin/bash"]
