@@ -258,6 +258,7 @@ class EmailCollector(BaseCollector):
         with _tracer.start_as_current_span("email.fetch_messages") as span:
             span.set_attribute("email.account", account.alias)
             messages: list[dict] = []
+            failure_cutoffs: list[datetime] = []
             try:
                 token = self._get_token(account) if account.auth == "oauth" else None
                 with _connect(account, token) as client:
@@ -265,11 +266,12 @@ class EmailCollector(BaseCollector):
                         remaining = limit - len(messages)
                         if remaining <= 0:
                             break
-                        messages.extend(
-                            self._fetch_folder_messages(
-                                client, account, folder, since_dt, remaining
-                            )
+                        folder_messages, failure_cutoff = self._fetch_folder_messages(
+                            client, account, folder, since_dt, remaining
                         )
+                        messages.extend(folder_messages)
+                        if failure_cutoff is not None:
+                            failure_cutoffs.append(failure_cutoff)
             except (
                 imapclient.exceptions.IMAPClientError,
                 OSError,
@@ -282,6 +284,20 @@ class EmailCollector(BaseCollector):
                 tel._set_error(span)
                 return []
 
+            if failure_cutoffs:
+                # A FETCH batch failed partway through a folder. The push
+                # cursor is a single per-account watermark shared across all
+                # folders, so any message timestamped after the earliest
+                # failure point must be withheld this cycle — otherwise the
+                # cursor would advance past the unfetched batch and those
+                # messages would fall before `since` forever.
+                cutoff = min(failure_cutoffs)
+                messages = [
+                    m
+                    for m in messages
+                    if datetime.fromisoformat(m["timestamp"]) <= cutoff
+                ]
+
             messages.sort(key=lambda m: m["timestamp"])
             span.set_attribute("email.messages_fetched", len(messages))
             return messages[:limit]
@@ -293,14 +309,25 @@ class EmailCollector(BaseCollector):
         folder: str,
         since_dt: datetime,
         remaining: int,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], datetime | None]:
+        """Fetch messages from one folder.
+
+        Returns (messages, failure_cutoff). failure_cutoff is None when the
+        folder was fully processed (or skipped outright on a select/search
+        error, which contributes no messages either way). If a FETCH batch
+        fails partway through, failure_cutoff is set to the INTERNALDATE of
+        the last message actually retrieved before the failure (or since_dt
+        if none were) — the caller must not let the push cursor advance past
+        it, or the unfetched batch's messages would permanently fall before
+        the next cycle's `since`.
+        """
         try:
             client.select_folder(folder, readonly=True)
         except imapclient.exceptions.IMAPClientError as e:
             logger.warning(
                 "email: cannot select folder %r for %s: %s", folder, account.alias, e
             )
-            return []
+            return [], None
 
         try:
             uids = sorted(client.search(["SINCE", since_dt.date()]))
@@ -308,9 +335,10 @@ class EmailCollector(BaseCollector):
             logger.warning(
                 "email: search failed in %r for %s: %s", folder, account.alias, e
             )
-            return []
+            return [], None
 
         results: list[dict] = []
+        last_good_dt = since_dt
         for batch_start in range(0, len(uids), _FETCH_BATCH_SIZE):
             if len(results) >= remaining:
                 break
@@ -324,7 +352,7 @@ class EmailCollector(BaseCollector):
                     account.alias,
                     e,
                 )
-                continue
+                return results, last_good_dt
             for uid in batch:
                 data = response.get(uid)
                 if not data:
@@ -336,10 +364,11 @@ class EmailCollector(BaseCollector):
                 message = _build_message(account, folder, uid, raw, internal_date)
                 if message is not None:
                     results.append(message)
+                    last_good_dt = max(last_good_dt, internal_date)
                 if len(results) >= remaining:
                     break
 
-        return results
+        return results, None
 
     # ------------------------------------------------------------------
     # Token management
@@ -598,6 +627,7 @@ def _build_message(
     is_from_me = bool(account.username) and sender.lower() == account.username.lower()
 
     return {
+        "id": message_id,
         "message_id": message_id,
         "thread_id": thread_id,
         "sender": sender,

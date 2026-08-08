@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
@@ -74,6 +75,7 @@ class FakeIMAPClient:
         fail_select=frozenset(),
         fail_search=frozenset(),
         fail_fetch=frozenset(),
+        fail_fetch_after=None,
     ):
         self.folders_data = folders_data or {}
         self.uidnext = uidnext
@@ -81,6 +83,10 @@ class FakeIMAPClient:
         self.fail_select = fail_select
         self.fail_search = fail_search
         self.fail_fetch = fail_fetch
+        # {folder: n} - the folder's (n+1)-th fetch() call raises, letting
+        # tests simulate a batch failing partway through a folder's uids.
+        self.fail_fetch_after = fail_fetch_after or {}
+        self._fetch_calls: dict = {}
 
     def __enter__(self):
         return self
@@ -104,6 +110,12 @@ class FakeIMAPClient:
         if self.selected in self.fail_fetch:
             raise imapclient.exceptions.IMAPClientError(
                 f"fetch failed: {self.selected}"
+            )
+        call_count = self._fetch_calls.get(self.selected, 0)
+        self._fetch_calls[self.selected] = call_count + 1
+        if call_count >= self.fail_fetch_after.get(self.selected, float("inf")):
+            raise imapclient.exceptions.IMAPClientError(
+                f"fetch batch failed: {self.selected}"
             )
         folder_msgs = self.folders_data.get(self.selected, {})
         return {uid: folder_msgs[uid] for uid in uids if uid in folder_msgs}
@@ -318,6 +330,7 @@ class TestBuildMessage:
         raw = _raw_message()
         msg = _build_message(acct, "INBOX", 10, raw, self._ts())
         expected_keys = {
+            "id",
             "thread_id",
             "message_id",
             "sender",
@@ -335,6 +348,15 @@ class TestBuildMessage:
         assert isinstance(msg["recipients"], list)
         assert isinstance(msg["is_thread_root"], bool)
         assert isinstance(msg["is_from_me"], bool)
+
+    def test_id_matches_message_id_for_dedup(self):
+        # Every collector emits "id" as the downstream dedup key (calendar,
+        # reminders, oura, location, browser_history, notes, imessage); email
+        # must too, so the future EmailAdapter can dedup consistently.
+        acct = _account("work")
+        raw = _raw_message(message_id="<dedup-key@example.com>")
+        msg = _build_message(acct, "INBOX", 12, raw, self._ts())
+        assert msg["id"] == "<dedup-key@example.com>" == msg["message_id"]
 
     @pytest.mark.parametrize(
         "in_reply_to,references",
@@ -428,6 +450,48 @@ class TestFetchMessages:
 
         assert len(results) == 1
         assert results[0]["message_id"] == "<archive@example.com>"
+
+    def test_batch_failure_does_not_advance_past_unfetched_messages(self, monkeypatch):
+        # INBOX has more uids than one FETCH batch: the first batch succeeds,
+        # the second raises. Archive has a single, later-timestamped message
+        # that fetches fine. Because the push cursor is one watermark shared
+        # across all of an account's folders, Archive's later message must be
+        # withheld this cycle too - otherwise the cursor would jump past the
+        # INBOX messages that were never fetched, losing them forever.
+        acct = _account("work", folders=["INBOX", "Archive"])
+        inbox_data = {}
+        for i in range(email_mod._FETCH_BATCH_SIZE + 10):
+            inbox_data[i] = {
+                b"ENVELOPE": None,
+                b"BODY[]": _raw_message(message_id=f"<inbox{i}@example.com>"),
+                b"INTERNALDATE": datetime(2024, 1, 1, tzinfo=timezone.utc)
+                + timedelta(days=i, hours=12),
+            }
+        archive_msg = {
+            b"ENVELOPE": None,
+            b"BODY[]": _raw_message(message_id="<archive@example.com>"),
+            b"INTERNALDATE": datetime(2024, 1, 1, tzinfo=timezone.utc)
+            + timedelta(days=1000),
+        }
+        fake = FakeIMAPClient(
+            folders_data={"INBOX": inbox_data, "Archive": {1: archive_msg}},
+            fail_fetch_after={"INBOX": 1},
+        )
+        monkeypatch.setattr(email_mod, "_connect", lambda account, token=None: fake)
+
+        collector = EmailCollector(
+            EmailConfig(enabled=True, accounts=[acct], push_page_size=1000)
+        )
+        results = collector.fetch_messages(acct, "2020-01-01T00:00:00+00:00")
+
+        # Only the first, successfully-fetched INBOX batch is returned.
+        assert len(results) == email_mod._FETCH_BATCH_SIZE
+        assert all("archive" not in m["message_id"] for m in results)
+        returned_uids = {
+            int(re.fullmatch(r"<inbox(\d+)@example\.com>", m["message_id"]).group(1))
+            for m in results
+        }
+        assert returned_uids == set(range(email_mod._FETCH_BATCH_SIZE))
 
     def test_connect_failure_returns_empty_list(self, monkeypatch):
         acct = _account("work")
