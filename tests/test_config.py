@@ -3,8 +3,9 @@
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
-from context_helpers.config import AppConfig, load_config
+from context_helpers.config import AppConfig, EmailAccountConfig, load_config
 from tests.conftest import TEST_API_KEY, write_config
 
 
@@ -191,3 +192,36 @@ class TestEmailConfig:
         assert account.folders == ["INBOX"]
         assert account.exclude_folders == []
         assert account.initial_lookback_days == 30
+
+    def test_missing_alias_raises(self):
+        with pytest.raises(ValidationError, match="alias"):
+            EmailAccountConfig(host="imap.example.com")
+
+    def test_missing_host_raises(self):
+        with pytest.raises(ValidationError, match="host"):
+            EmailAccountConfig(alias="work")
+
+    def test_invalid_auth_literal_raises(self):
+        with pytest.raises(ValidationError):
+            EmailAccountConfig(alias="work", host="imap.example.com", auth="carrier-pigeon")
+
+    def test_invalid_provider_literal_raises(self):
+        with pytest.raises(ValidationError):
+            EmailAccountConfig(
+                alias="work", host="imap.example.com", provider="yahoo"
+            )
+
+    def test_config_loading_rejects_account_missing_required_fields(self, tmp_path):
+        p = write_config(
+            tmp_path / "config.yaml",
+            {
+                "collectors": {
+                    "email": {
+                        "enabled": True,
+                        "accounts": [{"alias": "work"}],  # missing required host
+                    }
+                }
+            },
+        )
+        with pytest.raises(ValidationError, match="host"):
+            load_config(p)

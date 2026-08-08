@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -109,6 +111,64 @@ class FakeIMAPClient:
     def folder_status(self, folder, what):
         return {
             b"UIDNEXT": self.uidnext,
+            b"MESSAGES": len(self.folders_data.get(folder, {})),
+        }
+
+
+class ScriptedIMAPClient:
+    """Full stand-in for imapclient.IMAPClient, patched in place of the real
+    class (not `_connect`) so integration tests exercise the whole
+    connect -> authenticate -> search -> fetch pipeline.
+
+    imapclient.IMAPClient is constructed fresh per `_connect()` call, so
+    per-account behaviour is looked up from `_sessions` by host at
+    construction time. Tests set `_sessions` via monkeypatch.setattr so it is
+    restored automatically.
+    """
+
+    _sessions: ClassVar[dict] = {}
+
+    def __init__(self, host, port=993, ssl=True, ssl_context=None):
+        self.host = host
+        self.selected = None
+        session = self._sessions.get(host, {})
+        self.folders_data = session.get("folders_data", {})
+        self.fail_login = session.get("fail_login", False)
+        self.login_calls: list = []
+        self.oauth2_login_calls: list = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def login(self, username, password):
+        if self.fail_login:
+            raise imapclient.exceptions.LoginError("bad credentials")
+        self.login_calls.append((username, password))
+
+    def oauth2_login(self, user, token, mech="XOAUTH2", vendor=None):
+        if self.fail_login:
+            raise imapclient.exceptions.LoginError("bad token")
+        self.oauth2_login_calls.append((user, token))
+
+    def shutdown(self):
+        pass
+
+    def select_folder(self, folder, readonly=False):
+        self.selected = folder
+
+    def search(self, criteria):
+        return list(self.folders_data.get(self.selected, {}).keys())
+
+    def fetch(self, uids, data):
+        folder_msgs = self.folders_data.get(self.selected, {})
+        return {uid: folder_msgs[uid] for uid in uids if uid in folder_msgs}
+
+    def folder_status(self, folder, what):
+        return {
+            b"UIDNEXT": 1,
             b"MESSAGES": len(self.folders_data.get(folder, {})),
         }
 
@@ -251,6 +311,49 @@ class TestBuildMessage:
         msg = _build_message(acct, "INBOX", 9, raw, ts)
         assert msg["timestamp"] == "2024-03-15T12:30:00+00:00"
 
+    def test_field_mapping_has_all_message_metadata_keys(self):
+        # Matches context-library's MessageMetadata field set exactly, so the
+        # dict is deserializable on the receiving end.
+        acct = _account("work")
+        raw = _raw_message()
+        msg = _build_message(acct, "INBOX", 10, raw, self._ts())
+        expected_keys = {
+            "thread_id",
+            "message_id",
+            "sender",
+            "recipients",
+            "timestamp",
+            "subject",
+            "in_reply_to",
+            "is_thread_root",
+            "is_from_me",
+            "text",
+            "folder",
+            "account",
+        }
+        assert expected_keys <= msg.keys()
+        assert isinstance(msg["recipients"], list)
+        assert isinstance(msg["is_thread_root"], bool)
+        assert isinstance(msg["is_from_me"], bool)
+
+    @pytest.mark.parametrize(
+        "in_reply_to,references",
+        [
+            (None, None),
+            ("<mid@example.com>", None),
+            ("<mid@example.com>", "<root@example.com> <mid@example.com>"),
+        ],
+    )
+    def test_is_thread_root_and_in_reply_to_are_mutually_exclusive(
+        self, in_reply_to, references
+    ):
+        # Mirrors context-library's MessageMetadata invariant: is_thread_root=True
+        # and in_reply_to must never both hold.
+        acct = _account("work")
+        raw = _raw_message(in_reply_to=in_reply_to, references=references)
+        msg = _build_message(acct, "INBOX", 11, raw, self._ts())
+        assert msg["is_thread_root"] != (msg["in_reply_to"] is not None)
+
 
 class TestFetchMessages:
     def test_oauth_account_without_tokens_returns_empty_list(
@@ -341,6 +444,115 @@ class TestFetchMessages:
         acct = _account("work", folders=["Sent"], exclude_folders=["Sent"])
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
         assert collector.fetch_messages(acct, None) == []
+
+
+class TestFetchMessagesFullPipeline:
+    """Integration tests through the real _connect()/imapclient.IMAPClient,
+    covering connect -> authenticate -> search -> fetch -> parse -> shape for
+    both the password and oauth auth branches.
+    """
+
+    def _msg_data(self, message_id, ts):
+        return {
+            b"ENVELOPE": None,
+            b"BODY[]": _raw_message(message_id=message_id),
+            b"INTERNALDATE": ts,
+        }
+
+    def test_password_auth_branch_full_pipeline(self, monkeypatch):
+        monkeypatch.setattr(imapclient, "IMAPClient", ScriptedIMAPClient)
+        monkeypatch.setattr(
+            ScriptedIMAPClient,
+            "_sessions",
+            {
+                "imap.example.com": {
+                    "folders_data": {
+                        "INBOX": {
+                            1: self._msg_data(
+                                "<pw@example.com>",
+                                datetime(2024, 6, 1, tzinfo=timezone.utc),
+                            )
+                        }
+                    },
+                }
+            },
+        )
+        acct = _account("work")  # auth="password" by default
+
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
+        results = collector.fetch_messages(acct, "2024-01-01T00:00:00+00:00")
+
+        assert len(results) == 1
+        assert results[0]["message_id"] == "<pw@example.com>"
+
+    def test_oauth_auth_branch_full_pipeline(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
+        monkeypatch.setattr(imapclient, "IMAPClient", ScriptedIMAPClient)
+        monkeypatch.setattr(
+            ScriptedIMAPClient,
+            "_sessions",
+            {
+                "imap.example.com": {
+                    "folders_data": {
+                        "INBOX": {
+                            1: self._msg_data(
+                                "<oauth@example.com>",
+                                datetime(2024, 6, 1, tzinfo=timezone.utc),
+                            )
+                        }
+                    },
+                }
+            },
+        )
+        acct = _account("work", auth="oauth")
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
+        far_future = datetime.now(timezone.utc) + timedelta(hours=1)
+        collector._token_stores["work"].save("valid-access", "refresh-1", far_future)
+
+        results = collector.fetch_messages(acct, "2024-01-01T00:00:00+00:00")
+
+        assert len(results) == 1
+        assert results[0]["message_id"] == "<oauth@example.com>"
+
+    def test_login_failure_on_one_account_does_not_affect_another(
+        self, monkeypatch, tmp_path
+    ):
+        import context_helpers.collectors.base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path)
+        monkeypatch.setattr(imapclient, "IMAPClient", ScriptedIMAPClient)
+        work_acct = _account("work", host="imap-work.example.com")
+        broken_acct = _account("broken", host="imap-broken.example.com")
+        monkeypatch.setattr(
+            ScriptedIMAPClient,
+            "_sessions",
+            {
+                "imap-work.example.com": {
+                    "folders_data": {
+                        "INBOX": {
+                            1: self._msg_data(
+                                "<work@example.com>",
+                                datetime(2024, 6, 1, tzinfo=timezone.utc),
+                            )
+                        }
+                    },
+                },
+                "imap-broken.example.com": {"fail_login": True},
+            },
+        )
+
+        collector = EmailCollector(
+            EmailConfig(enabled=True, accounts=[work_acct, broken_acct])
+        )
+
+        work_results = collector.fetch_messages(work_acct, "2024-01-01T00:00:00+00:00")
+        broken_results = collector.fetch_messages(
+            broken_acct, "2024-01-01T00:00:00+00:00"
+        )
+
+        assert len(work_results) == 1
+        assert work_results[0]["message_id"] == "<work@example.com>"
+        assert broken_results == []
 
 
 class TestHasChangesSince:
@@ -550,6 +762,60 @@ class TestRouter:
         assert work_cursor is not None
         assert personal_cursor is not None
 
+    def test_login_failure_on_one_account_does_not_block_or_advance_cursor(
+        self, monkeypatch, tmp_path
+    ):
+        # End-to-end via the real _connect()/imapclient.IMAPClient path (not a
+        # monkeypatched fetch_messages): a broken account's login failure must
+        # not block the working account's delivery, and must not advance the
+        # broken account's own cursor.
+        import context_helpers.collectors.base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path)
+        monkeypatch.setattr(imapclient, "IMAPClient", ScriptedIMAPClient)
+        # No push cursor exists yet, so the router falls back to each account's
+        # initial_lookback_days rather than the query-string `since` — use a
+        # wide lookback so a fixed message date is always within range.
+        work_acct = _account(
+            "work", host="imap-work.example.com", initial_lookback_days=3650
+        )
+        broken_acct = _account(
+            "broken", host="imap-broken.example.com", initial_lookback_days=3650
+        )
+        monkeypatch.setattr(
+            ScriptedIMAPClient,
+            "_sessions",
+            {
+                "imap-work.example.com": {
+                    "folders_data": {
+                        "INBOX": {
+                            1: {
+                                b"ENVELOPE": None,
+                                b"BODY[]": _raw_message(message_id="<work@example.com>"),
+                                b"INTERNALDATE": datetime(
+                                    2024, 6, 1, tzinfo=timezone.utc
+                                ),
+                            }
+                        }
+                    },
+                },
+                "imap-broken.example.com": {"fail_login": True},
+            },
+        )
+        collector = EmailCollector(
+            EmailConfig(enabled=True, accounts=[work_acct, broken_acct])
+        )
+        client = self._app_client(collector)
+
+        resp = client.get("/email/messages")
+
+        assert resp.status_code == 200
+        items = resp.json()
+        assert len(items) == 1
+        assert items[0]["message_id"] == "<work@example.com>"
+        assert collector.get_push_cursor("email:work") is not None
+        assert collector.get_push_cursor("email:broken") is None
+
 
 class _FakeTokenResponse:
     def __init__(self, payload):
@@ -609,6 +875,36 @@ class TestEmailTokenStore:
         assert work._path != personal._path
         assert work.load()["access_token"] == "work-access"
         assert personal.load()["access_token"] == "personal-access"
+
+    def test_save_leaves_no_leftover_tmp_file(self, tmp_path):
+        path = tmp_path / "work_tokens.json"
+        store = EmailTokenStore("work", path=path)
+        store.save("access-1", "refresh-1", datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+        assert path.exists()
+        assert not path.with_suffix(".tmp").exists()
+
+    def test_save_overwrite_is_atomic_via_rename(self, tmp_path, monkeypatch):
+        # save() must write to a temp file and rename it into place, never
+        # truncate the destination in place — otherwise a crash mid-write
+        # would leave a corrupt/partial token file.
+        path = tmp_path / "work_tokens.json"
+        store = EmailTokenStore("work", path=path)
+        expires_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        store.save("first-access", "first-refresh", expires_at)
+
+        real_replace = Path.replace
+        rename_calls = []
+
+        def spy_replace(self, target):
+            rename_calls.append((str(self), str(target)))
+            return real_replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", spy_replace)
+        store.save("second-access", "second-refresh", expires_at)
+
+        assert rename_calls == [(str(path.with_suffix(".tmp")), str(path))]
+        assert store.load()["access_token"] == "second-access"
 
 
 class TestResolveOauthSettings:
