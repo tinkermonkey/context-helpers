@@ -36,19 +36,35 @@ def _patch_db(collector: CalendarCollector, db_path: Path) -> None:
     collector._db_path = db_path
 
 
-# Today for seeding fixtures: 2026-03-27 (matches CLAUDE.md currentDate).
-# Events must fall within the 90-day past / 60-day future default window
-# relative to this date so the window-mode tests pass without mocking datetime.
-_TODAY = "2026-03-27"
-_RECENT = f"{_TODAY}T10:00:00+00:00"        # in window (today)
-_PAST_IN_WINDOW = "2026-01-15T09:00:00+00:00"  # ~71 days ago — in window
-_OLD_PAST = "2024-01-01T00:00:00+00:00"     # >90 days ago — outside window
-_FUTURE_IN_WINDOW = "2026-05-01T14:00:00+00:00"  # ~35 days ahead — in window
-_FUTURE_OUTSIDE = "2026-08-01T00:00:00+00:00"    # >60 days ahead — outside window
+# Fixture dates are computed relative to the real wall clock at test-run time
+# (rather than hardcoded) since the collector's window query is built from
+# datetime.now(). Events must fall within the 90-day past / 60-day future
+# default window relative to "now" so the window-mode tests pass without
+# mocking datetime.
+_NOW = datetime.now(timezone.utc)
 
-_MOD_EARLY = "2026-03-20T08:00:00+00:00"
-_MOD_MID   = "2026-03-25T08:00:00+00:00"
-_MOD_LATE  = "2026-03-27T08:00:00+00:00"
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+_RECENT = _iso(_NOW.replace(hour=10, minute=0, second=0, microsecond=0))  # in window (today)
+_PAST_IN_WINDOW = _iso(
+    (_NOW - timedelta(days=71)).replace(hour=9, minute=0, second=0, microsecond=0)
+)  # ~71 days ago — in window
+_OLD_PAST = _iso(
+    (_NOW - timedelta(days=800)).replace(hour=0, minute=0, second=0, microsecond=0)
+)  # >90 days ago — outside window
+_FUTURE_IN_WINDOW = _iso(
+    (_NOW + timedelta(days=35)).replace(hour=14, minute=0, second=0, microsecond=0)
+)  # ~35 days ahead — in window
+_FUTURE_OUTSIDE = _iso(
+    (_NOW + timedelta(days=120)).replace(hour=0, minute=0, second=0, microsecond=0)
+)  # >60 days ahead — outside window
+
+_MOD_EARLY = _iso((_NOW - timedelta(days=7)).replace(hour=8, minute=0, second=0, microsecond=0))
+_MOD_MID = _iso((_NOW - timedelta(days=2)).replace(hour=8, minute=0, second=0, microsecond=0))
+_MOD_LATE = _iso(_NOW.replace(hour=8, minute=0, second=0, microsecond=0))
 
 
 @pytest.fixture

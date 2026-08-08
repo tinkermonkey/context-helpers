@@ -23,13 +23,34 @@ WORKDIR /workspace/context-helpers
 
 COPY pyproject.toml ./
 
-# Create a minimal src layout so pip can resolve the editable install,
-# then remove the stub after deps are cached.
-RUN mkdir -p src/context_helpers && \
-    touch src/context_helpers/__init__.py && \
-    pip install --no-cache-dir \
-        -e ".[dev,server,telemetry,email,documents,push,obsidian,youtube]" && \
-    rm -rf src/
+# Extract and install third-party dependencies from pyproject.toml without
+# an editable install. An editable install bakes a .pth path into the image
+# that breaks when the runtime mount path differs from the build path.
+RUN python3 -c "\
+import tomllib, subprocess, sys; \
+d = tomllib.load(open('pyproject.toml', 'rb')); \
+extras = d['project'].get('optional-dependencies', {}); \
+deps = set(d['project'].get('dependencies', [])); \
+[deps.update(extras.get(e, [])) for e in \
+  ['dev','server','telemetry','email','documents','push','obsidian','youtube']]; \
+deps.discard('context-helpers[telemetry]'); \
+sys.exit(subprocess.call( \
+  ['pip', 'install', '--no-cache-dir'] + sorted(deps)))" && \
+    rm pyproject.toml
+
+# Remove any stale editable-install .pth files from previous image layers
+# that might point to the wrong source path.
+RUN find /usr/local/lib -name '*editable*context_helpers*' -delete 2>/dev/null; \
+    find /usr/local/lib -name 'context_helpers*' -path '*/site-packages/*' \
+      ! -path '*/site-packages/context_helpers/*' -delete 2>/dev/null; \
+    true
+
+# Source code is mounted at runtime. The orchestrator may mount the repo at
+# /workspace (source at /workspace/src) or /workspace/context-helpers (source
+# at /workspace/context-helpers/src). Include both so subprocesses — e.g. the
+# filesystem converter's `python -m context_helpers.collectors.filesystem.convert`
+# — can always find the package.
+ENV PYTHONPATH="/workspace/context-helpers/src:/workspace/src"
 
 # ============================================================================
 # Switch to runtime user

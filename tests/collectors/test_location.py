@@ -39,10 +39,19 @@ def _patch_db(collector: LocationCollector, db_path: Path) -> None:
     collector._db_path = db_path
 
 
-# Reference timestamps
-_TS_A = "2026-03-01T10:00:00+00:00"   # earliest visit
-_TS_B = "2026-03-10T12:00:00+00:00"   # middle visit
-_TS_C = "2026-03-20T14:00:00+00:00"   # latest visit
+# Reference timestamps, computed relative to the real wall clock at test-run
+# time (rather than hardcoded) since the collector's initial-load window is
+# built from datetime.now(). All must fall within the default 90-day lookback.
+_NOW = datetime.now(timezone.utc)
+_TS_A = (_NOW - timedelta(days=60)).replace(
+    hour=10, minute=0, second=0, microsecond=0
+).isoformat()  # earliest visit
+_TS_B = (_NOW - timedelta(days=30)).replace(
+    hour=12, minute=0, second=0, microsecond=0
+).isoformat()  # middle visit
+_TS_C = (_NOW - timedelta(days=10)).replace(
+    hour=14, minute=0, second=0, microsecond=0
+).isoformat()  # latest visit
 
 
 @pytest.fixture
@@ -292,7 +301,7 @@ class TestFetchVisitsIncremental:
     def test_since_z_suffix_accepted(self, tmp_db):
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_visits(since="2026-03-01T10:00:00Z")
+        items = c.fetch_visits(since=_TS_A.replace("+00:00", "Z"))
         # Strictly after _TS_A: B and C
         assert len(items) == 2
 
