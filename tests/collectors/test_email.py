@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
@@ -970,6 +971,26 @@ class TestEmailTokenStore:
         assert rename_calls == [(str(path.with_suffix(".tmp")), str(path))]
         assert store.load()["access_token"] == "second-access"
 
+    def test_save_writes_file_with_owner_only_permissions(self, tmp_path):
+        path = tmp_path / "work_tokens.json"
+        store = EmailTokenStore("work", path=path)
+        store.save("access-1", "refresh-1", datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_save_raises_and_does_not_swallow_write_failure(self, tmp_path, monkeypatch):
+        path = tmp_path / "nested" / "work_tokens.json"
+        store = EmailTokenStore("work", path=path)
+
+        def broken_open(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(email_mod.os, "open", broken_open)
+
+        with pytest.raises(OSError):
+            store.save("access-1", "refresh-1", datetime(2024, 1, 1, tzinfo=timezone.utc))
+        assert not path.exists()
+
 
 class TestResolveOauthSettings:
     def test_gmail_preset(self):
@@ -1074,6 +1095,64 @@ class TestGetToken:
         other_stored = collector._token_stores["other"].load()
         assert other_stored["access_token"] == "other-access"
         assert other_stored["refresh_token"] == "other-refresh"
+
+    def test_concurrent_refresh_returns_the_other_threads_new_token(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
+        acct = self._oauth_account()
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
+        near_expiry = datetime.now(timezone.utc) + timedelta(minutes=1)
+        store = collector._token_stores["work"]
+        store.save("stale-access", "refresh-1", near_expiry)
+
+        # Simulate a concurrent thread having already refreshed by the time
+        # this thread's _do_refresh acquires the lock and re-checks the store.
+        store.save("concurrently-refreshed-access", "refresh-2", near_expiry)
+
+        token = collector._do_refresh(acct, "refresh-1")
+
+        assert token == "concurrently-refreshed-access"
+
+    def test_concurrent_refresh_with_corrupted_store_raises_instead_of_empty_token(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
+        acct = self._oauth_account()
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
+        near_expiry = datetime.now(timezone.utc) + timedelta(minutes=1)
+        store = collector._token_stores["work"]
+        store.save("stale-access", "refresh-1", near_expiry)
+
+        # A concurrent refresh landed a new refresh_token but no access_token,
+        # e.g. from a corrupted or partially-written store.
+        store._path.write_text(
+            json.dumps({"refresh_token": "refresh-2", "expires_at": near_expiry.isoformat()})
+        )
+
+        with pytest.raises(KeyError):
+            collector._do_refresh(acct, "refresh-1")
+
+    def test_non_numeric_expires_in_falls_back_instead_of_crashing(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
+        acct = self._oauth_account()
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
+        near_expiry = datetime.now(timezone.utc) + timedelta(minutes=1)
+        collector._token_stores["work"].save("stale-access", "refresh-1", near_expiry)
+
+        def fake_urlopen(req, timeout=30):
+            return _FakeTokenResponse(
+                {"access_token": "new-access", "expires_in": "not-a-number"}
+            )
+
+        monkeypatch.setattr(email_mod.urllib.request, "urlopen", fake_urlopen)
+
+        # _do_refresh raises TypeError from timedelta(seconds="not-a-number");
+        # _get_token must catch it and fall back to the still-stored access
+        # token rather than letting it propagate to a 500.
+        assert collector._get_token(acct) == "stale-access"
 
 
 class TestConnectOAuth:

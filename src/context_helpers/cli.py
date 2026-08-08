@@ -675,7 +675,11 @@ def email_auth(config: str | None, alias: str, port: int) -> None:
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
     store = EmailTokenStore(alias)
-    store.save(access_token, refresh_token, expires_at)
+    try:
+        store.save(access_token, refresh_token, expires_at)
+    except OSError as e:
+        click.echo(f"Failed to save tokens to {store._path}: {e}", err=True)
+        sys.exit(1)
 
     click.echo(f"\n✓ Tokens for {alias!r} saved to {store._path}")
     click.echo(f"  Token expires: {expires_at.strftime('%Y-%m-%d %H:%M UTC')}")

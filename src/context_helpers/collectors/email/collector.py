@@ -6,6 +6,7 @@ import email
 import email.policy
 import json
 import logging
+import os
 import ssl
 import threading
 import urllib.parse
@@ -109,6 +110,11 @@ class EmailTokenStore:
             return {}
 
     def save(self, access_token: str, refresh_token: str, expires_at: datetime) -> None:
+        """Persist tokens to disk, mode 0o600 so only this user can read them.
+
+        Raises OSError if the write fails, so callers never mistake a failed
+        persist for success.
+        """
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
         data = {
@@ -117,12 +123,14 @@ class EmailTokenStore:
             "expires_at": expires_at.isoformat(),
         }
         try:
-            with open(tmp, "w") as f:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 json.dump(data, f, indent=2)
                 f.write("\n")
             tmp.replace(self._path)
         except OSError as e:
             logger.error("EmailTokenStore: failed to write %s: %s", self._path, e)
+            raise
 
 
 class EmailCollector(BaseCollector):
@@ -417,10 +425,12 @@ class EmailCollector(BaseCollector):
         if refresh_token and account.client_id and account.client_secret:
             try:
                 return self._do_refresh(account, refresh_token)
-            except (OSError, ValueError, KeyError) as e:
-                # OSError: network failure talking to the token endpoint.
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                # OSError: network failure talking to the token endpoint, or a
+                #   failure persisting the refreshed tokens to disk.
                 # ValueError: malformed JSON response (json.JSONDecodeError).
                 # KeyError: response JSON missing access_token.
+                # TypeError: response JSON has a non-numeric expires_in.
                 logger.warning(
                     "email: token refresh failed for %s: %s", account.alias, e
                 )
@@ -450,7 +460,13 @@ class EmailCollector(BaseCollector):
             stored = store.load()
             stored_refresh = stored.get("refresh_token")
             if stored_refresh and stored_refresh != refresh_token:
-                return stored.get("access_token", "")
+                concurrent_access = stored.get("access_token")
+                if not concurrent_access:
+                    raise KeyError(
+                        f"token store for account {account.alias!r} was refreshed "
+                        "concurrently but has no access_token"
+                    )
+                return concurrent_access
 
             oauth = resolve_oauth_settings(account)
             data = urllib.parse.urlencode(
