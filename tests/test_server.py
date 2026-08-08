@@ -1,6 +1,5 @@
 """Tests for context_helpers.server — FastAPI app factory, route mounting, health endpoint."""
 
-import pytest
 from fastapi import APIRouter
 from fastapi.testclient import TestClient
 

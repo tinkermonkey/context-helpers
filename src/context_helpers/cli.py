@@ -213,10 +213,10 @@ def setup() -> None:
     else:
         click.echo("Warning: no API key set. Edit config.yaml before starting the service.", err=True)
 
-    click.echo(f"\nNext steps:")
+    click.echo("\nNext steps:")
     click.echo(f"  1. Edit {_CONFIG_PATH} to enable collectors")
-    click.echo(f"  2. Run: context-helpers start")
-    click.echo(f"  3. Or run as daemon: context-helpers start --daemon")
+    click.echo("  2. Run: context-helpers start")
+    click.echo("  3. Or run as daemon: context-helpers start --daemon")
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +400,7 @@ def oura_auth(config: str | None, port: int) -> None:
     auth_url = f"https://cloud.ouraring.com/oauth/authorize?{auth_params}"
 
     click.echo(f"\nMake sure '{redirect_uri}' is registered as a redirect URI in your Oura app.")
-    click.echo(f"\nOpening browser for Oura authorization...")
+    click.echo("\nOpening browser for Oura authorization...")
     click.echo(f"If the browser does not open, visit:\n  {auth_url}\n")
     webbrowser.open(auth_url)
 
@@ -461,7 +461,7 @@ def oura_auth(config: str | None, port: int) -> None:
 
     click.echo(f"\n✓ Oura tokens saved to {store._path}")
     click.echo(f"  Token expires: {expires_at.strftime('%Y-%m-%d %H:%M UTC')}")
-    click.echo(f"  Tokens will refresh automatically going forward.")
+    click.echo("  Tokens will refresh automatically going forward.")
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +480,6 @@ def uninstall() -> None:
     else:
         click.echo("No launchd agent installed.")
 
-    import sys
 
     venv = os.environ.get("VIRTUAL_ENV")
     if venv:

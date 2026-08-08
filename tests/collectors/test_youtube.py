@@ -8,7 +8,7 @@ push page would be filtered out forever by the strictly-greater-than cursor
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pytest
 

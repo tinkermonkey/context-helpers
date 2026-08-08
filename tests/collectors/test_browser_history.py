@@ -708,7 +708,7 @@ class TestFindFirefoxDb:
         ini = ff_dir / "profiles.ini"
         ini.write_text(
             "[InstallABCDEF]\n"
-            f"Default=Profiles/abc.default-release\n"
+            "Default=Profiles/abc.default-release\n"
             "Locked=1\n"
         )
 
@@ -738,7 +738,7 @@ class TestFindFirefoxDb:
             "[Profile0]\n"
             "Name=default\n"
             "IsRelative=1\n"
-            f"Path=Profiles/xyz.default\n"
+            "Path=Profiles/xyz.default\n"
             "Default=1\n"
         )
 

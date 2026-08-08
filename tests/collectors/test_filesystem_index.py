@@ -1,6 +1,5 @@
 """Unit tests for the filesystem FileIndex (SQLite change-sequence index)."""
 
-from pathlib import Path
 
 import pytest
 

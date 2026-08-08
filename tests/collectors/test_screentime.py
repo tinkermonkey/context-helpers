@@ -11,12 +11,9 @@ from context_helpers.collectors.screentime.collector import (
     ScreenTimeCollector,
     _APPLE_EPOCH_OFFSET,
     _CURSOR_APP_USAGE,
-    _CURSOR_FOCUS,
-    _app_usage_from_row,
     _appname_from_bundle_id,
     _apple_ts_to_iso,
     _datetime_to_apple_ts,
-    _focus_event_from_row,
 )
 from context_helpers.config import ScreenTimeConfig
 
@@ -594,7 +591,6 @@ class TestHasChangesSince:
         _patch_db(c, tmp_db)
         future = datetime(2099, 1, 1, tzinfo=timezone.utc)
         # Only patch one cursor key — the other returns None → should return True
-        original_get = c.get_push_cursor
 
         def partial_cursor(cursor_key=None):
             if cursor_key == _CURSOR_APP_USAGE:
@@ -708,7 +704,7 @@ class TestHTTPEndpoints:
         c.get_push_cursor = lambda cursor_key=None: lock_cursor
 
         client = TestClient(app)
-        resp = client.get(f"/screentime/focus?since=2000-01-01T00:00:00Z")
+        resp = client.get("/screentime/focus?since=2000-01-01T00:00:00Z")
         assert resp.status_code == 200
         items = resp.json()
         assert len(items) == 1

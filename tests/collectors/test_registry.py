@@ -3,7 +3,6 @@
 import sys
 import types
 
-import pytest
 
 from context_helpers.collectors.registry import build_collector_registry
 from context_helpers.config import (

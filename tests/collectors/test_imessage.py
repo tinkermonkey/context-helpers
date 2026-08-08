@@ -10,7 +10,6 @@ from context_helpers.collectors.imessage.collector import (
     iMessageCollector,
 )
 from context_helpers.config import iMessageConfig
-from tests.collectors.conftest import unix_to_apple_ns
 
 
 # ---------------------------------------------------------------------------

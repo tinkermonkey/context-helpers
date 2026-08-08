@@ -4,7 +4,6 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -14,7 +13,6 @@ from context_helpers.collectors.podcasts.collector import (
     _MLX_WHISPER_AVAILABLE,
     _apple_ts_to_datetime,
     _apple_ts_to_date,
-    _apple_ts_to_iso,
     _datetime_to_apple_ts,
     _find_transcript_file,
     _listen_event_from_row,

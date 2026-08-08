@@ -1,6 +1,5 @@
 """Tests for context_helpers.config — loading, validation, defaults."""
 
-from pathlib import Path
 
 import pytest
 import yaml

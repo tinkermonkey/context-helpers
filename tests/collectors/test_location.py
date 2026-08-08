@@ -11,12 +11,10 @@ import pytest
 from context_helpers.collectors.location.collector import (
     LocationCollector,
     _APPLE_EPOCH_OFFSET,
-    _KNOWLEDGEC_DIR,
     _PUSH_CURSOR_KEY,
     _apple_ts_to_iso,
     _datetime_to_apple_ts,
     _duration_minutes,
-    _row_to_dict,
 )
 from context_helpers.config import LocationConfig
 
