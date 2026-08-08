@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 
 
@@ -164,6 +165,35 @@ class OuraConfig(BaseSettings):
     initial_lookback_days: int = 365  # how far back to fetch on first delivery (no push cursor)
 
 
+class EmailAccountConfig(BaseModel):
+    model_config = {"extra": "ignore"}
+
+    alias: str
+    host: str
+    port: int = 993
+    auth: Literal["oauth", "password"] = "password"
+    username: str = ""
+    password: str = ""  # app-password, used only when auth == "password"
+    provider: Literal["gmail", "microsoft", "custom"] = "custom"
+    # OAuth fields — used only when auth == "oauth"
+    client_id: str = ""
+    client_secret: str = ""
+    authorize_url: str = ""
+    token_url: str = ""
+    scopes: list[str] = []
+    # Folder filtering and backfill
+    folders: list[str] = ["INBOX"]
+    exclude_folders: list[str] = []
+    initial_lookback_days: int = 30
+
+
+class EmailConfig(BaseSettings):
+    model_config = {"extra": "ignore"}
+
+    enabled: bool = False
+    accounts: list[EmailAccountConfig] = []
+
+
 class ContactsConfig(BaseSettings):
     model_config = {"extra": "ignore"}
 
@@ -285,6 +315,7 @@ class CollectorsConfig(BaseSettings):
     filesystem: FilesystemConfig = FilesystemConfig()
     obsidian: ObsidianConfig = ObsidianConfig()
     oura: OuraConfig = OuraConfig()
+    email: EmailConfig = EmailConfig()
     contacts: ContactsConfig = ContactsConfig()
     youtube: YouTubeConfig = YouTubeConfig()
     calendar: CalendarConfig = CalendarConfig()
@@ -351,6 +382,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             filesystem=FilesystemConfig(**collectors_raw.get("filesystem", {})),
             obsidian=ObsidianConfig(**collectors_raw.get("obsidian", {})),
             oura=OuraConfig(**collectors_raw.get("oura", {})),
+            email=EmailConfig(**collectors_raw.get("email", {})),
             contacts=ContactsConfig(**collectors_raw.get("contacts", {})),
             youtube=YouTubeConfig(**collectors_raw.get("youtube", {})),
             calendar=CalendarConfig(**collectors_raw.get("calendar", {})),

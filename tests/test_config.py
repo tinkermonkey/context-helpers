@@ -128,3 +128,67 @@ class TestCollectorPaths:
         p = write_config(tmp_path / "config.yaml",
                          {"collectors": {"reminders": {"list_filter": "Work"}}})
         assert load_config(p).collectors.reminders.list_filter == "Work"
+
+
+class TestEmailConfig:
+    def test_disabled_by_default(self, tmp_path):
+        p = write_config(tmp_path / "config.yaml")
+        assert load_config(p).collectors.email.enabled is False
+
+    def test_accounts_default_empty(self, tmp_path):
+        p = write_config(tmp_path / "config.yaml")
+        assert load_config(p).collectors.email.accounts == []
+
+    def test_two_accounts_with_distinct_aliases(self, tmp_path):
+        p = write_config(
+            tmp_path / "config.yaml",
+            {
+                "collectors": {
+                    "email": {
+                        "enabled": True,
+                        "accounts": [
+                            {
+                                "alias": "work",
+                                "host": "imap.gmail.com",
+                                "auth": "oauth",
+                                "username": "work@example.com",
+                                "provider": "gmail",
+                            },
+                            {
+                                "alias": "personal",
+                                "host": "imap.mail.me.com",
+                                "auth": "password",
+                                "username": "personal@example.com",
+                                "password": "app-password",
+                            },
+                        ],
+                    }
+                }
+            },
+        )
+        config = load_config(p).collectors.email
+        assert config.enabled is True
+        assert len(config.accounts) == 2
+        assert {a.alias for a in config.accounts} == {"work", "personal"}
+
+    def test_account_defaults(self, tmp_path):
+        p = write_config(
+            tmp_path / "config.yaml",
+            {
+                "collectors": {
+                    "email": {
+                        "enabled": True,
+                        "accounts": [
+                            {"alias": "work", "host": "imap.example.com", "username": "work@example.com"}
+                        ],
+                    }
+                }
+            },
+        )
+        account = load_config(p).collectors.email.accounts[0]
+        assert account.port == 993
+        assert account.auth == "password"
+        assert account.provider == "custom"
+        assert account.folders == ["INBOX"]
+        assert account.exclude_folders == []
+        assert account.initial_lookback_days == 30

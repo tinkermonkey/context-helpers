@@ -96,6 +96,15 @@ def build_collector_registry(config: AppConfig) -> list[BaseCollector]:
         except ImportError as e:
             logger.warning("Skipping oura collector (import error): %s", e)
 
+    if config.collectors.email.enabled:
+        try:
+            from context_helpers.collectors.email.collector import EmailCollector
+
+            collectors.append(EmailCollector(config.collectors.email))
+            logger.info("Registered collector: email")
+        except ImportError as e:
+            logger.warning("Skipping email collector (import error): %s", e)
+
     if config.collectors.contacts.enabled:
         try:
             from context_helpers.collectors.contacts.collector import ContactsCollector
