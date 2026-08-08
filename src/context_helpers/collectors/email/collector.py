@@ -253,7 +253,10 @@ class EmailCollector(BaseCollector):
     # ------------------------------------------------------------------
 
     def fetch_messages(
-        self, account: EmailAccountConfig, since: str | None
+        self,
+        account: EmailAccountConfig,
+        since: str | None,
+        errors: list[str] | None = None,
     ) -> list[dict]:
         """Fetch messages for one account, oldest first.
 
@@ -264,6 +267,11 @@ class EmailCollector(BaseCollector):
         filters by exact INTERNALDATE in Python. Returns at most
         get_push_limit() + 1 messages so apply_push_paging() can detect
         has_more.
+
+        If *errors* is given, the account's alias is appended to it whenever
+        the whole-account fetch fails (connect/auth/token errors) so callers
+        that merge several accounts' results can tell "no mail" apart from
+        "this account is broken" — an empty return alone can't.
         """
         folders = _account_folders(account)
         if not folders:
@@ -299,6 +307,8 @@ class EmailCollector(BaseCollector):
                 )
                 span.record_exception(e)
                 tel._set_error(span)
+                if errors is not None:
+                    errors.append(account.alias)
                 return []
 
             if failure_cutoffs:
@@ -521,6 +531,7 @@ def _connect(
         port=account.port,
         ssl=True,
         ssl_context=ssl.create_default_context(),
+        timeout=account.connect_timeout_sec,
     )
     try:
         if account.auth == "oauth":

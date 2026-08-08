@@ -185,6 +185,9 @@ class EmailAccountConfig(BaseModel):
     folders: list[str] = ["INBOX"]
     exclude_folders: list[str] = []
     initial_lookback_days: int = 30
+    # Bounds how long a single IMAP connection attempt may block, so an
+    # unreachable host can't hang the whole /email/messages request.
+    connect_timeout_sec: float = 30.0
 
 
 class EmailConfig(BaseSettings):

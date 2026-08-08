@@ -141,7 +141,7 @@ class ScriptedIMAPClient:
 
     _sessions: ClassVar[dict] = {}
 
-    def __init__(self, host, port=993, ssl=True, ssl_context=None):
+    def __init__(self, host, port=993, ssl=True, ssl_context=None, timeout=None):
         self.host = host
         self.selected = None
         session = self._sessions.get(host, {})
@@ -732,7 +732,7 @@ class TestRouter:
         acct2 = _account("personal")
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct1, acct2]))
 
-        def fake_fetch(account, since):
+        def fake_fetch(account, since, errors=None):
             ts = (
                 "2024-01-01T00:00:00+00:00"
                 if account.alias == "work"
@@ -762,13 +762,15 @@ class TestRouter:
         assert len(items) == 2
         assert [i["timestamp"] for i in items] == sorted(i["timestamp"] for i in items)
 
-    def test_one_account_failure_does_not_block_another(self, monkeypatch):
+    def test_one_account_empty_result_does_not_block_another(self, monkeypatch):
+        # An account with no new mail (not a failure) must not affect the
+        # response status or the other account's delivery.
         acct1 = _account("work")
-        acct2 = _account("broken")
+        acct2 = _account("quiet")
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct1, acct2]))
 
-        def fake_fetch(account, since):
-            if account.alias == "broken":
+        def fake_fetch(account, since, errors=None):
+            if account.alias == "quiet":
                 return []
             return [
                 {
@@ -794,6 +796,44 @@ class TestRouter:
         assert len(items) == 1
         assert items[0]["message_id"] == "<work@example.com>"
 
+    def test_one_account_failure_does_not_block_another(self, monkeypatch):
+        # A genuinely broken account (fetch_messages reports it via `errors`)
+        # must not block the working account's delivery, but the response
+        # must surface the partial failure rather than looking like a clean 200.
+        acct1 = _account("work")
+        acct2 = _account("broken")
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct1, acct2]))
+
+        def fake_fetch(account, since, errors=None):
+            if account.alias == "broken":
+                if errors is not None:
+                    errors.append(account.alias)
+                return []
+            return [
+                {
+                    "message_id": "<work@example.com>",
+                    "thread_id": "<work@example.com>",
+                    "sender": "alice@example.com",
+                    "recipients": [],
+                    "timestamp": "2024-01-01T00:00:00+00:00",
+                    "subject": "hi",
+                    "in_reply_to": None,
+                    "is_thread_root": True,
+                    "is_from_me": False,
+                    "text": "hi",
+                }
+            ]
+
+        monkeypatch.setattr(collector, "fetch_messages", fake_fetch)
+        client = self._app_client(collector)
+
+        resp = client.get("/email/messages")
+        assert resp.status_code == 207
+        assert resp.headers["X-Email-Failed-Accounts"] == "broken"
+        items = resp.json()
+        assert len(items) == 1
+        assert items[0]["message_id"] == "<work@example.com>"
+
     def test_cursors_advance_independently_per_account(self, monkeypatch, tmp_path):
         acct1 = _account("work")
         acct2 = _account("personal")
@@ -802,7 +842,7 @@ class TestRouter:
 
         monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path)
 
-        def fake_fetch(account, since):
+        def fake_fetch(account, since, errors=None):
             return [
                 {
                     "message_id": f"<{account.alias}@example.com>",
@@ -874,7 +914,8 @@ class TestRouter:
 
         resp = client.get("/email/messages")
 
-        assert resp.status_code == 200
+        assert resp.status_code == 207
+        assert resp.headers["X-Email-Failed-Accounts"] == "broken"
         items = resp.json()
         assert len(items) == 1
         assert items[0]["message_id"] == "<work@example.com>"
@@ -897,8 +938,9 @@ class _FakeTokenResponse:
 
 
 class _FakeIMAPClientForConnect:
-    def __init__(self, host, port=993, ssl=True, ssl_context=None):
+    def __init__(self, host, port=993, ssl=True, ssl_context=None, timeout=None):
         self.host = host
+        self.timeout = timeout
         self.oauth2_login_calls = []
         self.login_calls = []
 
@@ -1173,3 +1215,11 @@ class TestConnectOAuth:
 
         assert client.login_calls == [("work@example.com", "app-password")]
         assert client.oauth2_login_calls == []
+
+    def test_connect_passes_account_timeout_to_imapclient(self, monkeypatch):
+        monkeypatch.setattr(imapclient, "IMAPClient", _FakeIMAPClientForConnect)
+        acct = _account("work", connect_timeout_sec=5.0)
+
+        client = email_mod._connect(acct)
+
+        assert client.timeout == 5.0
