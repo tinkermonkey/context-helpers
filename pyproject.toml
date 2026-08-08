@@ -42,7 +42,7 @@ all = ["healthkit-to-sqlite", "apple-notes-to-sqlite", "obsidiantools", "python-
 
 dev = [
     "pytest",
-    "httpx",
+    "httpx2",
     "ruff",
     "mypy",
     "types-PyYAML",
