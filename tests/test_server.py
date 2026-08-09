@@ -1,5 +1,8 @@
 """Tests for context_helpers.server — FastAPI app factory, route mounting, health endpoint."""
 
+from datetime import datetime, timezone
+from unittest.mock import patch
+
 from fastapi import APIRouter
 from fastapi.testclient import TestClient
 
@@ -68,6 +71,27 @@ class ExplodingCollector(BaseCollector):
 
     def check_permissions(self) -> list[str]:
         return []
+
+
+class SingleCustomKeyCollector(BaseCollector):
+    """Mimics a single-account email collector: one push cursor key that is
+    NOT the collector name (e.g. "email_alias" instead of "email")."""
+
+    @property
+    def name(self) -> str:
+        return "email"
+
+    def get_router(self) -> APIRouter:
+        return APIRouter()
+
+    def health_check(self) -> dict:
+        return {"status": "ok", "message": "ok"}
+
+    def check_permissions(self) -> list[str]:
+        return []
+
+    def push_cursor_keys(self) -> list[str]:
+        return ["email_alias"]
 
 
 # ---------------------------------------------------------------------------
@@ -224,3 +248,28 @@ class TestCreateApp:
         # app1 has the ok-data route, app2 does not
         assert c1.get("/ok-data", headers=_auth()).status_code == 200
         assert c2.get("/ok-data", headers=_auth()).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# /status endpoint — single-endpoint vs. multi-endpoint display
+# ---------------------------------------------------------------------------
+
+class TestStatusEndpoint:
+    def test_single_custom_cursor_key_uses_endpoints_branch(self, tmp_path):
+        """A collector with exactly one push_cursor_keys() entry that isn't the
+        collector name (e.g. a single-account email collector) must still be
+        displayed via the "endpoints" branch, not the bare get_push_cursor()
+        default which looks up the wrong cursor file and always reads null."""
+        collector = SingleCustomKeyCollector()
+        cursor_ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        with patch("context_helpers.collectors.base._CURSORS_DIR", tmp_path / "cursors"):
+            collector._save_push_cursor(cursor_ts, "email_alias")
+
+            client = _client([collector])
+            resp = client.get("/status", headers=_auth())
+
+        assert resp.status_code == 200
+        info = resp.json()["collectors"]["email"]
+        assert "endpoints" in info
+        assert info["endpoints"]["alias"]["cursor"] == cursor_ts.isoformat()

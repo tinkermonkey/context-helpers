@@ -160,7 +160,7 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
             cursor      — push cursor: timestamp of last item delivered
             has_more    — last push page hit the limit; more items remain
 
-        Multi-endpoint collectors (health, oura):
+        Multi-endpoint collectors (health, oura, email):
             endpoints   — dict of endpoint name →
                             cursor   — timestamp of last item delivered (null if never)
                             has_more — last push page for this endpoint hit the limit
@@ -185,8 +185,12 @@ def create_app(config: AppConfig, collectors: list[BaseCollector]) -> FastAPI:
                 info["has_pending"] = collector.has_pending()
                 info["has_more"] = collector.has_more()
 
-            elif len(cursor_keys) > 1:
-                # Multi-endpoint: strip the collector-name prefix for display
+            elif cursor_keys != [collector.name]:
+                # Multi-endpoint: strip the collector-name prefix for display.
+                # Keyed on whether push_cursor_keys() differs from the single-key
+                # default, not on len() > 1 — a single-account email collector still
+                # returns one *custom* key (e.g. "email_alias"), not "email".
+
                 prefix = collector.name + "_"
                 info["endpoints"] = {
                     (k.removeprefix(prefix)): {
