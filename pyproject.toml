@@ -20,6 +20,7 @@ health    = ["healthkit-to-sqlite"]
 notes     = ["apple-notes-to-sqlite"]
 obsidian  = ["obsidiantools", "python-frontmatter"]
 oura      = []          # stdlib only: urllib
+email     = ["imapclient>=3.0", "html2text"]
 push      = ["watchdog"]
 youtube   = ["yt-dlp"]  # requires yt-dlp CLI on PATH; pip install yt-dlp
 whisper   = ["mlx-whisper"]  # Mac Silicon only; enables auto-transcription of podcast episodes
@@ -37,13 +38,14 @@ telemetry = [
 ]
 
 # Convenience bundle
-all = ["healthkit-to-sqlite", "apple-notes-to-sqlite", "obsidiantools", "python-frontmatter", "watchdog", "yt-dlp", "mlx-whisper", "markitdown[pdf,docx,xlsx,pptx,xls]>=0.1.5", "context-helpers[telemetry]"]
+all = ["healthkit-to-sqlite", "apple-notes-to-sqlite", "obsidiantools", "python-frontmatter", "watchdog", "yt-dlp", "mlx-whisper", "markitdown[pdf,docx,xlsx,pptx,xls]>=0.1.5", "imapclient>=3.0", "html2text", "context-helpers[telemetry]"]
 
 dev = [
     "pytest",
-    "httpx",
+    "httpx2",
     "ruff",
     "mypy",
+    "types-PyYAML",
     "xlwt",  # writes legacy .xls test fixtures
     # needed to import server/auth/cli without installing extras
     "fastapi",
@@ -63,6 +65,41 @@ context-helpers = "context_helpers.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/context_helpers"]
+
+[tool.mypy]
+ignore_missing_imports = false
+
+[[tool.mypy.overrides]]
+module = "mlx_whisper"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "obsidiantools.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "frontmatter"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "healthkit_to_sqlite.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "apple_notes_to_sqlite.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "yt_dlp.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "imapclient.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "watchdog.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]   # "." makes `tests/` importable as a package (for conftest imports)

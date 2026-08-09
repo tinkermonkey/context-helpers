@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from context_helpers.collectors.youtube.collector import YouTubeCollector
 
 
-def make_youtube_router(collector: "YouTubeCollector") -> APIRouter:
+def make_youtube_router(collector: YouTubeCollector) -> APIRouter:
     """Build and return the YouTube router bound to *collector*."""
     router = APIRouter()
 

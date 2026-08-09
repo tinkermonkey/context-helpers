@@ -8,25 +8,21 @@ from unittest.mock import patch
 import pytest
 
 from context_helpers.collectors.screentime.collector import (
-    ScreenTimeCollector,
     _APPLE_EPOCH_OFFSET,
     _CURSOR_APP_USAGE,
-    _CURSOR_FOCUS,
-    _app_usage_from_row,
-    _appname_from_bundle_id,
+    ScreenTimeCollector,
     _apple_ts_to_iso,
+    _appname_from_bundle_id,
     _datetime_to_apple_ts,
-    _focus_event_from_row,
 )
 from context_helpers.config import ScreenTimeConfig
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _collector(**kwargs) -> ScreenTimeCollector:
-    defaults = dict(enabled=True, push_page_size=200, lookback_days=30)
+    defaults = {"enabled": True, "push_page_size": 200, "lookback_days": 30}
     defaults.update(kwargs)
     return ScreenTimeCollector(ScreenTimeConfig(**defaults))
 
@@ -223,7 +219,7 @@ class TestFetchAppUsageInitialLoad:
         c = _collector()
         c._db_path = tmp_path / "missing.db"
         # Connection will fail; should raise (not silently return [])
-        with pytest.raises(Exception):
+        with pytest.raises(sqlite3.OperationalError):
             c.fetch_app_usage(since=None)
 
     def test_returns_empty_list_on_operational_error(self, tmp_path):
@@ -373,6 +369,7 @@ class TestCompleteDayPaging:
         each page ending on a day boundary and has_more correct throughout."""
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from context_helpers.collectors import base as base_mod
 
         monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
@@ -594,7 +591,6 @@ class TestHasChangesSince:
         _patch_db(c, tmp_db)
         future = datetime(2099, 1, 1, tzinfo=timezone.utc)
         # Only patch one cursor key — the other returns None → should return True
-        original_get = c.get_push_cursor
 
         def partial_cursor(cursor_key=None):
             if cursor_key == _CURSOR_APP_USAGE:
@@ -708,7 +704,7 @@ class TestHTTPEndpoints:
         c.get_push_cursor = lambda cursor_key=None: lock_cursor
 
         client = TestClient(app)
-        resp = client.get(f"/screentime/focus?since=2000-01-01T00:00:00Z")
+        resp = client.get("/screentime/focus?since=2000-01-01T00:00:00Z")
         assert resp.status_code == 200
         items = resp.json()
         assert len(items) == 1
@@ -742,6 +738,7 @@ class TestHTTPEndpoints:
 class TestRegistry:
     def test_screentime_registered_when_enabled(self, tmp_config):
         import yaml
+
         from context_helpers.collectors.registry import build_collector_registry
         from context_helpers.config import load_config
 

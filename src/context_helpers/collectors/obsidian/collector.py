@@ -9,9 +9,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from context_helpers import telemetry as tel
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import ObsidianConfig
-from context_helpers import telemetry as tel
 
 _tracer = tel.get_tracer("context_helpers.collectors.obsidian")
 
@@ -30,6 +30,7 @@ except ImportError:
 
 try:
     import frontmatter
+    import yaml
     _HAS_FRONTMATTER = True
 except ImportError:
     pass
@@ -119,8 +120,10 @@ class ObsidianCollector(BaseCollector):
                         try:
                             note_count = len(list(self._vault_path.rglob("*.md")))
                             span.set_attribute("obsidian.note_count", note_count)
-                        except Exception:
-                            pass
+                        except OSError as e:
+                            logger.debug(
+                                "Obsidian: could not count notes for span attribute: %s", e
+                            )
                     except Exception as e:
                         if self._vault is not None:
                             # Transient failure (e.g. iCloud sync deadlock). Serve the stale
@@ -191,7 +194,7 @@ class ObsidianCollector(BaseCollector):
                     post = frontmatter.load(str(note_path))
                     fm_data = post.metadata
                     markdown = post.content
-                except Exception as e:
+                except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
                     logger.warning("Frontmatter parse failed for %s: %s", note_path, e)
                     markdown = note_path.read_text(encoding="utf-8")
                     fm_data = {}
@@ -219,8 +222,13 @@ class ObsidianCollector(BaseCollector):
                         norm_key = key.lower().replace(" ", "_").replace("-", "_")
                         if norm_key not in dataview_fields:
                             dataview_fields[norm_key] = value.strip()
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # Last-resort guard: arbitrary user-authored markdown must never
+                    # abort ingestion of an otherwise-valid note over optional
+                    # inline Dataview field extraction.
+                    logger.debug(
+                        "Obsidian: dataview field extraction failed for %s: %s", note_path, e
+                    )
 
                 # Wikilinks / backlinks from vault graph
                 note_name = note_path.stem
@@ -230,14 +238,14 @@ class ObsidianCollector(BaseCollector):
                     wl = vault.get_wikilinks(note_name)
                     if wl:
                         wikilinks = list(wl)
-                except Exception:
-                    pass
+                except (ValueError, AttributeError) as e:
+                    logger.debug("Obsidian: could not resolve wikilinks for %s: %s", note_name, e)
                 try:
                     bl = vault.get_backlinks(note_name)
                     if bl:
                         backlinks = list(bl)
-                except Exception:
-                    pass
+                except (ValueError, AttributeError) as e:
+                    logger.debug("Obsidian: could not resolve backlinks for %s: %s", note_name, e)
 
                 created_at = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat()
                 modified_at_iso = modified_at.isoformat()

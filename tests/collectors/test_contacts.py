@@ -3,7 +3,6 @@
 import json
 import subprocess
 from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -217,25 +216,31 @@ class TestFetchContacts:
         monkeypatch.setattr(
             "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
         )
-        with patch("subprocess.run", return_value=_osascript_fail("JXA crash")):
-            with pytest.raises(RuntimeError, match="JXA contacts fetch failed"):
-                _collector().fetch_contacts(since=None)
+        with (
+            patch("subprocess.run", return_value=_osascript_fail("JXA crash")),
+            pytest.raises(RuntimeError, match="JXA contacts fetch failed"),
+        ):
+            _collector().fetch_contacts(since=None)
 
     def test_raises_on_invalid_json(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
         )
-        with patch("subprocess.run", return_value=_osascript_ok("not json")):
-            with pytest.raises(RuntimeError, match="invalid JSON"):
-                _collector().fetch_contacts(since=None)
+        with (
+            patch("subprocess.run", return_value=_osascript_ok("not json")),
+            pytest.raises(RuntimeError, match="invalid JSON"),
+        ):
+            _collector().fetch_contacts(since=None)
 
     def test_raises_when_response_is_not_list(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "context_helpers.collectors.contacts.collector._ADDRESSBOOK_DIR", tmp_path
         )
-        with patch("subprocess.run", return_value=_osascript_ok('{"key": "value"}')):
-            with pytest.raises(RuntimeError, match="unexpected type"):
-                _collector().fetch_contacts(since=None)
+        with (
+            patch("subprocess.run", return_value=_osascript_ok('{"key": "value"}')),
+            pytest.raises(TypeError, match="unexpected type"),
+        ):
+            _collector().fetch_contacts(since=None)
 
 
 # ---------------------------------------------------------------------------

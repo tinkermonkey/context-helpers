@@ -42,9 +42,9 @@ from pathlib import Path
 
 from fastapi import APIRouter
 
+from context_helpers import telemetry as tel
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import PodcastsConfig
-from context_helpers import telemetry as tel
 from context_helpers.telemetry import subprocess_span
 
 _tracer = tel.get_tracer("context_helpers.collectors.podcasts")
@@ -360,7 +360,9 @@ def _transcribe_audio_file(audio_path: Path, model_name: str) -> str | None:
             if text:
                 span.set_attribute("podcasts.transcript_chars", len(text))
             return text or None
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - one episode's transcription
+            # failing (mlx-whisper covers many failure modes: bad audio,
+            # model load errors, OOM, etc.) must not crash the collector.
             logger.warning(
                 "PodcastsCollector: transcription failed for %s: %s", audio_path.name, e
             )
@@ -573,7 +575,7 @@ class PodcastsCollector(BaseCollector):
                         "message": f"whisper_transcripts_dir is not writable: {self._whisper_transcripts_dir}",
                     }
             return {"status": "ok", "message": msg}
-        except Exception as e:
+        except (sqlite3.Error, OSError) as e:
             return {"status": "error", "message": str(e)}
 
     def check_permissions(self) -> list[str]:
@@ -581,10 +583,10 @@ class PodcastsCollector(BaseCollector):
             with self._open():
                 pass
             return []
-        except Exception:
+        except (sqlite3.Error, OSError):
             return [
-                f"Read access to Podcasts database at {self._db_path} "
-                "(ensure Podcasts.app has synced at least once)"
+                (f"Read access to Podcasts database at {self._db_path} "
+                "(ensure Podcasts.app has synced at least once)")
             ]
 
     # ------------------------------------------------------------------
@@ -619,9 +621,8 @@ class PodcastsCollector(BaseCollector):
         oldest_cursor: datetime | None = None
         for key in self.push_cursor_keys():
             cursor = self.get_push_cursor(key)
-            if cursor is not None:
-                if oldest_cursor is None or cursor < oldest_cursor:
-                    oldest_cursor = cursor
+            if cursor is not None and (oldest_cursor is None or cursor < oldest_cursor):
+                oldest_cursor = cursor
 
         compare_against = oldest_cursor or watermark
         if compare_against is None:
@@ -921,5 +922,7 @@ class PodcastsCollector(BaseCollector):
                 logger.info(
                     "PodcastsCollector: background transcription finished, %d episodes", count
                 )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - last-resort guard for the
+            # background transcription thread; any failure must be logged
+            # and swallowed rather than killing the daemon thread silently.
             logger.error("PodcastsCollector: background transcription error: %s", e)

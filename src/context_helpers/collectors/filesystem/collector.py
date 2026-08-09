@@ -18,10 +18,11 @@ import os
 import re
 import threading
 import time
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
 
+from context_helpers import telemetry as tel
 from context_helpers.collectors.base import PagedCollector, push_ack_mode
 from context_helpers.collectors.filesystem.convert import (
     CONVERTIBLE_EXTENSIONS,
@@ -29,7 +30,6 @@ from context_helpers.collectors.filesystem.convert import (
 )
 from context_helpers.collectors.filesystem.index import FileIndex, IndexedFile
 from context_helpers.config import FilesystemConfig
-from context_helpers import telemetry as tel
 
 _HAS_MARKITDOWN = False
 try:  # optional [documents] extra
@@ -268,8 +268,8 @@ class FilesystemCollector(PagedCollector):
         while not self._scan_stop.is_set():
             try:
                 self.scan_now()
-            except Exception as e:
-                logger.error("filesystem: scan failed: %s", e, exc_info=True)
+            except Exception:
+                logger.exception("filesystem: scan failed")
             self._scan_wake.wait(timeout=self._config.scan_interval_sec)
             self._scan_wake.clear()
 
@@ -413,7 +413,7 @@ class FilesystemCollector(PagedCollector):
         """Format *seq* as the opaque wire token for the current index generation."""
         return f"g{self._index.generation()}-{seq}"
 
-    def resolve_after(self, source_ref: "str | None") -> int:
+    def resolve_after(self, source_ref: str | None) -> int:
         """Map an opaque wire cursor to a starting seq against the current index.
 
         - empty → the committed (ack'd) cursor: the crash-recovery floor
@@ -447,7 +447,7 @@ class FilesystemCollector(PagedCollector):
     # Document conversion (PDF / Office / iWork → markdown)
     # ------------------------------------------------------------------
 
-    def _convert_document(self, path: Path) -> "tuple[str | None, str | None]":
+    def _convert_document(self, path: Path) -> tuple[str | None, str | None]:
         """Convert a document to markdown in a timeout-guarded subprocess.
 
         Returns (markdown, None) on success or (None, error) on failure. A
@@ -466,6 +466,7 @@ class FilesystemCollector(PagedCollector):
                     capture_output=True,
                     text=True,
                     timeout=self._config.convert_timeout_sec,
+                    check=False,
                 )
             except subprocess.TimeoutExpired:
                 span.set_attribute("filesystem.convert.result", "timeout")
@@ -760,7 +761,9 @@ class FilesystemCollector(PagedCollector):
         try:
             cursor = self.get_cursor()
             items, has_more, page_max = self.fetch_page(after=cursor, limit=limit)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - last-resort guard so a failed
+            # background stash fill (DB/index errors of any kind) can't take
+            # down the push-trigger poll loop; degrade to an empty page.
             logger.error("filesystem: fill_stash() failed: %s", e)
             items, has_more, page_max = [], False, None
         finally:

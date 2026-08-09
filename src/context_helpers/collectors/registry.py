@@ -26,7 +26,9 @@ def build_collector_registry(config: AppConfig) -> list[BaseCollector]:
 
     if config.collectors.reminders.enabled:
         try:
-            from context_helpers.collectors.reminders.collector import RemindersCollector
+            from context_helpers.collectors.reminders.collector import (
+                RemindersCollector,
+            )
 
             collectors.append(RemindersCollector(config.collectors.reminders))
             logger.info("Registered collector: reminders")
@@ -71,7 +73,9 @@ def build_collector_registry(config: AppConfig) -> list[BaseCollector]:
 
     if config.collectors.filesystem.enabled:
         try:
-            from context_helpers.collectors.filesystem.collector import FilesystemCollector
+            from context_helpers.collectors.filesystem.collector import (
+                FilesystemCollector,
+            )
 
             collectors.append(FilesystemCollector(config.collectors.filesystem))
             logger.info("Registered collector: filesystem")
@@ -95,6 +99,15 @@ def build_collector_registry(config: AppConfig) -> list[BaseCollector]:
             logger.info("Registered collector: oura")
         except ImportError as e:
             logger.warning("Skipping oura collector (import error): %s", e)
+
+    if config.collectors.email.enabled:
+        try:
+            from context_helpers.collectors.email.collector import EmailCollector
+
+            collectors.append(EmailCollector(config.collectors.email))
+            logger.info("Registered collector: email")
+        except ImportError as e:
+            logger.warning("Skipping email collector (import error): %s", e)
 
     if config.collectors.contacts.enabled:
         try:
@@ -147,7 +160,9 @@ def build_collector_registry(config: AppConfig) -> list[BaseCollector]:
 
     if config.collectors.screentime.enabled:
         try:
-            from context_helpers.collectors.screentime.collector import ScreenTimeCollector
+            from context_helpers.collectors.screentime.collector import (
+                ScreenTimeCollector,
+            )
 
             collectors.append(ScreenTimeCollector(config.collectors.screentime))
             logger.info("Registered collector: screentime")

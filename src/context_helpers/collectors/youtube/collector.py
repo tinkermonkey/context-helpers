@@ -32,9 +32,9 @@ from pathlib import Path
 
 from fastapi import APIRouter
 
+from context_helpers import telemetry as tel
 from context_helpers.collectors.base import BaseCollector
 from context_helpers.config import YouTubeConfig
-from context_helpers import telemetry as tel
 from context_helpers.telemetry import subprocess_span
 
 _tracer = tel.get_tracer("context_helpers.collectors.youtube")
@@ -71,6 +71,7 @@ class YouTubeCollector(BaseCollector):
                 capture_output=True,
                 text=True,
                 timeout=10,
+                check=False,
             )
             if result.returncode != 0:
                 return {
@@ -216,6 +217,7 @@ class YouTubeCollector(BaseCollector):
                     capture_output=True,
                     text=True,
                     timeout=120,
+                    check=False,
                 )
             except subprocess.TimeoutExpired:
                 raise RuntimeError("yt-dlp timed out after 120 s")

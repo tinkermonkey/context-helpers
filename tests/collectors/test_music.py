@@ -2,8 +2,7 @@
 
 import json
 import subprocess
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime
 from unittest.mock import patch
 
 import pytest
@@ -180,14 +179,18 @@ class TestOrdering:
 
 class TestFetchTracksErrors:
     def test_osascript_failure_raises_runtime_error(self):
-        with patch("subprocess.run", return_value=_osascript_err("some JXA error")):
-            with pytest.raises(RuntimeError, match="JXA failed"):
-                _collector().fetch_tracks(since=None)
+        with (
+            patch("subprocess.run", return_value=_osascript_err("some JXA error")),
+            pytest.raises(RuntimeError, match="JXA failed"),
+        ):
+            _collector().fetch_tracks(since=None)
 
     def test_timeout_raises_runtime_error(self):
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=[], timeout=120)):
-            with pytest.raises(RuntimeError, match="timed out"):
-                _collector().fetch_tracks(since=None)
+        with (
+            patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=[], timeout=120)),
+            pytest.raises(RuntimeError, match="timed out"),
+        ):
+            _collector().fetch_tracks(since=None)
 
 
 # ---------------------------------------------------------------------------

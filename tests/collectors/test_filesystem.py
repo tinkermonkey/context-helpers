@@ -93,21 +93,21 @@ class TestWalkFiltering:
         (tmp_path / "a.md").write_text("# A")
         (tmp_path / "b.py").write_text("print(1)")
         c = _collector(tmp_path)
-        items, _, page_max = c.fetch_page(after=None, limit=50)
+        items, _, _page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md", f"{_label(tmp_path)}/b.py"]
 
     def test_known_binary_extension_excluded(self, tmp_path):
         (tmp_path / "img.jpg").write_bytes(b"binary")
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        items, _, page_max = c.fetch_page(after=None, limit=50)
+        items, _, _page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
     def test_hidden_file_excluded(self, tmp_path):
         (tmp_path / ".secret").write_text("hidden")
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        items, _, page_max = c.fetch_page(after=None, limit=50)
+        items, _, _page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
     def test_hidden_directory_pruned(self, tmp_path):
@@ -116,7 +116,7 @@ class TestWalkFiltering:
         (gitdir / "config").write_text("text")
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        items, _, page_max = c.fetch_page(after=None, limit=50)
+        items, _, _page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
     def test_node_modules_pruned(self, tmp_path):
@@ -125,27 +125,27 @@ class TestWalkFiltering:
         (nm / "readme.md").write_text("# pkg")
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        items, _, page_max = c.fetch_page(after=None, limit=50)
+        items, _, _page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
     def test_include_hidden_toggle(self, tmp_path):
         (tmp_path / ".envrc").write_text("export X=1")
         c = _collector(tmp_path, include_hidden=True)
-        items, _, page_max = c.fetch_page(after=None, limit=50)
+        items, _, _page_max = c.fetch_page(after=None, limit=50)
         assert f"{_label(tmp_path)}/.envrc" in _ids(items)
 
     def test_exclude_globs(self, tmp_path):
         (tmp_path / "keep.md").write_text("# keep")
         (tmp_path / "skip.md").write_text("# skip")
         c = _collector(tmp_path, exclude_globs=["skip.*"])
-        items, _, page_max = c.fetch_page(after=None, limit=50)
+        items, _, _page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/keep.md"]
 
     def test_extension_allowlist(self, tmp_path):
         (tmp_path / "a.md").write_text("# A")
         (tmp_path / "b.py").write_text("print(1)")
         c = _collector(tmp_path, extensions=[".md"])
-        items, _, page_max = c.fetch_page(after=None, limit=50)
+        items, _, _page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
     def test_nested_relative_source_id(self, tmp_path):
@@ -153,7 +153,7 @@ class TestWalkFiltering:
         sub.mkdir(parents=True)
         (sub / "note.md").write_text("# nested")
         c = _collector(tmp_path)
-        items, _, page_max = c.fetch_page(after=None, limit=50)
+        items, _, _page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/sub/deep/note.md"]
 
 
@@ -166,7 +166,7 @@ class TestMultiRoot:
         (r1 / "README.md").write_text("# one")
         (r2 / "README.md").write_text("# two")
         c = _collector(tmp_path, roots=[r1, r2])
-        items, _, page_max = c.fetch_page(after=None, limit=50)
+        items, _, _page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == ["repo1/README.md", "repo2/README.md"]
 
     def test_colliding_basenames_deduped(self, tmp_path):
@@ -190,7 +190,7 @@ class TestPaging:
         for i in range(5):
             (tmp_path / f"f{i}.md").write_text(f"# {i}")
         c = _collector(tmp_path, page_size=3)
-        items, has_more, page_max = c.fetch_page(after=None, limit=3)
+        items, has_more, _page_max = c.fetch_page(after=None, limit=3)
         assert len(items) == 3
         assert has_more is True
 
@@ -219,14 +219,14 @@ class TestPaging:
         (tmp_path / "empty.md").write_text("   \n  ")
         (tmp_path / "real.md").write_text("real")
         c = _collector(tmp_path)
-        items, _, page_max = c.fetch_page(after=None, limit=50)
+        items, _, _page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/real.md"]
 
     def test_oversized_file_skipped_but_cursor_advances(self, tmp_path):
         (tmp_path / "big.txt").write_bytes(b"x" * 4000)
         (tmp_path / "small.md").write_text("ok")
         c = _collector(tmp_path, max_file_size_mb=0.001)  # ~1KB cap
-        items, has_more, page_max = c.fetch_page(after=None, limit=50)
+        items, _has_more, page_max = c.fetch_page(after=None, limit=50)
         assert _ids(items) == [f"{_label(tmp_path)}/small.md"]
         c.commit_page(page_max)
         assert c.has_changes_since(None) is False  # big file's seq was passed
@@ -235,7 +235,7 @@ class TestPaging:
         for i in range(5):
             (tmp_path / f"f{i}.md").write_text("x" * 100)
         c = _collector(tmp_path, max_response_mb=0.0002)  # ~209 bytes
-        items, has_more, page_max = c.fetch_page(after=None, limit=50)
+        items, has_more, _page_max = c.fetch_page(after=None, limit=50)
         assert len(items) < 5
         assert has_more is True
 
@@ -262,7 +262,7 @@ class TestPaging:
     def test_cursor_beyond_max_restarts(self, tmp_path):
         (tmp_path / "a.md").write_text("# A")
         c = _collector(tmp_path)
-        items, _, page_max = c.fetch_page(after=10_000, limit=50)  # cursor past end → restart
+        items, _, _page_max = c.fetch_page(after=10_000, limit=50)  # cursor past end → restart
         assert _ids(items) == [f"{_label(tmp_path)}/a.md"]
 
     def test_overlapping_fetches_commit_their_own_page_max(self, tmp_path):
@@ -280,7 +280,7 @@ class TestPaging:
         c = _collector(tmp_path)
         items_a, _, page_max_a = c.fetch_page(after=None, limit=2)
         # Request B overlaps: examines the whole backlog before A commits.
-        items_b, _, page_max_b = c.fetch_page(after=None, limit=50)
+        _items_b, _, page_max_b = c.fetch_page(after=None, limit=50)
         assert page_max_b > page_max_a
         c.commit_page(page_max_a)  # A commits only what A served
         assert c.get_cursor() == page_max_a

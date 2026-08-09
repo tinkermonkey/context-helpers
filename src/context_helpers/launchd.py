@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -68,6 +67,7 @@ def install(config_path: Path | None = None) -> Path:
         ["launchctl", "load", str(plist_path)],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         raise RuntimeError(f"launchctl load failed: {result.stderr.strip()}")
@@ -89,6 +89,7 @@ def uninstall() -> None:
             ["launchctl", "unload", str(plist_path)],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode != 0:
             logger.warning(f"launchctl unload returned non-zero: {result.stderr.strip()}")
@@ -109,5 +110,6 @@ def is_running() -> bool:
         ["launchctl", "list", _PLIST_LABEL],
         capture_output=True,
         text=True,
+        check=False,
     )
     return result.returncode == 0

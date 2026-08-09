@@ -8,13 +8,12 @@ from unittest.mock import patch
 import pytest
 
 from context_helpers.collectors.reminders.collector import (
-    RemindersCollector,
     _APPLE_EPOCH_OFFSET,
+    RemindersCollector,
     _apple_ts_to_datetime,
     _datetime_to_apple_ts,
 )
 from context_helpers.config import RemindersConfig
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -218,7 +217,7 @@ class TestFetchRemindersErrors:
     def test_missing_db_raises_runtime_error(self):
         c = _collector()
         c._db_path = Path("/nonexistent/path/Data-FAKE.sqlite")
-        with pytest.raises(Exception):
+        with pytest.raises(sqlite3.OperationalError):
             c.fetch_reminders(since=None, list_filter=None)
 
 

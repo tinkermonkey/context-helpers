@@ -9,24 +9,21 @@ from unittest.mock import patch
 import pytest
 
 from context_helpers.collectors.location.collector import (
-    LocationCollector,
     _APPLE_EPOCH_OFFSET,
-    _KNOWLEDGEC_DIR,
     _PUSH_CURSOR_KEY,
+    LocationCollector,
     _apple_ts_to_iso,
     _datetime_to_apple_ts,
     _duration_minutes,
-    _row_to_dict,
 )
 from context_helpers.config import LocationConfig
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _collector(**kwargs) -> LocationCollector:
-    defaults = dict(enabled=True, push_page_size=200, lookback_days=90)
+    defaults = {"enabled": True, "push_page_size": 200, "lookback_days": 90}
     defaults.update(kwargs)
     return LocationCollector(LocationConfig(**defaults))
 
@@ -42,10 +39,19 @@ def _patch_db(collector: LocationCollector, db_path: Path) -> None:
     collector._db_path = db_path
 
 
-# Reference timestamps
-_TS_A = "2026-03-01T10:00:00+00:00"   # earliest visit
-_TS_B = "2026-03-10T12:00:00+00:00"   # middle visit
-_TS_C = "2026-03-20T14:00:00+00:00"   # latest visit
+# Reference timestamps, computed relative to the real wall clock at test-run
+# time (rather than hardcoded) since the collector's initial-load window is
+# built from datetime.now(). All must fall within the default 90-day lookback.
+_NOW = datetime.now(timezone.utc)
+_TS_A = (_NOW - timedelta(days=60)).replace(
+    hour=10, minute=0, second=0, microsecond=0
+).isoformat()  # earliest visit
+_TS_B = (_NOW - timedelta(days=30)).replace(
+    hour=12, minute=0, second=0, microsecond=0
+).isoformat()  # middle visit
+_TS_C = (_NOW - timedelta(days=10)).replace(
+    hour=14, minute=0, second=0, microsecond=0
+).isoformat()  # latest visit
 
 
 @pytest.fixture
@@ -260,6 +266,7 @@ class TestFetchVisitsIncremental:
         False, and delivery crawled one page per poll interval."""
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from context_helpers.collectors import base as base_mod
 
         monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
@@ -294,7 +301,7 @@ class TestFetchVisitsIncremental:
     def test_since_z_suffix_accepted(self, tmp_db):
         c = _collector()
         _patch_db(c, tmp_db)
-        items = c.fetch_visits(since="2026-03-01T10:00:00Z")
+        items = c.fetch_visits(since=_TS_A.replace("+00:00", "Z"))
         # Strictly after _TS_A: B and C
         assert len(items) == 2
 
@@ -504,8 +511,9 @@ class TestHTTPEndpoints:
 class TestRegistry:
     def test_location_registered_when_enabled(self, tmp_config):
         import yaml
-        from context_helpers.config import load_config
+
         from context_helpers.collectors.registry import build_collector_registry
+        from context_helpers.config import load_config
 
         # Patch config to enable location (db path doesn't need to exist for registry)
         raw = yaml.safe_load(tmp_config.read_text())
@@ -518,8 +526,8 @@ class TestRegistry:
         assert "location" in names
 
     def test_location_absent_when_disabled(self, tmp_config):
-        from context_helpers.config import load_config
         from context_helpers.collectors.registry import build_collector_registry
+        from context_helpers.config import load_config
 
         cfg = load_config(tmp_config)
         collectors = build_collector_registry(cfg)

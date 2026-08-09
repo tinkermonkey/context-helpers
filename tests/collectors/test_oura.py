@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import json
 import urllib.error
-from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import APIRouter
 
 from context_helpers.collectors.oura.collector import (
-    OuraCollector,
-    OuraTokenStore,
     _DEFAULT_LOOKBACK_DAYS,
     _EXPIRY_BUFFER_MINUTES,
+    OuraCollector,
+    OuraTokenStore,
 )
 from context_helpers.config import OuraConfig
 
@@ -306,9 +305,11 @@ class TestGetWith401Retry:
             mock_resp.__exit__ = MagicMock(return_value=False)
             return mock_resp
 
-        with patch.object(c, "_do_refresh", return_value="new-acc") as mock_do_refresh:
-            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-                result = c._get("/usercollection/personal_info")
+        with (
+            patch.object(c, "_do_refresh", return_value="new-acc") as mock_do_refresh,
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            result = c._get("/usercollection/personal_info")
 
         mock_do_refresh.assert_called_once_with("current-refresh")
         assert result == {"id": "ok"}
@@ -317,9 +318,11 @@ class TestGetWith401Retry:
         c = make_collector(token="old-token")  # no client_id/secret/refresh_token
         err_401 = urllib.error.HTTPError(url="", code=401, msg="Unauthorized", hdrs=None, fp=None)
 
-        with patch("urllib.request.urlopen", side_effect=err_401):
-            with pytest.raises(urllib.error.HTTPError) as exc_info:
-                c._get("/usercollection/personal_info")
+        with (
+            patch("urllib.request.urlopen", side_effect=err_401),
+            pytest.raises(urllib.error.HTTPError) as exc_info,
+        ):
+            c._get("/usercollection/personal_info")
         assert exc_info.value.code == 401
 
     def test_raises_on_second_401_after_refresh(self, tmp_path):
@@ -332,10 +335,12 @@ class TestGetWith401Retry:
         )
         err_401 = urllib.error.HTTPError(url="", code=401, msg="Unauthorized", hdrs=None, fp=None)
 
-        with patch.object(c, "_do_refresh", return_value="refreshed"):
-            with patch("urllib.request.urlopen", side_effect=err_401):
-                with pytest.raises(urllib.error.HTTPError) as exc_info:
-                    c._get("/usercollection/personal_info")
+        with (
+            patch.object(c, "_do_refresh", return_value="refreshed"),
+            patch("urllib.request.urlopen", side_effect=err_401),
+            pytest.raises(urllib.error.HTTPError) as exc_info,
+        ):
+            c._get("/usercollection/personal_info")
         assert exc_info.value.code == 401
 
 
@@ -390,21 +395,23 @@ class TestDateRange:
     def test_no_since_defaults_to_30_days(self):
         c = make_collector()
         start, end = c._date_range(None)
-        expected_start = (date.today() - timedelta(days=_DEFAULT_LOOKBACK_DAYS)).isoformat()
+        expected_start = (
+            datetime.now(timezone.utc).date() - timedelta(days=_DEFAULT_LOOKBACK_DAYS)
+        ).isoformat()
         assert start == expected_start
-        assert end == date.today().isoformat()
+        assert end == datetime.now(timezone.utc).date().isoformat()
 
     def test_iso_timestamp_since(self):
         c = make_collector()
         start, end = c._date_range("2026-03-01T00:00:00+00:00")
         assert start == "2026-03-01"
-        assert end == date.today().isoformat()
+        assert end == datetime.now(timezone.utc).date().isoformat()
 
     def test_since_with_z_suffix(self):
         c = make_collector()
         start, end = c._date_range("2026-02-15T12:00:00Z")
         assert start == "2026-02-15"
-        assert end == date.today().isoformat()
+        assert end == datetime.now(timezone.utc).date().isoformat()
 
 
 # ---------------------------------------------------------------------------

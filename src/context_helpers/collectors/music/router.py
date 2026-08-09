@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from context_helpers.collectors.music.collector import MusicCollector
 
 
-def make_music_router(collector: "MusicCollector") -> APIRouter:
+def make_music_router(collector: MusicCollector) -> APIRouter:
     """Build and return the music router bound to a collector instance."""
     router = APIRouter()
 

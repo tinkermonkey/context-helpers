@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import time
 import subprocess
+import time
 
 _tracer_provider = None
 _meter_provider = None
@@ -29,9 +29,16 @@ def setup_telemetry(
         return
 
     try:
-        from opentelemetry import trace, metrics
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry import metrics, trace
+        from opentelemetry._logs import set_logger_provider
+        from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
+            OTLPMetricExporter,
+        )
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,
+        )
+
         # NOTE: the logs SDK lives under the underscore-prefixed module in
         # current opentelemetry releases; `opentelemetry.sdk.logs` does not
         # exist, and importing it here used to abort the ENTIRE telemetry
@@ -41,10 +48,8 @@ def setup_telemetry(
         from opentelemetry.sdk.metrics import MeterProvider
         from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
         from opentelemetry.sdk.resources import Resource
-        from opentelemetry._logs import set_logger_provider
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-        from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-        from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
         resource = Resource.create({
             "service.name": service_name,

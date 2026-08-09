@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from context_helpers.collectors.notes.collector import NotesCollector
 
 
-def make_notes_router(collector: "NotesCollector") -> APIRouter:
+def make_notes_router(collector: NotesCollector) -> APIRouter:
     """Build and return the notes router bound to a collector instance."""
     router = APIRouter()
 

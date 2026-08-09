@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from context_helpers.collectors.contacts.collector import ContactsCollector
 
 
-def make_contacts_router(collector: "ContactsCollector") -> APIRouter:
+def make_contacts_router(collector: ContactsCollector) -> APIRouter:
     """Build and return the contacts router bound to a collector instance."""
     router = APIRouter()
 

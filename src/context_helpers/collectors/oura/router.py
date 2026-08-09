@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from context_helpers.collectors.oura.collector import OuraCollector
 
 
-def make_oura_router(collector: "OuraCollector") -> APIRouter:
+def make_oura_router(collector: OuraCollector) -> APIRouter:
     router = APIRouter()
 
     @router.get("/oura/sleep")

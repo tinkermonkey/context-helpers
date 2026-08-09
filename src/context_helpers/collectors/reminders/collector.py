@@ -90,7 +90,8 @@ def _find_db_path() -> Path | None:
                 if count > best_count:
                     best_count = count
                     best = candidate
-        except Exception:
+        except sqlite3.Error as e:
+            logger.debug("Reminders: skipping unreadable candidate db %s: %s", candidate, e)
             continue
     return best
 
@@ -177,7 +178,7 @@ class RemindersCollector(PagedCollector):
                 "status": "ok",
                 "message": f"Reminders accessible ({row[0]} lists, {row[1]:,} reminders)",
             }
-        except Exception as e:
+        except (RuntimeError, sqlite3.Error) as e:
             return {"status": "error", "message": str(e)}
 
     def check_permissions(self) -> list[str]:
@@ -186,10 +187,10 @@ class RemindersCollector(PagedCollector):
             with sqlite3.connect(f"file:{db}?mode=ro", uri=True):
                 pass
             return []
-        except Exception:
+        except (RuntimeError, sqlite3.Error):
             return [
-                f"Read access to Reminders database in {_REMINDERS_STORE_DIR} "
-                "(grant Full Disk Access to Terminal in System Settings → Privacy & Security)"
+                (f"Read access to Reminders database in {_REMINDERS_STORE_DIR} "
+                "(grant Full Disk Access to Terminal in System Settings → Privacy & Security)")
             ]
 
     def watch_paths(self) -> list[Path]:
@@ -210,8 +211,8 @@ class RemindersCollector(PagedCollector):
             if row and row[0]:
                 max_dt = _apple_ts_to_datetime(row[0])
                 return max_dt > compare_against
-        except Exception:
-            pass
+        except (RuntimeError, sqlite3.Error) as e:
+            logger.debug("Reminders: has_changes_since check failed, assuming changed: %s", e)
         return True
 
     def fetch_page(self, after: datetime | None, limit: int) -> tuple[list[dict], bool]:

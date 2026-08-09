@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import socket
 import threading
@@ -9,10 +10,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from context_helpers.collectors.base import PagedCollector
 from context_helpers import telemetry as tel
+from context_helpers.collectors.base import PagedCollector
 
 _tracer = tel.get_tracer("context_helpers.push")
 
@@ -23,13 +24,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_HAS_WATCHDOG = False
-try:
-    from watchdog.observers import Observer  # type: ignore
-    from watchdog.events import FileSystemEventHandler  # type: ignore
-    _HAS_WATCHDOG = True
-except ImportError:
-    pass
+_HAS_WATCHDOG = importlib.util.find_spec("watchdog") is not None
 
 
 class _DebounceHandler:
@@ -70,9 +65,9 @@ class PushTrigger:
 
     def __init__(
         self,
-        config: "PushConfig",
-        collectors: list["BaseCollector"],
-        state_store: "StateStore",
+        config: PushConfig,
+        collectors: list[BaseCollector],
+        state_store: StateStore,
     ) -> None:
         self._config = config
         self._collectors = collectors
@@ -80,7 +75,7 @@ class PushTrigger:
         self._stop_event = threading.Event()
         self._pending = threading.Event()   # set by watchdog to wake poll loop early
         self._poll_thread: threading.Thread | None = None
-        self._observer = None
+        self._observer: Any | None = None
         self._consecutive_timeouts: int = 0
 
     def start(self) -> None:
@@ -131,8 +126,8 @@ class PushTrigger:
 
     def _start_file_watcher(self) -> None:
         """Register watchdog handlers for collectors that expose watch_paths()."""
-        from watchdog.observers import Observer
         from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
 
         observer = Observer()
         watched_any = False
@@ -141,7 +136,7 @@ class PushTrigger:
             paths = []
             try:
                 paths = collector.watch_paths()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - collector plugin isolation: one bad collector must not block watcher setup
                 logger.warning("PushTrigger: watch_paths() failed for %s: %s", collector.name, e)
 
             for path in paths:
@@ -155,7 +150,7 @@ class PushTrigger:
                     self._pending.set()
                     try:
                         c.request_scan()
-                    except Exception as e:  # pragma: no cover - defensive
+                    except Exception as e:  # noqa: BLE001 - collector plugin isolation; pragma: no cover - defensive
                         logger.warning("PushTrigger: request_scan() failed for %s: %s", c.name, e)
 
                 debouncer = _DebounceHandler(_on_change)
@@ -210,9 +205,17 @@ class PushTrigger:
                     ):
                         changed.append(collector.name)
                         continue
+                    # Non-paged collectors that served a full push page still have a
+                    # backlog to drain even when has_changes_since() reports no new
+                    # data (e.g. email's UIDNEXT probe is blind to already-known
+                    # backlog) — otherwise the remaining page is never delivered
+                    # until new data arrives or another collector triggers a cycle.
+                    if not isinstance(collector, PagedCollector) and collector.has_push_more():
+                        changed.append(collector.name)
+                        continue
                     if collector.has_changes_since(watermark):
                         changed.append(collector.name)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 - collector plugin isolation: has_changes_since() may raise arbitrary errors
                     logger.warning(
                         "PushTrigger: has_changes_since() raised for '%s': %s", collector.name, e
                     )
@@ -231,13 +234,16 @@ class PushTrigger:
             # (pull-owned collectors never appear in `changed`, so their stash is
             # never pre-filled — their delivery flows through their fetch routes)
             for collector in self._collectors:
-                if isinstance(collector, PagedCollector) and collector.name in changed:
-                    if not collector.has_pending():
-                        page_size = getattr(getattr(collector, "_config", None), "page_size", 200)
-                        collector.fill_stash(limit=page_size)
-                        # If fill produced nothing and no more pages remain, skip delivery
-                        if not collector.has_pending() and not collector.has_more():
-                            changed.remove(collector.name)
+                if (
+                    isinstance(collector, PagedCollector)
+                    and collector.name in changed
+                    and not collector.has_pending()
+                ):
+                    page_size = getattr(getattr(collector, "_config", None), "page_size", 200)
+                    collector.fill_stash(limit=page_size)
+                    # If fill produced nothing and no more pages remain, skip delivery
+                    if not collector.has_pending() and not collector.has_more():
+                        changed.remove(collector.name)
 
             if not changed:
                 logger.debug("PushTrigger: stash empty after fill — no delivery needed")
@@ -320,7 +326,7 @@ class PushTrigger:
                 span.set_attribute("push.result", type(e).__name__)
                 span.record_exception(e)
                 tel._set_error(span)
-                logger.error("PushTrigger: delivery failed unexpectedly: %s", e, exc_info=True)
+                logger.exception("PushTrigger: delivery failed unexpectedly")
 
     def _reduce_push_limits(self) -> None:
         """Halve push page sizes for all non-paged collectors after a timeout."""

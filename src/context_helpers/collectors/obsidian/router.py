@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from context_helpers.collectors.obsidian.collector import ObsidianCollector
 
 
-def make_obsidian_router(collector: "ObsidianCollector") -> APIRouter:
+def make_obsidian_router(collector: ObsidianCollector) -> APIRouter:
     """Build and return the obsidian router bound to a collector instance."""
     router = APIRouter()
 

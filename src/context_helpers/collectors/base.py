@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter
+
 from context_helpers import telemetry as tel
 
 if TYPE_CHECKING:
@@ -30,7 +31,7 @@ push_ack_mode: ContextVar[bool] = ContextVar("push_ack_mode", default=False)
 _CURSORS_DIR = Path.home() / ".local" / "share" / "context-helpers" / "cursors"
 
 
-def _parse_item_ts(value) -> "datetime | None":
+def _parse_item_ts(value) -> datetime | None:
     """Parse an item timestamp to an aware datetime, or None if unparseable.
 
     Accepts ISO 8601 (including a trailing Z) and the space-separated
@@ -105,7 +106,7 @@ class BaseCollector(ABC):
         """
         ...
 
-    def has_changes_since(self, watermark: "datetime | None") -> bool:
+    def has_changes_since(self, watermark: datetime | None) -> bool:
         """Return True if this collector may have data newer than *watermark*.
 
         The default returns True unconditionally (conservative: always trigger).
@@ -120,7 +121,7 @@ class BaseCollector(ABC):
         """
         return True
 
-    def watch_paths(self) -> "list[Path]":
+    def watch_paths(self) -> list[Path]:
         """Return filesystem paths that should trigger near-instant push on change.
 
         Used by the FSEvents watcher (watchdog) when available.  Override in
@@ -149,19 +150,19 @@ class BaseCollector(ABC):
         Default no-op; file-indexing collectors override it.
         """
 
-    _state_store: "StateStore | None" = None
+    _state_store: StateStore | None = None
 
-    def set_state_store(self, state_store: "StateStore") -> None:
+    def set_state_store(self, state_store: StateStore) -> None:
         """Inject the shared StateStore so routers can resolve the delivery watermark."""
         self._state_store = state_store
 
-    def get_watermark(self) -> "datetime | None":
+    def get_watermark(self) -> datetime | None:
         """Return the last-delivered-at watermark, or None if not available."""
         if self._state_store is None:
             return None
         return self._state_store.get_watermark()
 
-    def resolve_since(self, since: "str | None") -> "str | None":
+    def resolve_since(self, since: str | None) -> str | None:
         """Return *since* if provided, otherwise fall back to the delivery watermark.
 
         Routers call this so that omitting `since` automatically scopes the
@@ -176,7 +177,7 @@ class BaseCollector(ABC):
     # Push paging — bounded delivery for non-paged collectors
     # ------------------------------------------------------------------
 
-    def get_push_cursor(self, cursor_key: "str | None" = None) -> "datetime | None":
+    def get_push_cursor(self, cursor_key: str | None = None) -> datetime | None:
         """Return the push cursor for *cursor_key* (default: collector name).
 
         Multi-endpoint collectors (health, Oura) should pass a unique key per
@@ -197,7 +198,7 @@ class BaseCollector(ABC):
         except (json.JSONDecodeError, OSError, ValueError):
             return None
 
-    def _save_push_cursor(self, ts: "datetime", cursor_key: "str | None" = None) -> None:
+    def _save_push_cursor(self, ts: datetime, cursor_key: str | None = None) -> None:
         key = cursor_key or self.name
         _CURSORS_DIR.mkdir(parents=True, exist_ok=True)
         cursor_path = _CURSORS_DIR / f"{key}_push.json"
@@ -210,7 +211,7 @@ class BaseCollector(ABC):
         except OSError as e:
             logger.error("BaseCollector: failed to save push cursor for %s: %s", self.name, e)
 
-    def resolve_push_since(self, since: "str | None", cursor_key: "str | None" = None) -> "str | None":
+    def resolve_push_since(self, since: str | None, cursor_key: str | None = None) -> str | None:
         """Return the lower-bound timestamp for a push-trigger delivery.
 
         The push cursor is the authoritative delivery position for each endpoint.
@@ -252,7 +253,7 @@ class BaseCollector(ABC):
         # locking the collector into an empty-response loop indefinitely.
         return None
 
-    def push_cursor_keys(self) -> "list[str]":
+    def push_cursor_keys(self) -> list[str]:
         """Return the push cursor key(s) used by this collector.
 
         Single-endpoint collectors return ``[self.name]`` (the default).
@@ -272,7 +273,7 @@ class BaseCollector(ABC):
         """Override the push page size (used by the push trigger on timeout)."""
         self._push_limit_override = max(10, n)
 
-    def has_push_more(self, cursor_key: "str | None" = None) -> bool:
+    def has_push_more(self, cursor_key: str | None = None) -> bool:
         """Return True if the last apply_push_paging() call hit the limit.
 
         Pass *cursor_key* to check a specific endpoint; omit to check any endpoint.
@@ -284,11 +285,11 @@ class BaseCollector(ABC):
 
     def apply_push_paging(
         self,
-        items: "list[dict]",
+        items: list[dict],
         ts_field: str,
-        cursor_key: "str | None" = None,
-        defer_commit: "bool | None" = None,
-    ) -> "list[dict]":
+        cursor_key: str | None = None,
+        defer_commit: bool | None = None,
+    ) -> list[dict]:
         """Sort items by ts_field ASC, apply push limit, advance push cursor.
 
         Multi-endpoint collectors pass a unique *cursor_key* per endpoint so each
@@ -368,7 +369,7 @@ class BaseCollector(ABC):
             self._staged_push_cursors: dict[str, datetime] = {}
             self._push_stage_lock = threading.Lock()
 
-    def _stage_push_cursor(self, ts: "datetime", cursor_key: "str | None" = None) -> None:
+    def _stage_push_cursor(self, ts: datetime, cursor_key: str | None = None) -> None:
         """Stage a proposed push cursor without persisting it (commit-ack mode).
 
         The cursor only becomes the authoritative position once the consumer
@@ -386,12 +387,12 @@ class BaseCollector(ABC):
             if existing is None or ts > existing:
                 self._staged_push_cursors[key] = ts
 
-    def _persist_push_cursor_if_newer(self, ts: "datetime", cursor_key: str) -> None:
+    def _persist_push_cursor_if_newer(self, ts: datetime, cursor_key: str) -> None:
         current = self.get_push_cursor(cursor_key)
         if current is None or ts > current:
             self._save_push_cursor(ts, cursor_key)
 
-    def commit_push_cursors(self, keys: "list[str] | None" = None) -> "list[str]":
+    def commit_push_cursors(self, keys: list[str] | None = None) -> list[str]:
         """Persist staged push cursors (commit-ack confirmation).
 
         Called by the ``POST /collectors/{name}/ack`` endpoint after the consumer
@@ -422,7 +423,7 @@ class BaseCollector(ABC):
             committed.append(key)
         return committed
 
-    def reset_state(self) -> "list[str]":
+    def reset_state(self) -> list[str]:
         """Clear all delivery cursors and in-memory push state for this collector.
 
         Returns a list of human-readable strings describing what was cleared.
@@ -474,7 +475,7 @@ class PagedCollector(BaseCollector):
         # Commit-ack staging for the PAGE cursor (separate from push cursors):
         # consume_stash() stages here in ack mode instead of persisting, so a
         # served-but-never-committed page is re-served rather than lost.
-        self._staged_page_cursor: "datetime | None" = None
+        self._staged_page_cursor: datetime | None = None
 
     @property
     def _cursor_path(self) -> Path:
@@ -482,8 +483,8 @@ class PagedCollector(BaseCollector):
 
     @abstractmethod
     def fetch_page(
-        self, after: "datetime | None", limit: int
-    ) -> "tuple[list[dict], bool]":
+        self, after: datetime | None, limit: int
+    ) -> tuple[list[dict], bool]:
         """Fetch up to `limit` items with cursor_field strictly > `after`.
 
         Returns:
@@ -493,7 +494,7 @@ class PagedCollector(BaseCollector):
 
     # --- Cursor persistence ---
 
-    def get_cursor(self) -> "datetime | None":
+    def get_cursor(self) -> datetime | None:
         if not self._cursor_path.exists():
             return None
         try:
@@ -507,7 +508,7 @@ class PagedCollector(BaseCollector):
         except (json.JSONDecodeError, OSError, ValueError):
             return None
 
-    def _save_cursor(self, ts: "datetime") -> None:
+    def _save_cursor(self, ts: datetime) -> None:
         self._cursor_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._cursor_path.with_suffix(".tmp")
         try:
@@ -532,7 +533,7 @@ class PagedCollector(BaseCollector):
             try:
                 cursor = self.get_cursor()
                 items, has_more = self.fetch_page(after=cursor, limit=limit)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - isolate subclass fetch_page() bugs from the push/stash thread
                 logger.error("PagedCollector: fill_stash() failed for %s: %s", self.name, e)
                 span.record_exception(e)
                 tel._set_error(span)
@@ -546,7 +547,7 @@ class PagedCollector(BaseCollector):
             span.set_attribute("collector.items_stashed", len(items))
             span.set_attribute("collector.has_more", bool(has_more))
 
-    def consume_stash(self) -> "list[dict]":
+    def consume_stash(self) -> list[dict]:
         """Return stash and advance the page cursor. Clears the stash.
 
         In commit-ack mode (``?ack=true``) the new cursor is STAGED rather than
@@ -574,7 +575,7 @@ class PagedCollector(BaseCollector):
                 logger.warning("PagedCollector: could not advance cursor for %s: %s", self.name, e)
         return items
 
-    def _stage_page_cursor(self, ts: "datetime") -> None:
+    def _stage_page_cursor(self, ts: datetime) -> None:
         with self._stash_lock:
             if self._staged_page_cursor is None or ts > self._staged_page_cursor:
                 self._staged_page_cursor = ts
@@ -583,7 +584,7 @@ class PagedCollector(BaseCollector):
         """Cursor key that identifies the page cursor in keyed acks."""
         return f"{self.name}_page"
 
-    def commit_push_cursors(self, keys: "list[str] | None" = None) -> "list[str]":
+    def commit_push_cursors(self, keys: list[str] | None = None) -> list[str]:
         """Also commit the staged page cursor (see consume_stash)."""
         committed = super().commit_push_cursors(keys)
 
@@ -620,11 +621,11 @@ class PagedCollector(BaseCollector):
         with self._stash_lock:
             return self._has_more
 
-    def has_changes_since(self, watermark: "datetime | None") -> bool:
+    def has_changes_since(self, watermark: datetime | None) -> bool:
         """Default uses per-collector cursor. Subclasses should override with cheap check."""
         return True
 
-    def reset_state(self) -> "list[str]":
+    def reset_state(self) -> list[str]:
         """Also clears the page cursor and in-memory stash."""
         cleared = super().reset_state()
 

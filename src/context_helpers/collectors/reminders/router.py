@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from context_helpers.collectors.reminders.collector import RemindersCollector
 
 
-def make_reminders_router(collector: "RemindersCollector") -> APIRouter:
+def make_reminders_router(collector: RemindersCollector) -> APIRouter:
     """Build and return the reminders router bound to a collector instance."""
     router = APIRouter()
 

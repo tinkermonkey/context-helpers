@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 def register_staleness_metrics(
-    collectors: "list[BaseCollector]", state_store: "StateStore"
+    collectors: list[BaseCollector], state_store: StateStore
 ) -> None:
     """Register observable gauges that report cursor/watermark staleness.
 
@@ -56,12 +56,23 @@ def register_staleness_metrics(
             keys = []
             try:
                 keys = collector.push_cursor_keys()
-            except Exception:
+            except Exception:  # collector-overridable; logged with exc_info so BLE001 allows the broad catch
+                logger.warning(
+                    "staleness: %s.push_cursor_keys() raised; skipping cursor_age for this collector",
+                    collector.name,
+                    exc_info=True,
+                )
                 continue
             for key in keys:
                 try:
                     cursor = collector.get_push_cursor(key)
-                except Exception:
+                except Exception:  # collector-overridable; logged with exc_info so BLE001 allows the broad catch
+                    logger.warning(
+                        "staleness: %s.get_push_cursor(%r) raised; skipping this cursor key",
+                        collector.name,
+                        key,
+                        exc_info=True,
+                    )
                     continue
                 if cursor is None:
                     continue
@@ -76,7 +87,12 @@ def register_staleness_metrics(
             if get_cursor is not None:
                 try:
                     page_cursor = get_cursor()
-                except Exception:
+                except Exception:  # collector-overridable; logged with exc_info so BLE001 allows the broad catch
+                    logger.warning(
+                        "staleness: %s.get_cursor() raised; omitting page cursor age",
+                        collector.name,
+                        exc_info=True,
+                    )
                     page_cursor = None
                 if page_cursor is not None and hasattr(page_cursor, "tzinfo"):
                     observations.append(
@@ -95,7 +111,12 @@ def register_staleness_metrics(
                 has_more_fn = getattr(collector, "has_more", None)
                 if has_more_fn is not None:
                     more = more or bool(has_more_fn())
-            except Exception:
+            except Exception:  # collector-overridable; logged with exc_info so BLE001 allows the broad catch
+                logger.warning(
+                    "staleness: %s.has_push_more()/has_more() raised; skipping has_more for this collector",
+                    collector.name,
+                    exc_info=True,
+                )
                 continue
             observations.append(
                 Observation(1 if more else 0, {"collector": collector.name})
@@ -105,7 +126,8 @@ def register_staleness_metrics(
     def _observe_watermark_age(_options):
         try:
             wm = state_store.get_watermark()
-        except Exception:
+        except Exception:  # metrics must never break on a state-store error; logged with exc_info so BLE001 allows it
+            logger.warning("staleness: state_store.get_watermark() raised; skipping watermark_age", exc_info=True)
             return []
         if wm is None:
             return []
@@ -131,5 +153,5 @@ def register_staleness_metrics(
             unit="s",
         )
         logger.info("staleness metrics registered for %d collectors", len(collectors))
-    except Exception as e:  # pragma: no cover - defensive
+    except Exception as e:  # noqa: BLE001 - pragma: no cover - defensive; registration must never crash startup
         logger.warning("failed to register staleness metrics: %s", e)

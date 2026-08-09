@@ -230,7 +230,7 @@ class CalendarCollector(PagedCollector):
                 "status": "ok",
                 "message": f"Calendar accessible ({row[0]} calendars, {row[1]:,} events)",
             }
-        except Exception as e:
+        except (sqlite3.Error, OSError) as e:
             return {"status": "error", "message": str(e)}
 
     def check_permissions(self) -> list[str]:
@@ -238,11 +238,11 @@ class CalendarCollector(PagedCollector):
             with self._open():
                 pass
             return []
-        except Exception:
+        except (sqlite3.Error, OSError):
             return [
-                f"Read access to Calendar Cache at {self._db_path} "
+                (f"Read access to Calendar Cache at {self._db_path} "
                 "(grant Full Disk Access to Terminal in "
-                "System Settings → Privacy & Security)"
+                "System Settings → Privacy & Security)")
             ]
 
     # ------------------------------------------------------------------

@@ -4,17 +4,15 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from context_helpers.collectors.podcasts.collector import (
-    PodcastsCollector,
     _APPLE_EPOCH_OFFSET,
     _MLX_WHISPER_AVAILABLE,
-    _apple_ts_to_datetime,
+    PodcastsCollector,
     _apple_ts_to_date,
-    _apple_ts_to_iso,
+    _apple_ts_to_datetime,
     _datetime_to_apple_ts,
     _find_transcript_file,
     _listen_event_from_row,
@@ -26,13 +24,12 @@ from context_helpers.collectors.podcasts.collector import (
 )
 from context_helpers.config import PodcastsConfig
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _collector(**kwargs) -> PodcastsCollector:
-    defaults = dict(enabled=True, push_page_size=200, min_played_fraction=0.9)
+    defaults = {"enabled": True, "push_page_size": 200, "min_played_fraction": 0.9}
     defaults.update(kwargs)
     return PodcastsCollector(PodcastsConfig(**defaults))
 
@@ -363,6 +360,7 @@ class TestPlayStateModifiedAt:
         the SQL filter column."""
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from context_helpers.collectors import base as base_mod
 
         monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
@@ -935,11 +933,13 @@ class TestWhisperHelpers:
 
     def test_write_whisper_transcript_tmp_cleaned_on_failure(self, tmp_path):
         """If json.dump raises, the .tmp file is removed."""
-        import unittest.mock as mock
+        from unittest import mock
 
-        with mock.patch("json.dump", side_effect=OSError("disk full")):
-            with pytest.raises(OSError, match="disk full"):
-                _write_whisper_transcript(tmp_path, "ep-fail", {}, "text", "base.en")
+        with (
+            mock.patch("json.dump", side_effect=OSError("disk full")),
+            pytest.raises(OSError, match="disk full"),
+        ):
+            _write_whisper_transcript(tmp_path, "ep-fail", {}, "text", "base.en")
 
         # No .tmp left behind.
         assert not list(tmp_path.glob("*.tmp"))

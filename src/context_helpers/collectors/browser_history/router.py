@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     )
 
 
-def make_browser_history_router(collector: "BrowserHistoryCollector") -> APIRouter:
+def make_browser_history_router(collector: BrowserHistoryCollector) -> APIRouter:
     """Build and return the browser history router bound to a collector instance."""
     router = APIRouter()
 

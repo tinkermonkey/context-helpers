@@ -1,11 +1,16 @@
 """Tests for context_helpers.config — loading, validation, defaults."""
 
-from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
-from context_helpers.config import AppConfig, load_config
+from context_helpers.config import (
+    AppConfig,
+    EmailAccountConfig,
+    EmailConfig,
+    load_config,
+)
 from tests.conftest import TEST_API_KEY, write_config
 
 
@@ -128,3 +133,140 @@ class TestCollectorPaths:
         p = write_config(tmp_path / "config.yaml",
                          {"collectors": {"reminders": {"list_filter": "Work"}}})
         assert load_config(p).collectors.reminders.list_filter == "Work"
+
+
+class TestEmailConfig:
+    def test_disabled_by_default(self, tmp_path):
+        p = write_config(tmp_path / "config.yaml")
+        assert load_config(p).collectors.email.enabled is False
+
+    def test_accounts_default_empty(self, tmp_path):
+        p = write_config(tmp_path / "config.yaml")
+        assert load_config(p).collectors.email.accounts == []
+
+    def test_two_accounts_with_distinct_aliases(self, tmp_path):
+        p = write_config(
+            tmp_path / "config.yaml",
+            {
+                "collectors": {
+                    "email": {
+                        "enabled": True,
+                        "accounts": [
+                            {
+                                "alias": "work",
+                                "host": "imap.gmail.com",
+                                "auth": "oauth",
+                                "username": "work@example.com",
+                                "provider": "gmail",
+                            },
+                            {
+                                "alias": "personal",
+                                "host": "imap.mail.me.com",
+                                "auth": "password",
+                                "username": "personal@example.com",
+                                "password": "app-password",
+                            },
+                        ],
+                    }
+                }
+            },
+        )
+        config = load_config(p).collectors.email
+        assert config.enabled is True
+        assert len(config.accounts) == 2
+        assert {a.alias for a in config.accounts} == {"work", "personal"}
+
+    def test_account_defaults(self, tmp_path):
+        p = write_config(
+            tmp_path / "config.yaml",
+            {
+                "collectors": {
+                    "email": {
+                        "enabled": True,
+                        "accounts": [
+                            {"alias": "work", "host": "imap.example.com", "username": "work@example.com"}
+                        ],
+                    }
+                }
+            },
+        )
+        account = load_config(p).collectors.email.accounts[0]
+        assert account.port == 993
+        assert account.auth == "password"
+        assert account.provider == "custom"
+        assert account.folders == ["INBOX"]
+        assert account.exclude_folders == []
+        assert account.initial_lookback_days == 30
+
+    def test_missing_alias_raises(self):
+        with pytest.raises(ValidationError, match="alias"):
+            EmailAccountConfig(host="imap.example.com")
+
+    def test_missing_host_raises(self):
+        with pytest.raises(ValidationError, match="host"):
+            EmailAccountConfig(alias="work")
+
+    def test_invalid_auth_literal_raises(self):
+        with pytest.raises(ValidationError):
+            EmailAccountConfig(alias="work", host="imap.example.com", auth="carrier-pigeon")
+
+    def test_invalid_provider_literal_raises(self):
+        with pytest.raises(ValidationError):
+            EmailAccountConfig(
+                alias="work", host="imap.example.com", provider="yahoo"
+            )
+
+    def test_duplicate_alias_raises(self):
+        with pytest.raises(ValidationError, match="duplicate"):
+            EmailConfig(
+                enabled=True,
+                accounts=[
+                    EmailAccountConfig(alias="work", host="imap.example.com"),
+                    EmailAccountConfig(alias="work", host="imap.other.com"),
+                ],
+            )
+
+    def test_duplicate_alias_raises_via_load_config(self, tmp_path):
+        p = write_config(
+            tmp_path / "config.yaml",
+            {
+                "collectors": {
+                    "email": {
+                        "enabled": True,
+                        "accounts": [
+                            {"alias": "work", "host": "imap.example.com", "username": "a@example.com"},
+                            {"alias": "work", "host": "imap.other.com", "username": "b@example.com"},
+                        ],
+                    }
+                }
+            },
+        )
+        with pytest.raises(ValidationError, match="duplicate"):
+            load_config(p)
+
+    def test_three_accounts_two_duplicate_aliases_reports_both(self):
+        with pytest.raises(ValidationError, match="alpha, beta"):
+            EmailConfig(
+                enabled=True,
+                accounts=[
+                    EmailAccountConfig(alias="alpha", host="imap.example.com"),
+                    EmailAccountConfig(alias="alpha", host="imap.example.com"),
+                    EmailAccountConfig(alias="beta", host="imap.example.com"),
+                    EmailAccountConfig(alias="beta", host="imap.example.com"),
+                ],
+            )
+
+    def test_config_loading_rejects_account_missing_required_fields(self, tmp_path):
+        p = write_config(
+            tmp_path / "config.yaml",
+            {
+                "collectors": {
+                    "email": {
+                        "enabled": True,
+                        "accounts": [{"alias": "work"}],  # missing required host
+                    }
+                }
+            },
+        )
+        with pytest.raises(ValidationError, match="host"):
+            load_config(p)

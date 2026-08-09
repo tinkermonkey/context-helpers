@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from context_helpers.collectors.calendar.collector import CalendarCollector
 
 
-def make_calendar_router(collector: "CalendarCollector") -> APIRouter:
+def make_calendar_router(collector: CalendarCollector) -> APIRouter:
     """Build and return the calendar router bound to a collector instance."""
     router = APIRouter()
 
