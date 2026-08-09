@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import stat
@@ -292,6 +293,22 @@ class TestBuildMessage:
         )
         msg = _build_message(acct, "INBOX", 5, raw, self._ts())
         assert "**Bob**" in msg["text"]
+
+    def test_html2text_failure_returns_empty_text_instead_of_crashing(
+        self, monkeypatch
+    ):
+        def broken_handle(self, html_content):
+            raise AttributeError("malformed input")
+
+        monkeypatch.setattr(email_mod.html2text.HTML2Text, "handle", broken_handle)
+        acct = _account("work")
+        raw = _raw_message(
+            content_type="text/html; charset=utf-8",
+            body="<html><body><p>Hi <b>Bob</b></p></body></html>",
+        )
+        msg = _build_message(acct, "INBOX", 5, raw, self._ts())
+        assert msg is not None
+        assert msg["text"] == ""
 
     def test_is_from_me_matches_username(self):
         acct = _account("work", username="me@example.com")
@@ -1192,6 +1209,25 @@ class TestGetToken:
         monkeypatch.setattr(email_mod.urllib.request, "urlopen", fake_urlopen)
 
         # _do_refresh raises TypeError from timedelta(seconds="not-a-number");
+        # _get_token must catch it and fall back to the still-stored access
+        # token rather than letting it propagate to a 500.
+        assert collector._get_token(acct) == "stale-access"
+
+    def test_dropped_connection_during_refresh_falls_back_instead_of_crashing(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(email_mod, "_TOKEN_STORE_DIR", tmp_path)
+        acct = self._oauth_account()
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
+        near_expiry = datetime.now(timezone.utc) + timedelta(minutes=1)
+        collector._token_stores["work"].save("stale-access", "refresh-1", near_expiry)
+
+        def fake_urlopen(req, timeout=30):
+            raise http.client.IncompleteRead(b"")
+
+        monkeypatch.setattr(email_mod.urllib.request, "urlopen", fake_urlopen)
+
+        # http.client.IncompleteRead inherits HTTPException, not OSError;
         # _get_token must catch it and fall back to the still-stored access
         # token rather than letting it propagate to a 500.
         assert collector._get_token(acct) == "stale-access"

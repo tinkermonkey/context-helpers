@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import email
 import email.policy
+import http.client
 import json
 import logging
 import os
@@ -435,12 +436,20 @@ class EmailCollector(BaseCollector):
         if refresh_token and account.client_id and account.client_secret:
             try:
                 return self._do_refresh(account, refresh_token)
-            except (OSError, ValueError, KeyError, TypeError) as e:
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                TypeError,
+                http.client.HTTPException,
+            ) as e:
                 # OSError: network failure talking to the token endpoint, or a
                 #   failure persisting the refreshed tokens to disk.
                 # ValueError: malformed JSON response (json.JSONDecodeError).
                 # KeyError: response JSON missing access_token.
                 # TypeError: response JSON has a non-numeric expires_in.
+                # http.client.HTTPException: the connection dropped mid-response
+                #   (e.g. IncompleteRead), which is not an OSError.
                 logger.warning(
                     "email: token refresh failed for %s: %s", account.alias, e
                 )
@@ -608,7 +617,11 @@ def _extract_text(msg: EmailMessage) -> str:
             return ""
         converter = html2text.HTML2Text()
         converter.ignore_links = False
-        return converter.handle(html_content)
+        try:
+            return converter.handle(html_content)
+        except Exception as e:  # noqa: BLE001 - malformed HTML from any account must not crash the endpoint
+            logger.warning("email: html2text failed to convert message body: %s", e)
+            return ""
 
     return ""
 
