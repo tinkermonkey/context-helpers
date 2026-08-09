@@ -16,3 +16,9 @@ build/
 docs/
 tests/
 plists/
+src/
+config.example.yaml
+README.md
+ROADMAP.md
+LICENSE
+CLAUDE.md
