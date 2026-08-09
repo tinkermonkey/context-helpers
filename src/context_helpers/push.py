@@ -205,6 +205,14 @@ class PushTrigger:
                     ):
                         changed.append(collector.name)
                         continue
+                    # Non-paged collectors that served a full push page still have a
+                    # backlog to drain even when has_changes_since() reports no new
+                    # data (e.g. email's UIDNEXT probe is blind to already-known
+                    # backlog) — otherwise the remaining page is never delivered
+                    # until new data arrives or another collector triggers a cycle.
+                    if not isinstance(collector, PagedCollector) and collector.has_push_more():
+                        changed.append(collector.name)
+                        continue
                     if collector.has_changes_since(watermark):
                         changed.append(collector.name)
                 except Exception as e:  # noqa: BLE001 - collector plugin isolation: has_changes_since() may raise arbitrary errors

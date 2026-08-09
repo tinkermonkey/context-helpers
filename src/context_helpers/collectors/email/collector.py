@@ -165,6 +165,19 @@ class EmailCollector(BaseCollector):
     def push_cursor_keys(self) -> list[str]:
         return [push_cursor_key(acct.alias) for acct in self._config.accounts]
 
+    def reset_state(self) -> list[str]:
+        """Also clears the in-memory UIDNEXT tracking used by has_changes_since().
+
+        Without this, a stale UIDNEXT survives the reset and has_changes_since()
+        keeps reporting no changes until new mail arrives, so the just-cleared
+        backlog is never redelivered.
+        """
+        cleared = super().reset_state()
+        if self._uidnext_seen:
+            self._uidnext_seen.clear()
+            cleared.append("uidnext_seen")
+        return cleared
+
     # ------------------------------------------------------------------
     # Health
     # ------------------------------------------------------------------

@@ -159,6 +159,54 @@ class TestPullOwnedExclusion:
 
         assert trigger._pending.is_set()
 
+
+class TestNonPagedBacklogDrain:
+    """A non-PagedCollector with a served-but-unconsumed push page must still
+    be drained even when has_changes_since() reports no new data (e.g. email's
+    UIDNEXT probe can't see backlog left over from a full page or a reset)."""
+
+    def test_has_push_more_triggers_delivery_without_new_changes(self, tmp_path):
+        email = _StubCollector("email", changed=False)
+        email._has_push_more_by_key = {"email_work": True}
+        trigger = _make_trigger([email], tmp_path)
+
+        with patch.object(trigger, "_deliver") as deliver:
+            trigger._check_and_deliver()
+
+        deliver.assert_called_once()
+
+    def test_has_changes_since_not_consulted_when_backlog_pending(self, tmp_path):
+        email = _StubCollector("email", changed=False)
+        email._has_push_more_by_key = {"email_work": True}
+        trigger = _make_trigger([email], tmp_path)
+
+        with patch.object(trigger, "_deliver"):
+            trigger._check_and_deliver()
+
+        assert email.change_checks == 0
+
+    def test_no_backlog_and_no_changes_skips_delivery(self, tmp_path):
+        email = _StubCollector("email", changed=False)
+        trigger = _make_trigger([email], tmp_path)
+
+        with patch.object(trigger, "_deliver") as deliver:
+            trigger._check_and_deliver()
+
+        deliver.assert_not_called()
+
+    def test_pull_owned_has_push_more_not_consulted(self, tmp_path):
+        """Pull-owned collectors must still be skipped even with a pending page."""
+        oura = _StubCollector("oura", pull_owned=True, changed=False)
+        oura._has_push_more_by_key = {"oura": True}
+        trigger = _make_trigger([oura], tmp_path)
+
+        with patch.object(trigger, "_deliver") as deliver:
+            trigger._check_and_deliver()
+
+        deliver.assert_not_called()
+
+
+class TestDefaultCollectorsArePushOwned:
     def test_default_collectors_are_push_owned(self):
         assert _StubCollector("x").pull_owned is False
 

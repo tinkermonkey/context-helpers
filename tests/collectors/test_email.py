@@ -689,6 +689,50 @@ class TestHasChangesSince:
         assert collector.has_changes_since(None) is True
 
 
+class TestResetState:
+    def test_clears_uidnext_seen(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("context_helpers.collectors.base._CURSORS_DIR", tmp_path / "cursors")
+        acct = _account("work")
+        fake = FakeIMAPClient(uidnext=100)
+        monkeypatch.setattr(email_mod, "_connect", lambda account, token=None: fake)
+
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
+        collector.has_changes_since(None)  # primes _uidnext_seen
+        assert collector._uidnext_seen == {"work": 100}
+
+        cleared = collector.reset_state()
+
+        assert collector._uidnext_seen == {}
+        assert "uidnext_seen" in cleared
+
+    def test_has_changes_since_true_after_reset_with_unchanged_uidnext(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr("context_helpers.collectors.base._CURSORS_DIR", tmp_path / "cursors")
+        acct = _account("work")
+        fake = FakeIMAPClient(uidnext=100)
+        monkeypatch.setattr(email_mod, "_connect", lambda account, token=None: fake)
+
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
+        collector.has_changes_since(None)
+        assert collector.has_changes_since(None) is False  # unchanged UIDNEXT
+
+        collector.reset_state()
+
+        # UIDNEXT still hasn't moved, but the reset backlog must be redelivered.
+        assert collector.has_changes_since(None) is True
+
+    def test_reset_idempotent_with_no_probes_run(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("context_helpers.collectors.base._CURSORS_DIR", tmp_path / "cursors")
+        acct = _account("work")
+        collector = EmailCollector(EmailConfig(enabled=True, accounts=[acct]))
+
+        cleared = collector.reset_state()
+
+        assert collector._uidnext_seen == {}
+        assert "uidnext_seen" not in cleared
+
+
 class TestHealthCheck:
     def test_no_accounts_is_error(self):
         collector = EmailCollector(EmailConfig(enabled=True, accounts=[]))
