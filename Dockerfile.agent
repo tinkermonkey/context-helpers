@@ -69,6 +69,7 @@ from opentelemetry import trace, metrics; \
 from opentelemetry.sdk.trace import TracerProvider; \
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor; \
 import fastapi, uvicorn, yaml, click, jinja2, markitdown; \
+import imapclient; import html2text; \
 import os; assert '/workspace/context-helpers/src' in os.environ.get('PYTHONPATH', ''); \
 print('Python imports OK')"
 
