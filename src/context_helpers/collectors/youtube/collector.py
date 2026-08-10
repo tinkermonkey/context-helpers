@@ -63,6 +63,9 @@ class YouTubeCollector(BaseCollector):
 
         return make_youtube_router(self)
 
+    def push_cursor_keys(self) -> list[str]:
+        return ["youtube_history", "youtube_transcripts"]
+
     def health_check(self) -> dict:
         """Verify yt-dlp is installed and reachable."""
         try:
@@ -91,6 +94,47 @@ class YouTubeCollector(BaseCollector):
         # yt-dlp reads cookies directly from the browser's profile directory;
         # no special macOS TCC permissions are required.
         return []
+
+    # ------------------------------------------------------------------
+    # Change detection
+    # ------------------------------------------------------------------
+
+    def has_changes_since(self, watermark: datetime | None) -> bool:
+        """Evaluate both push cursors (history, transcripts) independently.
+
+        Mirrors PodcastsCollector.has_changes_since(): compares the
+        seen-cache mtime against the OLDEST of the two cursors, so a
+        stalled endpoint (e.g. transcripts, before its cursor ever
+        advances) doesn't mask new data for the other.
+        """
+        if self.has_push_more():
+            return True
+
+        # If any cursor is absent (never delivered), we have data to deliver.
+        for key in self.push_cursor_keys():
+            if self.get_push_cursor(key) is None:
+                return True
+
+        oldest_cursor: datetime | None = None
+        for key in self.push_cursor_keys():
+            cursor = self.get_push_cursor(key)
+            if cursor is not None and (oldest_cursor is None or cursor < oldest_cursor):
+                oldest_cursor = cursor
+
+        compare_against = oldest_cursor or watermark
+        if compare_against is None:
+            return True
+
+        try:
+            mtime = datetime.fromtimestamp(
+                _SEEN_CACHE_PATH.stat().st_mtime, tz=timezone.utc
+            )
+            if mtime > compare_against:
+                return True
+        except OSError:
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Data fetching

@@ -35,7 +35,9 @@ def make_youtube_router(collector: YouTubeCollector) -> APIRouter:
         Results are sorted by ``watched_at`` ASC and bounded by
         ``push_page_size`` to prevent oversized responses during catch-up.
         """
-        items = collector.fetch_history(since=collector.resolve_push_since(since))
-        return collector.apply_push_paging(items, "watched_at")
+        items = collector.fetch_history(
+            since=collector.resolve_push_since(since, "youtube_history")
+        )
+        return collector.apply_push_paging(items, "watched_at", "youtube_history")
 
     return router

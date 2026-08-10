@@ -127,3 +127,62 @@ class TestPushPagingWalk:
         page = collector.apply_push_paging(items, "watched_at")
         assert len(page) == 2
         assert collector.has_push_more() is True
+
+
+class TestConfigDefaults:
+    def test_transcript_field_defaults(self):
+        cfg = YouTubeConfig()
+        assert cfg.fetch_transcripts is False
+        assert cfg.auto_transcribe is False
+        assert cfg.whisper_model == "base.en"
+        assert isinstance(cfg.whisper_transcripts_dir, str)
+        assert isinstance(cfg.whisper_batch_size, int)
+        assert isinstance(cfg.sub_langs, str)
+        assert cfg.transcript_lookback_days == 30
+
+
+class TestPushCursorKeys:
+    def test_push_cursor_keys_returns_history_and_transcripts(self, collector):
+        assert collector.push_cursor_keys() == ["youtube_history", "youtube_transcripts"]
+
+    def test_history_endpoint_uses_youtube_history_cursor_key(
+        self, collector, monkeypatch, tmp_path
+    ):
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        monkeypatch.setattr(collector, "_run_ytdlp", lambda: _entries(1))
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+        app.include_router(collector.get_router())
+        client = TestClient(app)
+
+        resp = client.get("/youtube/history")
+        assert resp.status_code == 200
+        assert len(resp.json()) == 1
+
+        assert collector.get_push_cursor("youtube_history") is not None
+        assert collector.get_push_cursor("youtube") is None
+        assert not (tmp_path / "cursors" / "youtube_push.json").exists()
+        assert (tmp_path / "cursors" / "youtube_history_push.json").exists()
+
+    def test_has_changes_since_true_when_transcripts_cursor_absent(
+        self, collector, monkeypatch, tmp_path
+    ):
+        """Even after /youtube/history delivers fully, the transcripts cursor
+        is still unset, so has_changes_since must keep returning True
+        (oldest-of-both semantics) rather than going quiet."""
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        monkeypatch.setattr(collector, "_run_ytdlp", lambda: _entries(1))
+
+        items = collector.fetch_history(since=None)
+        collector.apply_push_paging(items, "watched_at", "youtube_history")
+
+        assert collector.get_push_cursor("youtube_history") is not None
+        assert collector.get_push_cursor("youtube_transcripts") is None
+        assert collector.has_changes_since(None) is True

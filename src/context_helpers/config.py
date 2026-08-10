@@ -227,6 +227,19 @@ class YouTubeConfig(BaseSettings):
     enabled: bool = False
     browser: Literal["safari", "chrome", "firefox", "chromium", "brave", "opera", "edge"] = "safari"
     push_page_size: int = 50    # max videos returned per push-trigger cycle
+    # Transcript support — yt-dlp captions
+    fetch_transcripts: bool = False
+    sub_langs: str = "en"
+    # Whisper auto-transcription fallback (requires mlx-whisper extra)
+    auto_transcribe: bool = False
+    whisper_model: str = "base.en"   # short name or full mlx-community HuggingFace repo
+    whisper_transcripts_dir: str = (
+        "~/.local/share/context-helpers/youtube_transcripts"
+    )
+    whisper_batch_size: int = 3      # max videos transcribed per push cycle
+    # Backfill safety rail: on first run (or cursor reset), only videos seen
+    # within this many days are eligible for transcript fetching.
+    transcript_lookback_days: int = 30
 
 
 class PodcastsConfig(BaseSettings):
