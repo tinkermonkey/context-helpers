@@ -313,6 +313,10 @@ class PushConfig(BaseSettings):
     library_url: str = ""      # URL of context-library server, e.g. "http://server:8000"
     library_secret: str = ""   # Must match CTX_WEBHOOK_SECRET on context-library
     poll_interval: int = 60    # Seconds between polling cycles for non-file sources
+    # Seconds between change-checks for collectors marked slow_poll=True (e.g.
+    # contacts) — sources that change infrequently and are expensive to
+    # check/ingest, so they're excluded from the fast poll_interval cadence.
+    slow_poll_interval: int = 3600
 
 
 class TelemetryConfig(BaseSettings):

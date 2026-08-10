@@ -122,6 +122,8 @@ class ContactsCollector(BaseCollector):
     deleted (AddressBook mtime advances).
     """
 
+    slow_poll = True
+
     def __init__(self, config: ContactsConfig) -> None:
         self._config = config
         self._cache: list[dict] = []

@@ -6,6 +6,7 @@ import importlib.util
 import logging
 import socket
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -77,6 +78,10 @@ class PushTrigger:
         self._poll_thread: threading.Thread | None = None
         self._observer: Any | None = None
         self._consecutive_timeouts: int = 0
+        # Monotonic timestamp of the last slow_poll change-check. Initialized
+        # in the past by slow_poll_interval so the first tick after startup
+        # treats slow collectors as due, instead of waiting a full interval.
+        self._last_slow_check: float = time.monotonic() - config.slow_poll_interval
 
     def start(self) -> None:
         """Start background poll thread and optional FSEvents watcher."""
@@ -186,8 +191,14 @@ class PushTrigger:
         """Ask each collector if it has changes; deliver if any do."""
         watermark = self._state.get_watermark()
 
+        now = time.monotonic()
+        slow_due = (now - self._last_slow_check) >= self._config.slow_poll_interval
+        if slow_due:
+            self._last_slow_check = now
+
         with _tracer.start_as_current_span("push.cycle") as span:
             span.set_attribute("push.watermark", watermark.isoformat() if watermark else "")
+            span.set_attribute("push.slow_due", slow_due)
 
             changed = []
             for collector in self._collectors:
@@ -197,6 +208,11 @@ class PushTrigger:
                 # unconsumed stash that makes the push loop spin. FSEvents still
                 # call request_scan() for them so their indexes stay fresh.
                 if collector.pull_owned:
+                    continue
+                # Slow-poll collectors (e.g. contacts) are expensive to check
+                # and change infrequently — only consider them once every
+                # slow_poll_interval, not on every fast poll_interval tick.
+                if collector.slow_poll and not slow_due:
                     continue
                 try:
                     # Paged collectors with a loaded stash or more pages are always changed

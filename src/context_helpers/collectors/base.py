@@ -67,6 +67,12 @@ class BaseCollector(ABC):
     # apple_music_library).
     pull_owned: bool = False
 
+    # When True, this collector is only checked for changes once per
+    # slow_poll_interval instead of every fast poll_interval tick — for
+    # sources that change infrequently and are expensive to check/ingest
+    # (e.g. contacts, which requires a full JXA export).
+    slow_poll: bool = False
+
     @property
     @abstractmethod
     def name(self) -> str:
