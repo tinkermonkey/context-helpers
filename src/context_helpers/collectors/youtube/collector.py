@@ -20,6 +20,18 @@ When polling runs every 15–30 minutes the approximation is tight enough that
 ``first_seen_at ≈ watched_at``.  On the very first run the entire history page
 (≈ 200 videos) lands at the same timestamp; subsequent polls only surface videos
 that are genuinely new.
+
+Whisper fallback transcription
+===============================
+Videos with no caption track fall back to local transcription when
+``auto_transcribe=True``.  A video becomes a whisper candidate once the
+caption path above (``fetch_pending_captions``) has attempted it and found
+no transcript.  For each candidate an audio-only stream is downloaded via
+``yt-dlp -x --audio-format wav`` to a temp file, transcribed locally with
+mlx-whisper (reusing ``PodcastsCollector``'s model-name resolution and
+transcription helper), written to ``whisper_transcripts_dir`` tagged
+``transcriptSource: "whisper"``, and the downloaded audio is always deleted
+afterward.  Requires the `whisper` extra: pip install 'context-helpers[whisper]'.
 """
 
 from __future__ import annotations
@@ -28,6 +40,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -38,10 +51,18 @@ from fastapi import APIRouter
 
 from context_helpers import telemetry as tel
 from context_helpers.collectors.base import BaseCollector
+from context_helpers.collectors.podcasts.collector import (
+    _MLX_WHISPER_AVAILABLE,
+    _transcribe_audio_file,
+)
 from context_helpers.config import YouTubeConfig
 from context_helpers.telemetry import subprocess_span
 
 _tracer = tel.get_tracer("context_helpers.collectors.youtube")
+
+# audio-only downloads run longer than caption fetches (60s); bound generously
+# so one slow video doesn't wedge the whisper backfill thread indefinitely.
+_AUDIO_DOWNLOAD_TIMEOUT = 300
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +179,39 @@ def _write_caption_transcript(
     return out_path
 
 
+def _write_whisper_transcript(
+    output_dir: Path,
+    video_id: str,
+    metadata: dict,
+    text: str,
+    model_name: str,
+) -> Path:
+    """Write a whisper transcript JSON to output_dir/<video_id>.json atomically.
+
+    Mirrors PodcastsCollector._write_whisper_transcript and
+    _write_caption_transcript above; shares _caption_transcript_path for the
+    same video-id sanitization.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = _caption_transcript_path(output_dir, video_id)
+    tmp_path = out_path.with_suffix(".tmp")
+    payload = {
+        **metadata,
+        "transcript": text,
+        "transcriptSource": "whisper",
+        "transcriptCreatedAt": datetime.now(tz=timezone.utc).isoformat(),
+        "whisperModel": model_name,
+    }
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        tmp_path.replace(out_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return out_path
+
+
 class YouTubeCollector(BaseCollector):
     """Collects YouTube watch history via yt-dlp with browser cookie extraction."""
 
@@ -169,6 +223,11 @@ class YouTubeCollector(BaseCollector):
         self._caption_attempts: dict[str, str] = self._load_caption_attempts()
         self._caption_fetch_lock = threading.Lock()
         self._caption_fetch_thread: threading.Thread | None = None
+        self._whisper_transcripts_dir = Path(
+            os.path.expanduser(config.whisper_transcripts_dir)
+        )
+        self._transcription_lock = threading.Lock()
+        self._transcription_thread: threading.Thread | None = None
 
     @property
     def name(self) -> str:
@@ -227,6 +286,11 @@ class YouTubeCollector(BaseCollector):
         # fetch_transcripts is on (mirrors PodcastsCollector's whisper trigger).
         if self._config.fetch_transcripts:
             self._start_caption_fetch_bg()
+
+        # Kick off background whisper transcription for videos the caption
+        # path above found no transcript for.
+        if self._config.auto_transcribe:
+            self._start_transcription_bg()
 
         if self.has_push_more():
             return True
@@ -603,6 +667,223 @@ class YouTubeCollector(BaseCollector):
             # background caption-fetch thread; any failure must be logged
             # and swallowed rather than killing the daemon thread silently.
             logger.error("YouTubeCollector: background caption fetch error: %s", e)
+
+    # ------------------------------------------------------------------
+    # Whisper fallback transcription pipeline
+    # ------------------------------------------------------------------
+
+    def transcribe_pending(self, max_videos: int | None = None) -> int:
+        """Transcribe videos the caption path attempted but found no transcript for.
+
+        Candidates are drawn from the caption-attempts cache (not the full
+        seen-cache): videos fetch_pending_captions() has already tried and
+        failed to find a caption track for, which don't already have a
+        whisper transcript file on disk. Bounded by whisper_batch_size (or
+        max_videos) per call so a large backlog doesn't turn one poll into
+        many sequential downloads; the remainder defer to later calls.
+
+        For each candidate: download an audio-only stream via yt-dlp,
+        transcribe it with mlx-whisper, write a transcript JSON tagged
+        transcriptSource="whisper", then delete the downloaded audio —
+        whether transcription succeeded or failed. Unlike PodcastsCollector
+        (which transcribes audio it never downloaded), this collector must
+        clean up the audio it downloads.
+
+        A download or transcription failure for one video is logged and
+        skipped; it never blocks the remaining videos.
+
+        Returns the count of videos successfully transcribed.
+
+        This method is safe to call from any thread. It is synchronous —
+        call _start_transcription_bg() for non-blocking execution.
+        """
+        if not self._config.auto_transcribe:
+            return 0
+
+        if not _MLX_WHISPER_AVAILABLE:
+            logger.warning(
+                "YouTubeCollector: auto_transcribe=True but mlx-whisper is not installed. "
+                "Install it with: pip install 'context-helpers[whisper]'"
+            )
+            return 0
+
+        limit = max_videos if max_videos is not None else self._config.whisper_batch_size
+        candidates = self._fetch_pending_whisper_candidates(limit)
+        if not candidates:
+            return 0
+
+        model = self._config.whisper_model
+        count = 0
+
+        for video_id, first_seen in candidates:
+            audio_path: Path | None = None
+            try:
+                audio_path = self._download_audio_for_whisper(video_id)
+                if audio_path is None:
+                    logger.debug(
+                        "YouTubeCollector: audio download failed for %s", video_id
+                    )
+                    continue
+
+                logger.info(
+                    "YouTubeCollector: transcribing %s (%s)", video_id, audio_path.name
+                )
+                text = _transcribe_audio_file(audio_path, model, log_prefix="YouTubeCollector")
+                if not text:
+                    continue
+
+                metadata = {
+                    "id": video_id,
+                    "source": "youtube",
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                    "firstSeenAt": first_seen.isoformat() if first_seen else None,
+                }
+                _write_whisper_transcript(
+                    self._whisper_transcripts_dir, video_id, metadata, text, model
+                )
+                logger.info(
+                    "YouTubeCollector: wrote whisper transcript for %s (%d chars)",
+                    video_id, len(text),
+                )
+                count += 1
+            except Exception as e:  # noqa: BLE001 - one video's download or
+                # transcription failing must not stop processing of the
+                # remaining videos.
+                logger.warning(
+                    "YouTubeCollector: whisper transcription failed for %s: %s", video_id, e
+                )
+            finally:
+                # Always delete the downloaded audio, success or failure —
+                # this collector (unlike PodcastsCollector) downloaded it
+                # itself and is responsible for cleaning it up.
+                if audio_path is not None:
+                    shutil.rmtree(audio_path.parent, ignore_errors=True)
+
+        return count
+
+    def _fetch_pending_whisper_candidates(
+        self, limit: int
+    ) -> list[tuple[str, datetime | None]]:
+        """Return (video_id, first_seen) pairs eligible for whisper fallback.
+
+        A video becomes eligible once fetch_pending_captions() has attempted
+        it and found no caption transcript file, and no whisper transcript
+        has been written for it yet. Videos never attempted for captions
+        (fetch_transcripts=False, or still queued behind caption_batch_size)
+        are not eligible — whisper is a fallback for the caption path, not a
+        replacement for it. Sorted oldest-first_seen-first.
+        """
+        candidates: list[tuple[str, datetime | None]] = []
+        for video_id in list(self._caption_attempts):
+            if _caption_transcript_path(self._transcripts_dir, video_id).exists():
+                continue
+            if _caption_transcript_path(self._whisper_transcripts_dir, video_id).exists():
+                continue
+
+            first_seen: datetime | None = None
+            first_seen_iso = self._seen.get(video_id)
+            if first_seen_iso:
+                try:
+                    first_seen = datetime.fromisoformat(first_seen_iso.replace("Z", "+00:00"))
+                except ValueError:
+                    first_seen = None
+            candidates.append((video_id, first_seen))
+
+        candidates.sort(key=lambda c: c[1] or datetime.min.replace(tzinfo=timezone.utc))
+        return candidates[:limit]
+
+    def _download_audio_for_whisper(self, video_id: str) -> Path | None:
+        """Download an audio-only stream for video_id via yt-dlp -x --audio-format wav.
+
+        Returns the path to the downloaded wav file inside a fresh temp
+        directory, or None if the download failed (in which case the temp
+        directory is already cleaned up). On success, the caller owns
+        deleting the returned path's parent directory after use.
+        """
+        tmp_dir = Path(tempfile.mkdtemp(prefix="context-helpers-youtube-whisper-"))
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        cmd = [
+            "yt-dlp",
+            "--cookies-from-browser", self._browser,
+            "-x", "--audio-format", "wav",
+            "--quiet",
+            "--no-warnings",
+            "-o", "%(id)s.%(ext)s",
+            url,
+        ]
+        with subprocess_span(_tracer, "youtube.fetch_audio", "yt-dlp",
+                             youtube_video_id=video_id) as span:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    cwd=tmp_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=_AUDIO_DOWNLOAD_TIMEOUT,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "YouTubeCollector: audio download timed out for %s", video_id
+                )
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return None
+            except FileNotFoundError:
+                logger.warning(
+                    "YouTubeCollector: yt-dlp not found — install with: pip install yt-dlp"
+                )
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return None
+
+            if result.returncode != 0:
+                logger.warning(
+                    "YouTubeCollector: yt-dlp exited %d downloading audio for %s: %s",
+                    result.returncode, video_id, result.stderr.strip()[:400],
+                )
+
+            audio_files = sorted(tmp_dir.glob(f"{video_id}*.wav"))
+            if not audio_files:
+                span.set_attribute("youtube.audio_downloaded", False)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return None
+
+            span.set_attribute("youtube.audio_downloaded", True)
+            return audio_files[0]
+
+    def _start_transcription_bg(self) -> None:
+        """Start a background whisper-transcription thread if one isn't already running."""
+        with self._transcription_lock:
+            if (
+                self._transcription_thread is not None
+                and self._transcription_thread.is_alive()
+            ):
+                return
+            _transcribe_ctx = tel.capture_context()
+
+            def _transcribe_target():
+                with tel.run_in_context(_transcribe_ctx):
+                    self._run_transcription_backfill()
+
+            t = threading.Thread(
+                target=_transcribe_target,
+                daemon=True,
+                name="youtube-transcription",
+            )
+            self._transcription_thread = t
+            t.start()
+
+    def _run_transcription_backfill(self) -> None:
+        """Background thread: transcribe one batch of pending videos."""
+        try:
+            count = self.transcribe_pending()
+            if count:
+                logger.info(
+                    "YouTubeCollector: background transcription finished, %d videos", count
+                )
+        except Exception as e:  # noqa: BLE001 - last-resort guard for the
+            # background transcription thread; any failure must be logged
+            # and swallowed rather than killing the daemon thread silently.
+            logger.error("YouTubeCollector: background transcription error: %s", e)
 
     # ------------------------------------------------------------------
     # Seen-cache persistence

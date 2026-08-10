@@ -336,21 +336,27 @@ def _resolve_asset_url(asset_url: str, podcasts_dir: Path = _PODCASTS_DIR) -> Pa
     return candidate if candidate.exists() else None
 
 
-def _transcribe_audio_file(audio_path: Path, model_name: str) -> str | None:
+def _transcribe_audio_file(
+    audio_path: Path, model_name: str, log_prefix: str = "PodcastsCollector"
+) -> str | None:
     """Transcribe an audio file using mlx-whisper and return the full text.
+
+    log_prefix identifies the calling collector in log messages (e.g.
+    "YouTubeCollector" when reused for the YouTube whisper-fallback pipeline).
 
     Returns None if mlx-whisper is unavailable, the file is unreadable, or
     transcription produces no text.
     """
     if not _MLX_WHISPER_AVAILABLE:
         logger.warning(
-            "PodcastsCollector: auto_transcribe=True but mlx-whisper is not installed. "
-            "Install it with: pip install 'context-helpers[whisper]'"
+            "%s: auto_transcribe=True but mlx-whisper is not installed. "
+            "Install it with: pip install 'context-helpers[whisper]'",
+            log_prefix,
         )
         return None
 
     repo = _mlx_repo_for_model(model_name)
-    logger.debug("PodcastsCollector: transcribing %s with %s", audio_path.name, repo)
+    logger.debug("%s: transcribing %s with %s", log_prefix, audio_path.name, repo)
     with subprocess_span(_tracer, "podcasts.transcribe", "mlx-whisper",
                          podcasts_audio_file=audio_path.name,
                          podcasts_model=model_name) as span:
@@ -364,7 +370,7 @@ def _transcribe_audio_file(audio_path: Path, model_name: str) -> str | None:
             # failing (mlx-whisper covers many failure modes: bad audio,
             # model load errors, OOM, etc.) must not crash the collector.
             logger.warning(
-                "PodcastsCollector: transcription failed for %s: %s", audio_path.name, e
+                "%s: transcription failed for %s: %s", log_prefix, audio_path.name, e
             )
             return None
 

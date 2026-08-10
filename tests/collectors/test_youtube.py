@@ -58,6 +58,28 @@ def collector(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def whisper_collector(tmp_path, monkeypatch):
+    """YouTubeCollector with fetch_transcripts + auto_transcribe enabled and caches isolated to tmp_path."""
+    monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
+    monkeypatch.setattr(
+        yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
+    )
+    c = YouTubeCollector(
+        YouTubeConfig(
+            enabled=True,
+            browser="safari",
+            fetch_transcripts=True,
+            auto_transcribe=True,
+            sub_langs="en",
+            transcripts_dir=str(tmp_path / "captions"),
+            whisper_transcripts_dir=str(tmp_path / "whisper"),
+            whisper_batch_size=5,
+        )
+    )
+    return c
+
+
+@pytest.fixture
 def transcripts_collector(tmp_path, monkeypatch):
     """YouTubeCollector with fetch_transcripts enabled and caches isolated to tmp_path."""
     monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
@@ -605,3 +627,350 @@ class TestCaptionBatchSize:
 
         assert len(calls) == 2
         assert calls == ["vid-0", "vid-1"]
+
+
+def _fake_download(tmp_path):
+    """Build a _download_audio_for_whisper replacement that writes a real
+    temp dir + wav file per call, so deletion can be asserted afterward."""
+
+    def _download(video_id: str) -> Path:
+        audio_dir = tmp_path / f"audio-{video_id}"
+        audio_dir.mkdir()
+        audio_file = audio_dir / f"{video_id}.wav"
+        audio_file.write_bytes(b"fake-audio")
+        return audio_file
+
+    return _download
+
+
+class TestTranscribePending:
+    def test_returns_zero_when_auto_transcribe_disabled(
+        self, transcripts_collector, monkeypatch
+    ):
+        transcripts_collector._caption_attempts["vid-x"] = datetime.now(timezone.utc).isoformat()
+        calls: list[str] = []
+        monkeypatch.setattr(
+            transcripts_collector, "_download_audio_for_whisper", lambda v: calls.append(v)
+        )
+
+        assert transcripts_collector.transcribe_pending() == 0
+        assert calls == []
+
+    def test_missing_mlx_whisper_logs_warning_and_returns_zero(
+        self, whisper_collector, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", False)
+        whisper_collector._caption_attempts["vid-x"] = datetime.now(timezone.utc).isoformat()
+
+        with caplog.at_level("WARNING"):
+            count = whisper_collector.transcribe_pending()
+
+        assert count == 0
+        messages = [r.message for r in caplog.records]
+        assert any("mlx-whisper is not installed" in m for m in messages)
+        assert any("pip install" in m for m in messages)
+
+    def test_video_never_caption_attempted_is_not_a_candidate(
+        self, whisper_collector, monkeypatch
+    ):
+        whisper_collector._seen["vid-new"] = datetime.now(timezone.utc).isoformat()
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+        calls: list[str] = []
+        monkeypatch.setattr(
+            whisper_collector, "_download_audio_for_whisper", lambda v: calls.append(v)
+        )
+
+        assert whisper_collector.transcribe_pending() == 0
+        assert calls == []
+
+    def test_video_with_existing_caption_transcript_is_not_a_candidate(
+        self, whisper_collector, monkeypatch
+    ):
+        vid = "vid-has-caption"
+        whisper_collector._caption_attempts[vid] = datetime.now(timezone.utc).isoformat()
+        whisper_collector._transcripts_dir.mkdir(parents=True, exist_ok=True)
+        (whisper_collector._transcripts_dir / f"{vid}.json").write_text("{}")
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            whisper_collector, "_download_audio_for_whisper", lambda v: calls.append(v)
+        )
+
+        assert whisper_collector.transcribe_pending() == 0
+        assert calls == []
+
+    def test_video_already_whisper_transcribed_is_skipped(
+        self, whisper_collector, monkeypatch
+    ):
+        vid = "vid-done"
+        whisper_collector._caption_attempts[vid] = datetime.now(timezone.utc).isoformat()
+        whisper_collector._whisper_transcripts_dir.mkdir(parents=True, exist_ok=True)
+        (whisper_collector._whisper_transcripts_dir / f"{vid}.json").write_text("{}")
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            whisper_collector, "_download_audio_for_whisper", lambda v: calls.append(v)
+        )
+
+        assert whisper_collector.transcribe_pending() == 0
+        assert calls == []
+
+    def test_success_writes_transcript_tagged_whisper_and_deletes_audio(
+        self, whisper_collector, monkeypatch, tmp_path
+    ):
+        vid = "vid-1"
+        whisper_collector._caption_attempts[vid] = datetime.now(timezone.utc).isoformat()
+        whisper_collector._seen[vid] = datetime.now(timezone.utc).isoformat()
+
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+        download = _fake_download(tmp_path)
+        monkeypatch.setattr(whisper_collector, "_download_audio_for_whisper", download)
+        monkeypatch.setattr(
+            yt_mod,
+            "_transcribe_audio_file",
+            lambda path, model, log_prefix=None: "Hello from whisper.",
+        )
+
+        count = whisper_collector.transcribe_pending()
+
+        assert count == 1
+        assert not (tmp_path / f"audio-{vid}").exists(), "downloaded audio must be deleted"
+        out_path = whisper_collector._whisper_transcripts_dir / f"{vid}.json"
+        assert out_path.exists()
+        data = json.loads(out_path.read_text())
+        assert data["id"] == vid
+        assert data["transcript"] == "Hello from whisper."
+        assert data["transcriptSource"] == "whisper"
+        assert data["source"] == "youtube"
+
+    def test_failed_transcription_still_deletes_audio_and_writes_nothing(
+        self, whisper_collector, monkeypatch, tmp_path
+    ):
+        vid = "vid-2"
+        whisper_collector._caption_attempts[vid] = datetime.now(timezone.utc).isoformat()
+
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+        download = _fake_download(tmp_path)
+        monkeypatch.setattr(whisper_collector, "_download_audio_for_whisper", download)
+        monkeypatch.setattr(
+            yt_mod, "_transcribe_audio_file", lambda path, model, log_prefix=None: None
+        )
+
+        count = whisper_collector.transcribe_pending()
+
+        assert count == 0
+        assert not (tmp_path / f"audio-{vid}").exists(), "downloaded audio must be deleted"
+        assert not (whisper_collector._whisper_transcripts_dir / f"{vid}.json").exists()
+
+    def test_exception_during_write_still_deletes_audio_and_does_not_raise(
+        self, whisper_collector, monkeypatch, tmp_path
+    ):
+        vid = "vid-3"
+        whisper_collector._caption_attempts[vid] = datetime.now(timezone.utc).isoformat()
+
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+        download = _fake_download(tmp_path)
+        monkeypatch.setattr(whisper_collector, "_download_audio_for_whisper", download)
+        monkeypatch.setattr(
+            yt_mod, "_transcribe_audio_file", lambda path, model, log_prefix=None: "text"
+        )
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(yt_mod, "_write_whisper_transcript", boom)
+
+        count = whisper_collector.transcribe_pending()  # must not raise
+
+        assert count == 0
+        assert not (tmp_path / f"audio-{vid}").exists(), "downloaded audio must be deleted"
+
+    def test_download_failure_skips_video_without_crash(self, whisper_collector, monkeypatch):
+        vid = "vid-4"
+        whisper_collector._caption_attempts[vid] = datetime.now(timezone.utc).isoformat()
+
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+        monkeypatch.setattr(whisper_collector, "_download_audio_for_whisper", lambda v: None)
+
+        count = whisper_collector.transcribe_pending()
+
+        assert count == 0
+
+    def test_one_video_failure_does_not_block_others(
+        self, whisper_collector, monkeypatch, tmp_path
+    ):
+        ok_vid, fail_vid = "vid-ok", "vid-fail"
+        now = datetime.now(timezone.utc)
+        whisper_collector._caption_attempts[fail_vid] = now.isoformat()
+        whisper_collector._caption_attempts[ok_vid] = (now + timedelta(seconds=1)).isoformat()
+
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+        monkeypatch.setattr(whisper_collector, "_download_audio_for_whisper", _fake_download(tmp_path))
+
+        def fake_transcribe(path, model, log_prefix=None):
+            if fail_vid in path.name:
+                raise RuntimeError("boom")
+            return "good text"
+
+        monkeypatch.setattr(yt_mod, "_transcribe_audio_file", fake_transcribe)
+
+        count = whisper_collector.transcribe_pending()
+
+        assert count == 1
+        assert (whisper_collector._whisper_transcripts_dir / f"{ok_vid}.json").exists()
+        assert not (whisper_collector._whisper_transcripts_dir / f"{fail_vid}.json").exists()
+        # Both videos' downloaded audio must be cleaned up regardless of outcome.
+        assert not (tmp_path / f"audio-{ok_vid}").exists()
+        assert not (tmp_path / f"audio-{fail_vid}").exists()
+
+    def test_bounded_by_whisper_batch_size_remainder_deferred(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
+        monkeypatch.setattr(
+            yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
+        )
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+        c = YouTubeCollector(
+            YouTubeConfig(
+                enabled=True,
+                fetch_transcripts=True,
+                auto_transcribe=True,
+                transcripts_dir=str(tmp_path / "captions"),
+                whisper_transcripts_dir=str(tmp_path / "whisper"),
+                whisper_batch_size=2,
+            )
+        )
+        now = datetime.now(timezone.utc)
+        for i in range(5):
+            vid = f"vid-{i}"
+            c._caption_attempts[vid] = (now + timedelta(seconds=i)).isoformat()
+            c._seen[vid] = (now + timedelta(seconds=i)).isoformat()
+
+        calls: list[str] = []
+
+        def fake_download(video_id):
+            calls.append(video_id)
+            audio_dir = tmp_path / f"audio-{video_id}"
+            audio_dir.mkdir()
+            audio_file = audio_dir / f"{video_id}.wav"
+            audio_file.write_bytes(b"fake")
+            return audio_file
+
+        monkeypatch.setattr(c, "_download_audio_for_whisper", fake_download)
+        monkeypatch.setattr(
+            yt_mod, "_transcribe_audio_file", lambda path, model, log_prefix=None: "text"
+        )
+
+        count = c.transcribe_pending()
+
+        assert count == 2
+        assert calls == ["vid-0", "vid-1"], "oldest first_seen videos transcribed first"
+
+        # Remaining videos are untouched, deferred to a later cycle.
+        assert not (c._whisper_transcripts_dir / "vid-2.json").exists()
+        assert not (c._whisper_transcripts_dir / "vid-3.json").exists()
+        assert not (c._whisper_transcripts_dir / "vid-4.json").exists()
+
+        # A later cycle picks up the remainder.
+        count2 = c.transcribe_pending()
+        assert count2 == 2
+        assert calls == ["vid-0", "vid-1", "vid-2", "vid-3"]
+
+
+class TestTranscriptionBackgroundTrigger:
+    def test_has_changes_since_starts_transcription_when_auto_transcribe_enabled(
+        self, whisper_collector, monkeypatch, tmp_path
+    ):
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        monkeypatch.setattr(whisper_collector, "_start_caption_fetch_bg", lambda: None)
+        started: list[bool] = []
+        monkeypatch.setattr(
+            whisper_collector, "_start_transcription_bg", lambda: started.append(True)
+        )
+
+        whisper_collector.has_changes_since(None)
+
+        assert started == [True]
+
+    def test_has_changes_since_does_not_start_transcription_when_auto_transcribe_disabled(
+        self, transcripts_collector, monkeypatch, tmp_path
+    ):
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        started: list[bool] = []
+        monkeypatch.setattr(
+            transcripts_collector, "_start_transcription_bg", lambda: started.append(True)
+        )
+
+        transcripts_collector.has_changes_since(None)
+
+        assert started == []
+
+    def test_start_transcription_bg_does_not_spawn_second_thread_while_running(
+        self, whisper_collector
+    ):
+        import threading
+
+        release = threading.Event()
+        entered = threading.Event()
+
+        def blocking_backfill():
+            entered.set()
+            release.wait(timeout=5)
+
+        whisper_collector._run_transcription_backfill = blocking_backfill
+        whisper_collector._start_transcription_bg()
+        assert entered.wait(timeout=5)
+        first_thread = whisper_collector._transcription_thread
+
+        whisper_collector._start_transcription_bg()
+        assert whisper_collector._transcription_thread is first_thread
+
+        release.set()
+        first_thread.join(timeout=5)
+
+    def test_history_endpoint_responsive_during_in_progress_transcription(
+        self, whisper_collector, monkeypatch, tmp_path
+    ):
+        import threading
+        import time
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        monkeypatch.setattr(whisper_collector, "_run_ytdlp", lambda: _entries(1))
+
+        release = threading.Event()
+        entered = threading.Event()
+
+        def blocking_backfill():
+            entered.set()
+            release.wait(timeout=5)
+
+        whisper_collector._run_transcription_backfill = blocking_backfill
+        whisper_collector._start_transcription_bg()
+        assert entered.wait(timeout=5)
+
+        app = FastAPI()
+        app.include_router(whisper_collector.get_router())
+        client = TestClient(app)
+
+        try:
+            start = time.monotonic()
+            resp = client.get("/youtube/history")
+            elapsed = time.monotonic() - start
+
+            assert resp.status_code == 200
+            assert elapsed < 2.0, "history endpoint must not block on in-progress transcription"
+        finally:
+            release.set()
+            whisper_collector._transcription_thread.join(timeout=5)
