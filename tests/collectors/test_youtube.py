@@ -9,12 +9,17 @@ push page would be filtered out forever by the strictly-greater-than cursor
 
 import itertools
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 import context_helpers.collectors.youtube.collector as yt_mod
-from context_helpers.collectors.youtube.collector import YouTubeCollector
+from context_helpers.collectors.youtube.collector import (
+    YouTubeCollector,
+    _parse_caption_file,
+    _write_caption_transcript,
+)
 from context_helpers.config import YouTubeConfig
 
 
@@ -38,7 +43,36 @@ def _entries(n: int) -> list[dict]:
 def collector(tmp_path, monkeypatch):
     """YouTubeCollector with the seen-cache isolated to tmp_path."""
     monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
-    c = YouTubeCollector(YouTubeConfig(enabled=True, browser="safari", push_page_size=2))
+    monkeypatch.setattr(
+        yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
+    )
+    c = YouTubeCollector(
+        YouTubeConfig(
+            enabled=True,
+            browser="safari",
+            push_page_size=2,
+            transcripts_dir=str(tmp_path / "captions"),
+        )
+    )
+    return c
+
+
+@pytest.fixture
+def transcripts_collector(tmp_path, monkeypatch):
+    """YouTubeCollector with fetch_transcripts enabled and caches isolated to tmp_path."""
+    monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
+    monkeypatch.setattr(
+        yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
+    )
+    c = YouTubeCollector(
+        YouTubeConfig(
+            enabled=True,
+            browser="safari",
+            fetch_transcripts=True,
+            sub_langs="en",
+            transcripts_dir=str(tmp_path / "captions"),
+        )
+    )
     return c
 
 
@@ -138,7 +172,9 @@ class TestConfigDefaults:
         assert isinstance(cfg.whisper_transcripts_dir, str)
         assert isinstance(cfg.whisper_batch_size, int)
         assert isinstance(cfg.sub_langs, str)
+        assert isinstance(cfg.transcripts_dir, str)
         assert cfg.transcript_lookback_days == 30
+        assert cfg.caption_batch_size == 5
 
 
 class TestPushCursorKeys:
@@ -186,3 +222,386 @@ class TestPushCursorKeys:
         assert collector.get_push_cursor("youtube_history") is not None
         assert collector.get_push_cursor("youtube_transcripts") is None
         assert collector.has_changes_since(None) is True
+
+
+class TestParseCaptionFile:
+    def test_parses_vtt_and_dedupes_rolling_captions(self, tmp_path):
+        vtt = tmp_path / "sample.vtt"
+        vtt.write_text(
+            "WEBVTT\n"
+            "Kind: captions\n"
+            "Language: en\n"
+            "\n"
+            "00:00:00.000 --> 00:00:02.000\n"
+            "Hello there\n"
+            "\n"
+            "00:00:02.000 --> 00:00:04.000\n"
+            "Hello there\n"
+            "General Kenobi\n"
+        )
+        assert _parse_caption_file(vtt) == "Hello there General Kenobi"
+
+    def test_parses_srt(self, tmp_path):
+        srt = tmp_path / "sample.srt"
+        srt.write_text(
+            "1\n"
+            "00:00:00,000 --> 00:00:02,000\n"
+            "Hello there\n"
+            "\n"
+            "2\n"
+            "00:00:02,000 --> 00:00:04,000\n"
+            "General Kenobi\n"
+        )
+        assert _parse_caption_file(srt) == "Hello there General Kenobi"
+
+    def test_strips_inline_markup_tags(self, tmp_path):
+        vtt = tmp_path / "sample.vtt"
+        vtt.write_text(
+            "WEBVTT\n\n"
+            "00:00:00.000 --> 00:00:02.000\n"
+            "<c>Hello</c> <00:00:00.500><c> there</c>\n"
+        )
+        assert _parse_caption_file(vtt) == "Hello there"
+
+    def test_returns_none_for_empty_file(self, tmp_path):
+        empty = tmp_path / "empty.vtt"
+        empty.write_text("WEBVTT\n\n")
+        assert _parse_caption_file(empty) is None
+
+    def test_returns_none_for_missing_file(self, tmp_path):
+        assert _parse_caption_file(tmp_path / "missing.vtt") is None
+
+
+class TestWriteCaptionTranscript:
+    def test_writes_json_with_caption_source_and_correct_id(self, tmp_path):
+        out_dir = tmp_path / "captions"
+        path = _write_caption_transcript(
+            out_dir, "vid-abc", {"id": "vid-abc", "source": "youtube"}, "Some text"
+        )
+        assert path == out_dir / "vid-abc.json"
+        data = json.loads(path.read_text())
+        assert data["id"] == "vid-abc"
+        assert data["transcript"] == "Some text"
+        assert data["transcriptSource"] == "caption"
+        assert "transcriptCreatedAt" in data
+
+    def test_write_is_atomic_no_leftover_tmp_file(self, tmp_path):
+        out_dir = tmp_path / "captions"
+        _write_caption_transcript(out_dir, "vid-abc", {"id": "vid-abc"}, "text")
+        assert not (out_dir / "vid-abc.tmp").exists()
+        assert (out_dir / "vid-abc.json").exists()
+
+
+class TestFetchPendingCaptions:
+    def test_caption_found_writes_transcript_tagged_caption(
+        self, transcripts_collector, monkeypatch
+    ):
+        transcripts_collector._seen["vid-caption"] = datetime.now(timezone.utc).isoformat()
+        monkeypatch.setattr(
+            transcripts_collector, "_fetch_caption_text", lambda vid: "Hello world"
+        )
+
+        count = transcripts_collector.fetch_pending_captions()
+
+        assert count == 1
+        out_file = transcripts_collector._transcripts_dir / "vid-caption.json"
+        assert out_file.exists()
+        data = json.loads(out_file.read_text())
+        assert data["id"] == "vid-caption"
+        assert data["transcript"] == "Hello world"
+        assert data["transcriptSource"] == "caption"
+
+    def test_missing_caption_track_produces_no_record_and_no_exception(
+        self, transcripts_collector, monkeypatch
+    ):
+        transcripts_collector._seen["vid-nocap"] = datetime.now(timezone.utc).isoformat()
+        monkeypatch.setattr(transcripts_collector, "_fetch_caption_text", lambda vid: None)
+
+        count = transcripts_collector.fetch_pending_captions()
+
+        assert count == 0
+        assert not (transcripts_collector._transcripts_dir / "vid-nocap.json").exists()
+
+    def test_ytdlp_failure_for_one_video_does_not_raise_or_block_others(
+        self, transcripts_collector, monkeypatch
+    ):
+        now = datetime.now(timezone.utc)
+        transcripts_collector._seen["vid-fail"] = now.isoformat()
+        transcripts_collector._seen["vid-ok"] = (now + timedelta(seconds=1)).isoformat()
+
+        def fake_fetch(video_id):
+            if video_id == "vid-fail":
+                raise RuntimeError("yt-dlp exploded")
+            return "Transcript text"
+
+        monkeypatch.setattr(transcripts_collector, "_fetch_caption_text", fake_fetch)
+
+        count = transcripts_collector.fetch_pending_captions()
+
+        assert count == 1
+        assert not (transcripts_collector._transcripts_dir / "vid-fail.json").exists()
+        assert (transcripts_collector._transcripts_dir / "vid-ok.json").exists()
+
+    def test_lookback_excludes_stale_first_seen(self, transcripts_collector, monkeypatch):
+        now = datetime.now(timezone.utc)
+        lookback = transcripts_collector._config.transcript_lookback_days
+        transcripts_collector._seen["vid-recent"] = now.isoformat()
+        transcripts_collector._seen["vid-old"] = (
+            now - timedelta(days=lookback + 1)
+        ).isoformat()
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            transcripts_collector,
+            "_fetch_caption_text",
+            lambda vid: calls.append(vid) or "text",
+        )
+
+        transcripts_collector.fetch_pending_captions()
+
+        assert calls == ["vid-recent"]
+
+    def test_disabled_when_fetch_transcripts_false(self, collector, monkeypatch):
+        collector._seen["vid-x"] = datetime.now(timezone.utc).isoformat()
+        calls: list[str] = []
+        monkeypatch.setattr(
+            collector, "_fetch_caption_text", lambda vid: calls.append(vid)
+        )
+
+        count = collector.fetch_pending_captions()
+
+        assert count == 0
+        assert calls == []
+
+    def test_skips_videos_with_existing_transcript_file(
+        self, transcripts_collector, monkeypatch
+    ):
+        transcripts_collector._transcripts_dir.mkdir(parents=True)
+        (transcripts_collector._transcripts_dir / "vid-done.json").write_text("{}")
+        transcripts_collector._seen["vid-done"] = datetime.now(timezone.utc).isoformat()
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            transcripts_collector,
+            "_fetch_caption_text",
+            lambda vid: calls.append(vid),
+        )
+
+        transcripts_collector.fetch_pending_captions()
+
+        assert calls == []
+
+
+class TestFetchCaptionText:
+    def test_ytdlp_invocation_uses_caption_only_flags_no_media_download(
+        self, transcripts_collector, monkeypatch
+    ):
+        """Verifies the actual yt-dlp command line: caption-only flags, no
+        audio/video download flags present."""
+        captured: dict = {}
+
+        class FakeCompletedProcess:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None, check=None):
+            captured["cmd"] = cmd
+            captured["cwd"] = cwd
+            (Path(cwd) / "vid-xyz.en.vtt").write_text(
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHi\n"
+            )
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
+
+        text = transcripts_collector._fetch_caption_text("vid-xyz")
+
+        assert text == "Hi"
+        cmd = captured["cmd"]
+        assert "--write-subs" in cmd
+        assert "--write-auto-subs" in cmd
+        assert "--skip-download" in cmd
+        assert "--sub-langs" in cmd
+        assert cmd[cmd.index("--sub-langs") + 1] == "en"
+        assert "--cookies-from-browser" in cmd
+        # No flags that would trigger an actual audio/video download.
+        assert "-f" not in cmd
+        assert "--format" not in cmd
+
+    def test_returns_none_when_no_caption_files_produced(
+        self, transcripts_collector, monkeypatch
+    ):
+        class FakeCompletedProcess:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None, check=None):
+            return FakeCompletedProcess()  # no caption file written
+
+        monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
+
+        assert transcripts_collector._fetch_caption_text("vid-none") is None
+
+    def test_returns_none_on_nonzero_exit_without_raising(
+        self, transcripts_collector, monkeypatch
+    ):
+        class FakeCompletedProcess:
+            returncode = 1
+            stdout = ""
+            stderr = "ERROR: Video unavailable"
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None, check=None):
+            return FakeCompletedProcess()  # non-zero exit, no caption file written
+
+        monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
+
+        assert transcripts_collector._fetch_caption_text("vid-unavailable") is None
+
+    def test_returns_none_on_timeout_without_raising(self, transcripts_collector, monkeypatch):
+        import subprocess as subprocess_mod
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None, check=None):
+            raise subprocess_mod.TimeoutExpired(cmd, timeout)
+
+        monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
+
+        assert transcripts_collector._fetch_caption_text("vid-timeout") is None
+
+    def test_returns_none_when_ytdlp_binary_missing(self, transcripts_collector, monkeypatch):
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None, check=None):
+            raise FileNotFoundError("yt-dlp not found")
+
+        monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
+
+        assert transcripts_collector._fetch_caption_text("vid-missing-binary") is None
+
+
+class TestCaptionFetchBackgroundTrigger:
+    def test_has_changes_since_starts_background_fetch_when_enabled(
+        self, transcripts_collector, monkeypatch, tmp_path
+    ):
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        started = []
+        monkeypatch.setattr(
+            transcripts_collector, "_start_caption_fetch_bg", lambda: started.append(True)
+        )
+
+        transcripts_collector.has_changes_since(None)
+
+        assert started == [True]
+
+    def test_has_changes_since_does_not_start_background_fetch_when_disabled(
+        self, collector, monkeypatch, tmp_path
+    ):
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        started = []
+        monkeypatch.setattr(collector, "_start_caption_fetch_bg", lambda: started.append(True))
+
+        collector.has_changes_since(None)
+
+        assert started == []
+
+    def test_start_caption_fetch_bg_does_not_spawn_second_thread_while_running(
+        self, transcripts_collector
+    ):
+        import threading
+
+        release = threading.Event()
+        entered = threading.Event()
+
+        def blocking_backfill():
+            entered.set()
+            release.wait(timeout=5)
+
+        transcripts_collector._run_caption_fetch_backfill = blocking_backfill
+        transcripts_collector._start_caption_fetch_bg()
+        assert entered.wait(timeout=5)
+        first_thread = transcripts_collector._caption_fetch_thread
+
+        transcripts_collector._start_caption_fetch_bg()
+        assert transcripts_collector._caption_fetch_thread is first_thread
+
+        release.set()
+        first_thread.join(timeout=5)
+
+
+class TestCaptionAttemptsCache:
+    def test_failed_or_missing_attempt_is_not_retried_on_next_call(
+        self, transcripts_collector, monkeypatch
+    ):
+        transcripts_collector._seen["vid-nocap"] = datetime.now(timezone.utc).isoformat()
+        calls: list[str] = []
+        monkeypatch.setattr(
+            transcripts_collector,
+            "_fetch_caption_text",
+            lambda vid: calls.append(vid) or None,
+        )
+
+        transcripts_collector.fetch_pending_captions()
+        transcripts_collector.fetch_pending_captions()
+
+        assert calls == ["vid-nocap"]
+
+    def test_attempts_persisted_across_collector_instances(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
+        monkeypatch.setattr(
+            yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
+        )
+        cfg = YouTubeConfig(
+            enabled=True,
+            fetch_transcripts=True,
+            transcripts_dir=str(tmp_path / "captions"),
+        )
+        first = YouTubeCollector(cfg)
+        first._seen["vid-nocap"] = datetime.now(timezone.utc).isoformat()
+        monkeypatch.setattr(first, "_fetch_caption_text", lambda vid: None)
+        first.fetch_pending_captions()
+
+        second = YouTubeCollector(cfg)
+        second._seen["vid-nocap"] = first._seen["vid-nocap"]
+        calls: list[str] = []
+        monkeypatch.setattr(
+            second, "_fetch_caption_text", lambda vid: calls.append(vid)
+        )
+        second.fetch_pending_captions()
+
+        assert calls == []
+
+
+class TestCaptionBatchSize:
+    def test_fetch_pending_captions_bounded_by_caption_batch_size(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
+        monkeypatch.setattr(
+            yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
+        )
+        c = YouTubeCollector(
+            YouTubeConfig(
+                enabled=True,
+                fetch_transcripts=True,
+                transcripts_dir=str(tmp_path / "captions"),
+                caption_batch_size=2,
+            )
+        )
+        now = datetime.now(timezone.utc)
+        for i in range(5):
+            c._seen[f"vid-{i}"] = (now + timedelta(seconds=i)).isoformat()
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            c, "_fetch_caption_text", lambda vid: calls.append(vid) or "text"
+        )
+
+        c.fetch_pending_captions()
+
+        assert len(calls) == 2
+        assert calls == ["vid-0", "vid-1"]

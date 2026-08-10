@@ -230,6 +230,10 @@ class YouTubeConfig(BaseSettings):
     # Transcript support — yt-dlp captions
     fetch_transcripts: bool = False
     sub_langs: str = "en"
+    transcripts_dir: str = (
+        "~/.local/share/context-helpers/youtube_transcripts/captions"
+    )
+    caption_batch_size: int = 5      # max videos caption-fetched per poll cycle
     # Whisper auto-transcription fallback (requires mlx-whisper extra)
     auto_transcribe: bool = False
     whisper_model: str = "base.en"   # short name or full mlx-community HuggingFace repo
