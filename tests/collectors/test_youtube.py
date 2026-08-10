@@ -1235,3 +1235,75 @@ class TestTranscriptsEndpoint:
         assert transcripts_collector.get_push_cursor("youtube_transcripts") is not None
         assert transcripts_collector.get_push_cursor("youtube_history") is None
         assert (tmp_path / "cursors" / "youtube_transcripts_push.json").exists()
+
+
+class TestHealthCheck:
+    """Tests for YouTubeCollector.health_check()'s whisper-pipeline reporting."""
+
+    class _FakeVersionResult:
+        def __init__(self, returncode=0, stdout="2026.01.01\n", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def _patch_ytdlp_version_ok(self, monkeypatch):
+        monkeypatch.setattr(
+            yt_mod.subprocess, "run", lambda *a, **k: self._FakeVersionResult()
+        )
+
+    def test_unchanged_when_fetch_transcripts_and_auto_transcribe_disabled(
+        self, collector, monkeypatch
+    ):
+        self._patch_ytdlp_version_ok(monkeypatch)
+
+        result = collector.health_check()
+
+        assert result == {"status": "ok", "message": "yt-dlp 2026.01.01"}
+
+    def test_reports_whisper_transcript_count_when_auto_transcribe_enabled(
+        self, whisper_collector, monkeypatch
+    ):
+        self._patch_ytdlp_version_ok(monkeypatch)
+        whisper_collector._whisper_transcripts_dir.mkdir(parents=True, exist_ok=True)
+        (whisper_collector._whisper_transcripts_dir / "vid-1.json").write_text("{}")
+        (whisper_collector._whisper_transcripts_dir / "vid-2.json").write_text("{}")
+
+        result = whisper_collector.health_check()
+
+        assert result["status"] == "ok"
+        assert "2 whisper transcripts" in result["message"]
+
+    def test_zero_whisper_transcripts_when_dir_missing(
+        self, whisper_collector, monkeypatch
+    ):
+        self._patch_ytdlp_version_ok(monkeypatch)
+
+        result = whisper_collector.health_check()
+
+        assert result["status"] == "ok"
+        assert "0 whisper transcripts" in result["message"]
+
+    def test_error_when_whisper_transcripts_dir_not_writable(
+        self, whisper_collector, monkeypatch
+    ):
+        self._patch_ytdlp_version_ok(monkeypatch)
+        whisper_collector._whisper_transcripts_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(yt_mod.os, "access", lambda path, mode: False)
+
+        result = whisper_collector.health_check()
+
+        assert result["status"] == "error"
+        assert str(whisper_collector._whisper_transcripts_dir) in result["message"]
+
+    def test_no_whisper_reporting_when_auto_transcribe_disabled(
+        self, transcripts_collector, monkeypatch
+    ):
+        """fetch_transcripts=True but auto_transcribe=False must not report whisper status."""
+        self._patch_ytdlp_version_ok(monkeypatch)
+        transcripts_collector._whisper_transcripts_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(yt_mod.os, "access", lambda path, mode: False)
+
+        result = transcripts_collector.health_check()
+
+        assert result["status"] == "ok"
+        assert "whisper" not in result["message"]

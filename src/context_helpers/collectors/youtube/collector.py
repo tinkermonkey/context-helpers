@@ -256,7 +256,25 @@ class YouTubeCollector(BaseCollector):
                     "status": "error",
                     "message": f"yt-dlp exited {result.returncode}: {result.stderr.strip()}",
                 }
-            return {"status": "ok", "message": f"yt-dlp {result.stdout.strip()}"}
+            msg = f"yt-dlp {result.stdout.strip()}"
+            if self._config.auto_transcribe:
+                whisper_count = (
+                    sum(1 for _ in self._whisper_transcripts_dir.glob("*.json"))
+                    if self._whisper_transcripts_dir.exists()
+                    else 0
+                )
+                msg += f"; {whisper_count} whisper transcripts"
+                if self._whisper_transcripts_dir.exists() and not os.access(
+                    self._whisper_transcripts_dir, os.W_OK
+                ):
+                    return {
+                        "status": "error",
+                        "message": (
+                            f"whisper_transcripts_dir is not writable: "
+                            f"{self._whisper_transcripts_dir}"
+                        ),
+                    }
+            return {"status": "ok", "message": msg}
         except FileNotFoundError:
             return {
                 "status": "error",
