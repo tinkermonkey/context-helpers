@@ -1014,6 +1014,12 @@ class YouTubeCollector(BaseCollector):
                 )
                 continue
 
+            if "id" not in data:
+                logger.warning(
+                    "YouTubeCollector: transcript %s missing 'id' field, skipping", path
+                )
+                continue
+
             created_at = data.get("transcriptCreatedAt", "")
             if after_iso and created_at and created_at <= after_iso:
                 continue

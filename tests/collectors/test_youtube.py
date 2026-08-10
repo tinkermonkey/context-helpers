@@ -1297,6 +1297,17 @@ class TestFetchTranscripts:
         items = transcripts_collector.fetch_transcripts(since="2026-01-02T00:00:00+00:00")
         assert items == []
 
+    def test_skips_transcript_json_missing_id(self, transcripts_collector):
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-good", "2026-01-01T00:00:00+00:00", "caption",
+        )
+        corrupt = transcripts_collector._transcripts_dir / "corrupt.json"
+        corrupt.write_text(json.dumps({"transcript": "no id here"}))
+
+        items = transcripts_collector.fetch_transcripts(since=None)
+        assert [i["id"] for i in items] == ["vid-good"]
+
 
 class TestTranscriptsEndpoint:
     """Tests for GET /youtube/transcripts."""
