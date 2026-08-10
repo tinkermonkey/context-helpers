@@ -380,7 +380,7 @@ class TestFetchPendingCaptions:
 
         def fake_fetch(video_id):
             if video_id == "vid-fail":
-                raise RuntimeError("yt-dlp exploded")
+                raise OSError("yt-dlp exploded")
             return "Transcript text"
 
         monkeypatch.setattr(transcripts_collector, "_fetch_caption_text", fake_fetch)
@@ -390,6 +390,28 @@ class TestFetchPendingCaptions:
         assert count == 1
         assert not (transcripts_collector._transcripts_dir / "vid-fail.json").exists()
         assert (transcripts_collector._transcripts_dir / "vid-ok.json").exists()
+        assert "vid-fail" in transcripts_collector._caption_attempts, (
+            "a per-video I/O failure is still recorded so it is not retried forever"
+        )
+
+    def test_programming_error_propagates_and_is_not_recorded_as_attempted(
+        self, transcripts_collector, monkeypatch
+    ):
+        """AttributeError/TypeError/etc. indicate a systemic bug, not a
+        per-video failure — they must not be swallowed, and the video they
+        were raised for must not be permanently blacklisted."""
+        now = datetime.now(timezone.utc)
+        transcripts_collector._seen["vid-buggy"] = now.isoformat()
+
+        def fake_fetch(video_id):
+            raise AttributeError("programming bug")
+
+        monkeypatch.setattr(transcripts_collector, "_fetch_caption_text", fake_fetch)
+
+        with pytest.raises(AttributeError):
+            transcripts_collector.fetch_pending_captions()
+
+        assert "vid-buggy" not in transcripts_collector._caption_attempts
 
     def test_lookback_excludes_stale_first_seen(self, transcripts_collector, monkeypatch):
         now = datetime.now(timezone.utc)
@@ -508,6 +530,30 @@ class TestFetchCaptionText:
 
         assert transcripts_collector._fetch_caption_text("vid-unavailable") is None
 
+    def test_nonzero_exit_discards_caption_file_even_if_written(
+        self, transcripts_collector, monkeypatch
+    ):
+        """A non-zero yt-dlp exit must never hand back a (possibly corrupt or
+        partial) caption file — even if yt-dlp left one on disk before
+        failing."""
+
+        class FakeCompletedProcess:
+            returncode = 1
+            stdout = ""
+            stderr = "ERROR: postprocessing failed"
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None, check=None):
+            (Path(cwd) / "vid-corrupt.en.vtt").write_text(
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPartial\n"
+            )
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
+
+        result = transcripts_collector._fetch_caption_text("vid-corrupt")
+
+        assert result is None, "a caption file left behind by a failing yt-dlp must be discarded"
+
     def test_returns_none_on_timeout_without_raising(self, transcripts_collector, monkeypatch):
         import subprocess as subprocess_mod
 
@@ -525,6 +571,38 @@ class TestFetchCaptionText:
         monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
 
         assert transcripts_collector._fetch_caption_text("vid-missing-binary") is None
+
+
+class TestBackgroundBackfillErrorLogging:
+    def test_caption_backfill_logs_stack_trace_on_error(
+        self, transcripts_collector, monkeypatch, caplog
+    ):
+        def boom(*args, **kwargs):
+            raise RuntimeError("systemic failure")
+
+        monkeypatch.setattr(transcripts_collector, "fetch_pending_captions", boom)
+
+        with caplog.at_level("ERROR"):
+            transcripts_collector._run_caption_fetch_backfill()
+
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert errors[0].exc_info is not None, "stack trace must be captured via exc_info=True"
+
+    def test_transcription_backfill_logs_stack_trace_on_error(
+        self, whisper_collector, monkeypatch, caplog
+    ):
+        def boom(*args, **kwargs):
+            raise RuntimeError("systemic failure")
+
+        monkeypatch.setattr(whisper_collector, "transcribe_pending", boom)
+
+        with caplog.at_level("ERROR"):
+            whisper_collector._run_transcription_backfill()
+
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert errors[0].exc_info is not None, "stack trace must be captured via exc_info=True"
 
 
 class TestCaptionFetchBackgroundTrigger:
@@ -811,7 +889,7 @@ class TestTranscribePending:
         )
 
         def boom(*args, **kwargs):
-            raise RuntimeError("disk full")
+            raise OSError("disk full")
 
         monkeypatch.setattr(yt_mod, "_write_whisper_transcript", boom)
 
@@ -830,6 +908,30 @@ class TestTranscribePending:
         count = whisper_collector.transcribe_pending()
 
         assert count == 0
+        assert vid in whisper_collector._whisper_attempts, (
+            "a failed download attempt is still recorded so it is not retried forever"
+        )
+
+    def test_programming_error_propagates_and_is_not_recorded_as_attempted(
+        self, whisper_collector, monkeypatch
+    ):
+        """AttributeError/TypeError/etc. indicate a systemic bug, not a
+        per-video failure — they must not be swallowed, and the video they
+        were raised for must not be permanently blacklisted."""
+        vid = "vid-buggy"
+        whisper_collector._caption_attempts[vid] = datetime.now(timezone.utc).isoformat()
+
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+
+        def boom(video_id):
+            raise AttributeError("programming bug")
+
+        monkeypatch.setattr(whisper_collector, "_download_audio_for_whisper", boom)
+
+        with pytest.raises(AttributeError):
+            whisper_collector.transcribe_pending()
+
+        assert vid not in whisper_collector._whisper_attempts
 
     def test_one_video_failure_does_not_block_others(
         self, whisper_collector, monkeypatch, tmp_path
@@ -844,7 +946,7 @@ class TestTranscribePending:
 
         def fake_transcribe(path, model, log_prefix=None):
             if fail_vid in path.name:
-                raise RuntimeError("boom")
+                raise OSError("boom")
             return "good text"
 
         monkeypatch.setattr(yt_mod, "_transcribe_audio_file", fake_transcribe)

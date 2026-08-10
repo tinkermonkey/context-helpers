@@ -567,8 +567,15 @@ class YouTubeCollector(BaseCollector):
         for video_id, first_seen in candidates:
             try:
                 text = self._fetch_caption_text(video_id)
-            except Exception as e:  # noqa: BLE001 - one video's caption fetch
-                # failing must not stop processing of the remaining videos.
+            except OSError as e:
+                # A per-video I/O or subprocess-launch failure must not stop
+                # processing of the remaining videos. Programming errors
+                # (AttributeError, TypeError, etc.) are intentionally not
+                # caught here — they indicate a systemic bug, not a
+                # per-video failure, and must not cause every candidate in
+                # this batch to be permanently blacklisted via
+                # _caption_attempts. They propagate to
+                # _run_caption_fetch_backfill's guard instead.
                 logger.warning(
                     "YouTubeCollector: caption fetch failed for %s: %s", video_id, e
                 )
@@ -658,6 +665,8 @@ class YouTubeCollector(BaseCollector):
                         "YouTubeCollector: yt-dlp exited %d fetching captions for %s: %s",
                         result.returncode, video_id, result.stderr.strip()[:400],
                     )
+                    span.set_attribute("youtube.captions_found", False)
+                    return None
 
                 caption_files = sorted(tmp_dir.glob(f"{video_id}*.vtt")) + sorted(
                     tmp_dir.glob(f"{video_id}*.srt")
@@ -700,10 +709,11 @@ class YouTubeCollector(BaseCollector):
                 logger.info(
                     "YouTubeCollector: background caption fetch finished, %d videos", count
                 )
-        except Exception as e:  # noqa: BLE001 - last-resort guard for the
-            # background caption-fetch thread; any failure must be logged
-            # and swallowed rather than killing the daemon thread silently.
-            logger.error("YouTubeCollector: background caption fetch error: %s", e)
+        except Exception:
+            # Last-resort guard for the background caption-fetch thread; any
+            # failure must be logged and swallowed rather than killing the
+            # daemon thread silently.
+            logger.exception("YouTubeCollector: background caption fetch error")
 
     # ------------------------------------------------------------------
     # Whisper fallback transcription pipeline
@@ -760,10 +770,14 @@ class YouTubeCollector(BaseCollector):
 
         for video_id, first_seen in candidates:
             audio_path: Path | None = None
-            self._whisper_attempts[video_id] = now.isoformat()
-            attempts_changed = True
             try:
                 audio_path = self._download_audio_for_whisper(video_id)
+                # Recorded only once a genuine attempt (the download call)
+                # has actually been made, so a programming error raised
+                # before this point never blacklists a candidate it never
+                # touched.
+                self._whisper_attempts[video_id] = now.isoformat()
+                attempts_changed = True
                 if audio_path is None:
                     logger.debug(
                         "YouTubeCollector: audio download failed for %s", video_id
@@ -791,9 +805,15 @@ class YouTubeCollector(BaseCollector):
                     video_id, len(text),
                 )
                 count += 1
-            except Exception as e:  # noqa: BLE001 - one video's download or
-                # transcription failing must not stop processing of the
-                # remaining videos.
+            except OSError as e:
+                # A per-video I/O or subprocess-launch failure must not stop
+                # processing of the remaining videos. Programming errors
+                # (AttributeError, TypeError, etc.) are intentionally not
+                # caught here — they indicate a systemic bug, not a
+                # per-video failure, and must not cause every candidate in
+                # this batch to be permanently blacklisted via
+                # _whisper_attempts. They propagate to
+                # _run_transcription_backfill's guard instead.
                 logger.warning(
                     "YouTubeCollector: whisper transcription failed for %s: %s", video_id, e
                 )
@@ -946,10 +966,11 @@ class YouTubeCollector(BaseCollector):
                 logger.info(
                     "YouTubeCollector: background transcription finished, %d videos", count
                 )
-        except Exception as e:  # noqa: BLE001 - last-resort guard for the
-            # background transcription thread; any failure must be logged
-            # and swallowed rather than killing the daemon thread silently.
-            logger.error("YouTubeCollector: background transcription error: %s", e)
+        except Exception:
+            # Last-resort guard for the background transcription thread; any
+            # failure must be logged and swallowed rather than killing the
+            # daemon thread silently.
+            logger.exception("YouTubeCollector: background transcription error")
 
     # ------------------------------------------------------------------
     # Transcript retrieval (GET /youtube/transcripts)
