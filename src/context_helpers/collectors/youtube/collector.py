@@ -337,6 +337,19 @@ class YouTubeCollector(BaseCollector):
         except OSError:
             return True
 
+        # Also check the transcript dirs for newly written files — background
+        # threads can write new transcripts without any new video being watched.
+        for transcripts_dir in (self._transcripts_dir, self._whisper_transcripts_dir):
+            if transcripts_dir.exists():
+                try:
+                    dir_mtime = datetime.fromtimestamp(
+                        transcripts_dir.stat().st_mtime, tz=timezone.utc
+                    )
+                    if dir_mtime > compare_against:
+                        return True
+                except OSError:
+                    pass
+
         return False
 
     # ------------------------------------------------------------------
