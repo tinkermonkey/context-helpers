@@ -245,7 +245,10 @@ class YouTubeCollector(BaseCollector):
         return make_youtube_router(self)
 
     def push_cursor_keys(self) -> list[str]:
-        return ["youtube_history", "youtube_transcripts"]
+        keys = ["youtube_history"]
+        if self._config.fetch_transcripts:
+            keys.append("youtube_transcripts")
+        return keys
 
     def health_check(self) -> dict:
         """Verify yt-dlp is installed and reachable."""
@@ -354,7 +357,11 @@ class YouTubeCollector(BaseCollector):
                     if dir_mtime > compare_against:
                         return True
                 except OSError:
-                    pass
+                    logger.warning(
+                        "Failed to stat transcripts dir %s; assuming changes",
+                        transcripts_dir,
+                    )
+                    return True
 
         return False
 

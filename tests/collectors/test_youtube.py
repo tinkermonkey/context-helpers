@@ -9,6 +9,7 @@ push page would be filtered out forever by the strictly-greater-than cursor
 
 import itertools
 import json
+import logging
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -227,8 +228,19 @@ class TestConfigDefaults:
 
 
 class TestPushCursorKeys:
-    def test_push_cursor_keys_returns_history_and_transcripts(self, collector):
-        assert collector.push_cursor_keys() == ["youtube_history", "youtube_transcripts"]
+    def test_push_cursor_keys_omits_transcripts_when_fetch_transcripts_disabled(
+        self, collector
+    ):
+        # `collector` fixture has fetch_transcripts=False by default.
+        assert collector.push_cursor_keys() == ["youtube_history"]
+
+    def test_push_cursor_keys_returns_history_and_transcripts_when_enabled(
+        self, transcripts_collector
+    ):
+        assert transcripts_collector.push_cursor_keys() == [
+            "youtube_history",
+            "youtube_transcripts",
+        ]
 
     def test_history_endpoint_uses_youtube_history_cursor_key(
         self, collector, monkeypatch, tmp_path
@@ -255,7 +267,7 @@ class TestPushCursorKeys:
         assert (tmp_path / "cursors" / "youtube_history_push.json").exists()
 
     def test_has_changes_since_true_when_transcripts_cursor_absent(
-        self, collector, monkeypatch, tmp_path
+        self, transcripts_collector, monkeypatch, tmp_path
     ):
         """Even after /youtube/history delivers fully, the transcripts cursor
         is still unset, so has_changes_since must keep returning True
@@ -263,14 +275,59 @@ class TestPushCursorKeys:
         from context_helpers.collectors import base as base_mod
 
         monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
-        monkeypatch.setattr(collector, "_run_ytdlp", lambda: _entries(1))
+        monkeypatch.setattr(transcripts_collector, "_run_ytdlp", lambda: _entries(1))
 
-        items = collector.fetch_history(since=None)
-        collector.apply_push_paging(items, "watched_at", "youtube_history")
+        items = transcripts_collector.fetch_history(since=None)
+        transcripts_collector.apply_push_paging(items, "watched_at", "youtube_history")
 
-        assert collector.get_push_cursor("youtube_history") is not None
-        assert collector.get_push_cursor("youtube_transcripts") is None
-        assert collector.has_changes_since(None) is True
+        assert transcripts_collector.get_push_cursor("youtube_history") is not None
+        assert transcripts_collector.get_push_cursor("youtube_transcripts") is None
+        assert transcripts_collector.has_changes_since(None) is True
+
+    def test_has_changes_since_not_stuck_true_when_fetch_transcripts_disabled(
+        self, collector, monkeypatch
+    ):
+        """With fetch_transcripts=False, push_cursor_keys() must not include
+        the transcripts cursor — otherwise has_changes_since finds it
+        perpetually unset and polls forever with nothing to deliver."""
+        yt_mod._SEEN_CACHE_PATH.write_text("{}")
+        future = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        monkeypatch.setattr(collector, "get_push_cursor", lambda key=None: future)
+
+        assert collector.has_changes_since(None) is False
+
+
+class TestHasChangesSinceTranscriptsDirStatError:
+    def test_returns_true_and_logs_when_transcripts_dir_stat_raises(
+        self, collector, monkeypatch, caplog, tmp_path
+    ):
+        """A transient OSError statting a transcripts dir must be treated the
+        same as the seen-cache stat failure: assume changes rather than
+        silently reporting none."""
+        # Seen-cache must exist with an mtime that does NOT trip the earlier
+        # `mtime > compare_against` check, so execution reaches the
+        # transcripts-dir stat that raises below.
+        yt_mod._SEEN_CACHE_PATH.write_text("{}")
+        future = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        monkeypatch.setattr(collector, "get_push_cursor", lambda key=None: future)
+
+        class _BoomPath:
+            def exists(self):
+                return True
+
+            def stat(self):
+                raise OSError("transient I/O error")
+
+        monkeypatch.setattr(collector, "_transcripts_dir", _BoomPath())
+        monkeypatch.setattr(collector, "_whisper_transcripts_dir", _BoomPath())
+
+        with caplog.at_level(logging.WARNING):
+            result = collector.has_changes_since(None)
+
+        assert result is True
+        assert any(
+            "transcripts dir" in record.message.lower() for record in caplog.records
+        )
 
 
 class TestParseCaptionFile:
