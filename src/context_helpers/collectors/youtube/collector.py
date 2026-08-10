@@ -886,6 +886,77 @@ class YouTubeCollector(BaseCollector):
             logger.error("YouTubeCollector: background transcription error: %s", e)
 
     # ------------------------------------------------------------------
+    # Transcript retrieval (GET /youtube/transcripts)
+    # ------------------------------------------------------------------
+
+    def fetch_transcripts(self, since: str | None) -> list[dict]:
+        """Return merged caption- and whisper-sourced video transcripts.
+
+        Caption transcripts are read from transcripts_dir, whisper transcripts
+        from whisper_transcripts_dir — both written by _write_caption_transcript
+        / _write_whisper_transcript with a "transcriptCreatedAt" timestamp used
+        for both since-filtering and cursor advancement. Caption transcripts
+        take priority when both sources have one for the same video (mirrors
+        PodcastsCollector.fetch_transcripts).
+
+        since=None  → all available transcripts.
+        since=<ISO> → transcripts created strictly after since.
+
+        Returns an empty list when fetch_transcripts=False: captions are never
+        fetched in that mode, and any whisper backlog left over from before
+        the feature was disabled should not be served either.
+        """
+        if not self._config.fetch_transcripts:
+            return []
+
+        caption_items = self._read_transcript_dir(self._transcripts_dir, since)
+        whisper_items = self._read_transcript_dir(self._whisper_transcripts_dir, since)
+
+        if not whisper_items:
+            return caption_items
+
+        caption_ids = {i["id"] for i in caption_items}
+        merged = caption_items + [i for i in whisper_items if i["id"] not in caption_ids]
+        merged.sort(key=lambda x: x.get("transcriptCreatedAt") or "")
+        return merged
+
+    def _read_transcript_dir(self, directory: Path, since: str | None) -> list[dict]:
+        """Read all transcript JSON files from directory, filtered by since.
+
+        Filters on transcriptCreatedAt (ISO 8601 string comparison, safe
+        because both sides are always UTC ISO 8601 from the same source —
+        see _write_caption_transcript / _write_whisper_transcript).
+        """
+        if not directory.exists():
+            return []
+
+        after_iso = since or ""
+        results: list[dict] = []
+
+        try:
+            paths = list(directory.glob("*.json"))
+        except OSError:
+            return []
+
+        for path in paths:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, json.JSONDecodeError) as e:
+                logger.debug(
+                    "YouTubeCollector: failed to read transcript %s: %s", path, e
+                )
+                continue
+
+            created_at = data.get("transcriptCreatedAt", "")
+            if after_iso and created_at and created_at <= after_iso:
+                continue
+
+            results.append(data)
+
+        return results
+
+    # ------------------------------------------------------------------
     # Seen-cache persistence
     # ------------------------------------------------------------------
 

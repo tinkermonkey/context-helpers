@@ -23,6 +23,23 @@ from context_helpers.collectors.youtube.collector import (
 from context_helpers.config import YouTubeConfig
 
 
+def _write_transcript_json(
+    directory: Path, video_id: str, created_at: str, source: str, text: str = "Some text"
+) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": video_id,
+        "source": "youtube",
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "transcript": text,
+        "transcriptSource": source,
+        "transcriptCreatedAt": created_at,
+    }
+    if source == "whisper":
+        payload["whisperModel"] = "base.en"
+    (directory / f"{video_id}.json").write_text(json.dumps(payload))
+
+
 def _entries(n: int) -> list[dict]:
     return [
         {
@@ -974,3 +991,247 @@ class TestTranscriptionBackgroundTrigger:
         finally:
             release.set()
             whisper_collector._transcription_thread.join(timeout=5)
+
+
+class TestFetchTranscripts:
+    """Tests for YouTubeCollector.fetch_transcripts (caption + whisper merge)."""
+
+    def test_returns_empty_when_fetch_transcripts_disabled(self, collector):
+        # `collector` fixture has fetch_transcripts=False by default.
+        _write_transcript_json(
+            collector._transcripts_dir, "vid-1", "2026-01-01T00:00:00+00:00", "caption"
+        )
+        assert collector.fetch_transcripts(since=None) == []
+
+    def test_returns_caption_and_whisper_items(self, transcripts_collector, tmp_path):
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-cap", "2026-01-01T00:00:00+00:00", "caption",
+        )
+        whisper_dir = tmp_path / "whisper"
+        transcripts_collector._whisper_transcripts_dir = whisper_dir
+        _write_transcript_json(whisper_dir, "vid-whisper", "2026-01-02T00:00:00+00:00", "whisper")
+
+        items = transcripts_collector.fetch_transcripts(since=None)
+        assert {i["id"] for i in items} == {"vid-cap", "vid-whisper"}
+
+    def test_items_include_required_fields(self, transcripts_collector):
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir, "vid-1", "2026-01-01T00:00:00+00:00", "caption"
+        )
+        items = transcripts_collector.fetch_transcripts(since=None)
+        item = items[0]
+        for field in ("id", "transcript", "transcriptSource", "transcriptCreatedAt"):
+            assert field in item
+
+    def test_caption_wins_over_whisper_for_same_video(self, transcripts_collector, tmp_path):
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-1", "2026-01-01T00:00:00+00:00", "caption", text="Caption wins",
+        )
+        whisper_dir = tmp_path / "whisper"
+        transcripts_collector._whisper_transcripts_dir = whisper_dir
+        _write_transcript_json(
+            whisper_dir, "vid-1", "2026-01-01T00:00:00+00:00", "whisper", text="Whisper loses"
+        )
+
+        items = transcripts_collector.fetch_transcripts(since=None)
+        assert len(items) == 1
+        assert items[0]["transcriptSource"] == "caption"
+        assert items[0]["transcript"] == "Caption wins"
+
+    def test_merged_items_ordered_ascending_by_created_at(self, transcripts_collector, tmp_path):
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-c", "2026-01-03T00:00:00+00:00", "caption",
+        )
+        whisper_dir = tmp_path / "whisper"
+        transcripts_collector._whisper_transcripts_dir = whisper_dir
+        _write_transcript_json(whisper_dir, "vid-a", "2026-01-01T00:00:00+00:00", "whisper")
+        _write_transcript_json(whisper_dir, "vid-b", "2026-01-02T00:00:00+00:00", "whisper")
+
+        items = transcripts_collector.fetch_transcripts(since=None)
+        assert [i["id"] for i in items] == ["vid-a", "vid-b", "vid-c"]
+
+    def test_since_filters_by_transcript_created_at(self, transcripts_collector):
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-old", "2026-01-01T00:00:00+00:00", "caption",
+        )
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-new", "2026-01-03T00:00:00+00:00", "caption",
+        )
+
+        items = transcripts_collector.fetch_transcripts(since="2026-01-02T00:00:00+00:00")
+        assert [i["id"] for i in items] == ["vid-new"]
+
+    def test_since_is_exclusive(self, transcripts_collector):
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-exact", "2026-01-02T00:00:00+00:00", "caption",
+        )
+        items = transcripts_collector.fetch_transcripts(since="2026-01-02T00:00:00+00:00")
+        assert items == []
+
+
+class TestTranscriptsEndpoint:
+    """Tests for GET /youtube/transcripts."""
+
+    def _make_client(self, collector):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+        app.include_router(collector.get_router())
+        return TestClient(app)
+
+    def test_no_since_returns_all_items(self, transcripts_collector, monkeypatch, tmp_path):
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-1", "2026-01-01T00:00:00+00:00", "caption",
+        )
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-2", "2026-01-02T00:00:00+00:00", "caption",
+        )
+
+        client = self._make_client(transcripts_collector)
+        resp = client.get("/youtube/transcripts")
+
+        assert resp.status_code == 200
+        items = resp.json()
+        assert {i["id"] for i in items} == {"vid-1", "vid-2"}
+        for item in items:
+            assert "id" in item
+            assert "transcript" in item
+            assert "transcriptSource" in item
+
+    def test_since_query_param_after_cursor_established_yields_no_further_items(
+        self, transcripts_collector, monkeypatch, tmp_path
+    ):
+        """Mirrors the /podcasts/transcripts and /youtube/history push-paging
+        contract: once a push cursor exists, resolve_push_since defers to it
+        rather than an arbitrary caller-supplied since — the persisted push
+        cursor is the authoritative delivery position (see
+        BaseCollector.resolve_push_since). A first request with no since
+        delivers the full backlog and advances the cursor to the newest
+        item; a follow-up request finds nothing further regardless of the
+        since value supplied."""
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-old", "2026-01-01T00:00:00+00:00", "caption",
+        )
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-new", "2026-01-03T00:00:00+00:00", "caption",
+        )
+
+        client = self._make_client(transcripts_collector)
+        first = client.get("/youtube/transcripts")
+        assert [i["id"] for i in first.json()] == ["vid-old", "vid-new"]
+
+        second = client.get(
+            "/youtube/transcripts", params={"since": "2026-01-02T00:00:00+00:00"}
+        )
+        assert second.status_code == 200
+        assert second.json() == []
+
+    def test_response_bounded_by_page_size_and_cursor_advances_to_last_served(
+        self, tmp_path, monkeypatch
+    ):
+        from context_helpers.collectors import base as base_mod
+        from context_helpers.collectors.youtube.collector import YouTubeCollector
+        from context_helpers.config import YouTubeConfig
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
+        monkeypatch.setattr(
+            yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
+        )
+        c = YouTubeCollector(
+            YouTubeConfig(
+                enabled=True,
+                fetch_transcripts=True,
+                push_page_size=2,
+                transcripts_dir=str(tmp_path / "captions"),
+            )
+        )
+        for i in range(3):
+            _write_transcript_json(
+                c._transcripts_dir, f"vid-{i}", f"2026-01-0{i + 1}T00:00:00+00:00", "caption"
+            )
+
+        client = self._make_client(c)
+        resp = client.get("/youtube/transcripts")
+
+        assert resp.status_code == 200
+        page = resp.json()
+        assert len(page) == 2
+        assert [i["id"] for i in page] == ["vid-0", "vid-1"]
+
+        cursor = c.get_push_cursor("youtube_transcripts")
+        assert cursor is not None
+        assert cursor.isoformat() == "2026-01-02T00:00:00+00:00"
+        assert c.has_push_more("youtube_transcripts") is True
+
+    def test_disabled_returns_empty_list(self, collector, monkeypatch, tmp_path):
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        # `collector` fixture has fetch_transcripts=False by default.
+        _write_transcript_json(
+            collector._transcripts_dir, "vid-1", "2026-01-01T00:00:00+00:00", "caption"
+        )
+
+        client = self._make_client(collector)
+        resp = client.get("/youtube/transcripts")
+
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_caption_and_whisper_merged_for_different_videos(
+        self, transcripts_collector, monkeypatch, tmp_path
+    ):
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        whisper_dir = tmp_path / "whisper"
+        transcripts_collector._whisper_transcripts_dir = whisper_dir
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-cap", "2026-01-01T00:00:00+00:00", "caption",
+        )
+        _write_transcript_json(whisper_dir, "vid-whisper", "2026-01-02T00:00:00+00:00", "whisper")
+
+        client = self._make_client(transcripts_collector)
+        resp = client.get("/youtube/transcripts")
+
+        items = resp.json()
+        assert [i["id"] for i in items] == ["vid-cap", "vid-whisper"]
+        assert {i["transcriptSource"] for i in items} == {"caption", "whisper"}
+
+    def test_uses_youtube_transcripts_cursor_key_independent_of_history(
+        self, transcripts_collector, monkeypatch, tmp_path
+    ):
+        from context_helpers.collectors import base as base_mod
+
+        monkeypatch.setattr(base_mod, "_CURSORS_DIR", tmp_path / "cursors")
+        _write_transcript_json(
+            transcripts_collector._transcripts_dir,
+            "vid-1", "2026-01-01T00:00:00+00:00", "caption",
+        )
+
+        client = self._make_client(transcripts_collector)
+        resp = client.get("/youtube/transcripts")
+
+        assert resp.status_code == 200
+        assert transcripts_collector.get_push_cursor("youtube_transcripts") is not None
+        assert transcripts_collector.get_push_cursor("youtube_history") is None
+        assert (tmp_path / "cursors" / "youtube_transcripts_push.json").exists()
