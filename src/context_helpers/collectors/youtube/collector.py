@@ -75,6 +75,11 @@ _CAPTION_ATTEMPTS_PATH = (
     / "youtube_caption_attempts.json"
 )
 
+_WHISPER_ATTEMPTS_PATH = (
+    Path.home() / ".local" / "share" / "context-helpers" / "cursors"
+    / "youtube_whisper_attempts.json"
+)
+
 # ---------------------------------------------------------------------------
 # Caption file parsing (VTT / SRT)
 # ---------------------------------------------------------------------------
@@ -226,6 +231,7 @@ class YouTubeCollector(BaseCollector):
         self._whisper_transcripts_dir = Path(
             os.path.expanduser(config.whisper_transcripts_dir)
         )
+        self._whisper_attempts: dict[str, str] = self._load_whisper_attempts()
         self._transcription_lock = threading.Lock()
         self._transcription_thread: threading.Thread | None = None
 
@@ -721,7 +727,11 @@ class YouTubeCollector(BaseCollector):
         clean up the audio it downloads.
 
         A download or transcription failure for one video is logged and
-        skipped; it never blocks the remaining videos.
+        skipped; it never blocks the remaining videos. Every candidate
+        processed — success or failure — is recorded in the whisper-attempts
+        cache so a persistently failing video (OOM, corrupt audio,
+        unsupported codec) is not re-downloaded and re-attempted on every
+        subsequent poll cycle.
 
         Returns the count of videos successfully transcribed.
 
@@ -745,9 +755,13 @@ class YouTubeCollector(BaseCollector):
 
         model = self._config.whisper_model
         count = 0
+        now = datetime.now(timezone.utc)
+        attempts_changed = False
 
         for video_id, first_seen in candidates:
             audio_path: Path | None = None
+            self._whisper_attempts[video_id] = now.isoformat()
+            attempts_changed = True
             try:
                 audio_path = self._download_audio_for_whisper(video_id)
                 if audio_path is None:
@@ -790,6 +804,9 @@ class YouTubeCollector(BaseCollector):
                 if audio_path is not None:
                     shutil.rmtree(audio_path.parent, ignore_errors=True)
 
+        if attempts_changed:
+            self._save_whisper_attempts()
+
         return count
 
     def _fetch_pending_whisper_candidates(
@@ -802,10 +819,16 @@ class YouTubeCollector(BaseCollector):
         has been written for it yet. Videos never attempted for captions
         (fetch_transcripts=False, or still queued behind caption_batch_size)
         are not eligible — whisper is a fallback for the caption path, not a
-        replacement for it. Sorted oldest-first_seen-first.
+        replacement for it. Videos already recorded in the whisper-attempts
+        cache (tracked the same way as _caption_attempts) are excluded too,
+        so a video whose audio download or transcription previously failed
+        (OOM, corrupt audio, unsupported codec) isn't re-downloaded and
+        re-attempted on every poll cycle. Sorted oldest-first_seen-first.
         """
         candidates: list[tuple[str, datetime | None]] = []
         for video_id in list(self._caption_attempts):
+            if video_id in self._whisper_attempts:
+                continue
             if _caption_transcript_path(self._transcripts_dir, video_id).exists():
                 continue
             if _caption_transcript_path(self._whisper_transcripts_dir, video_id).exists():
@@ -830,6 +853,15 @@ class YouTubeCollector(BaseCollector):
         directory, or None if the download failed (in which case the temp
         directory is already cleaned up). On success, the caller owns
         deleting the returned path's parent directory after use.
+
+        Unlike _run_ytdlp (which scrapes a feed of many videos, where exit
+        code 1 signals a partial failure — some entries unavailable, others
+        fine — and whatever JSON did print is still usable), this downloads
+        exactly one video. There is no partial-success case: any non-zero
+        exit code means this video's extraction failed, and any wav file
+        that happens to be on disk may be truncated or corrupt. So any
+        non-zero exit is treated as fatal and the produced file, if any, is
+        discarded rather than fed to mlx-whisper.
         """
         tmp_dir = Path(tempfile.mkdtemp(prefix="context-helpers-youtube-whisper-"))
         url = f"https://www.youtube.com/watch?v={video_id}"
@@ -871,6 +903,9 @@ class YouTubeCollector(BaseCollector):
                     "YouTubeCollector: yt-dlp exited %d downloading audio for %s: %s",
                     result.returncode, video_id, result.stderr.strip()[:400],
                 )
+                span.set_attribute("youtube.audio_downloaded", False)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return None
 
             audio_files = sorted(tmp_dir.glob(f"{video_id}*.wav"))
             if not audio_files:
@@ -1035,3 +1070,32 @@ class YouTubeCollector(BaseCollector):
             tmp.replace(_CAPTION_ATTEMPTS_PATH)
         except OSError as exc:
             logger.error("Could not save YouTube caption-attempts cache: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Whisper-attempts cache persistence
+    #
+    # Tracks video_id -> last attempted_at (ISO 8601), independent of the
+    # whisper_transcripts_dir output files, so a video whose audio download
+    # or transcription fails (OOM, corrupt audio, unsupported codec) is
+    # attempted once, not re-downloaded and re-transcribed on every poll
+    # cycle. Mirrors _caption_attempts / _load_caption_attempts above.
+    # ------------------------------------------------------------------
+
+    def _load_whisper_attempts(self) -> dict[str, str]:
+        _WHISPER_ATTEMPTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if _WHISPER_ATTEMPTS_PATH.exists():
+            try:
+                return json.loads(_WHISPER_ATTEMPTS_PATH.read_text())
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning(
+                    "Could not load YouTube whisper-attempts cache (%s); starting fresh", exc
+                )
+        return {}
+
+    def _save_whisper_attempts(self) -> None:
+        tmp = _WHISPER_ATTEMPTS_PATH.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(self._whisper_attempts))
+            tmp.replace(_WHISPER_ATTEMPTS_PATH)
+        except OSError as exc:
+            logger.error("Could not save YouTube whisper-attempts cache: %s", exc)

@@ -9,6 +9,7 @@ push page would be filtered out forever by the strictly-greater-than cursor
 
 import itertools
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -63,6 +64,9 @@ def collector(tmp_path, monkeypatch):
     monkeypatch.setattr(
         yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
     )
+    monkeypatch.setattr(
+        yt_mod, "_WHISPER_ATTEMPTS_PATH", tmp_path / "youtube_whisper_attempts.json"
+    )
     c = YouTubeCollector(
         YouTubeConfig(
             enabled=True,
@@ -80,6 +84,9 @@ def whisper_collector(tmp_path, monkeypatch):
     monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
     monkeypatch.setattr(
         yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
+    )
+    monkeypatch.setattr(
+        yt_mod, "_WHISPER_ATTEMPTS_PATH", tmp_path / "youtube_whisper_attempts.json"
     )
     c = YouTubeCollector(
         YouTubeConfig(
@@ -102,6 +109,9 @@ def transcripts_collector(tmp_path, monkeypatch):
     monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
     monkeypatch.setattr(
         yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
+    )
+    monkeypatch.setattr(
+        yt_mod, "_WHISPER_ATTEMPTS_PATH", tmp_path / "youtube_whisper_attempts.json"
     )
     c = YouTubeCollector(
         YouTubeConfig(
@@ -594,6 +604,9 @@ class TestCaptionAttemptsCache:
         monkeypatch.setattr(
             yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
         )
+        monkeypatch.setattr(
+            yt_mod, "_WHISPER_ATTEMPTS_PATH", tmp_path / "youtube_whisper_attempts.json"
+        )
         cfg = YouTubeConfig(
             enabled=True,
             fetch_transcripts=True,
@@ -622,6 +635,9 @@ class TestCaptionBatchSize:
         monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
         monkeypatch.setattr(
             yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
+        )
+        monkeypatch.setattr(
+            yt_mod, "_WHISPER_ATTEMPTS_PATH", tmp_path / "youtube_whisper_attempts.json"
         )
         c = YouTubeCollector(
             YouTubeConfig(
@@ -849,6 +865,9 @@ class TestTranscribePending:
         monkeypatch.setattr(
             yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
         )
+        monkeypatch.setattr(
+            yt_mod, "_WHISPER_ATTEMPTS_PATH", tmp_path / "youtube_whisper_attempts.json"
+        )
         monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
         c = YouTubeCollector(
             YouTubeConfig(
@@ -895,6 +914,210 @@ class TestTranscribePending:
         count2 = c.transcribe_pending()
         assert count2 == 2
         assert calls == ["vid-0", "vid-1", "vid-2", "vid-3"]
+
+
+class TestWhisperAttemptsCache:
+    def test_failed_download_is_not_retried_on_next_call(
+        self, whisper_collector, monkeypatch
+    ):
+        vid = "vid-oom"
+        whisper_collector._caption_attempts[vid] = datetime.now(timezone.utc).isoformat()
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+        calls: list[str] = []
+        monkeypatch.setattr(
+            whisper_collector,
+            "_download_audio_for_whisper",
+            lambda v: calls.append(v) or None,
+        )
+
+        whisper_collector.transcribe_pending()
+        whisper_collector.transcribe_pending()
+
+        assert calls == [vid], "a video whose audio download failed must not be retried"
+
+    def test_failed_transcription_is_not_retried_on_next_call(
+        self, whisper_collector, monkeypatch, tmp_path
+    ):
+        vid = "vid-corrupt-audio"
+        whisper_collector._caption_attempts[vid] = datetime.now(timezone.utc).isoformat()
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+        monkeypatch.setattr(
+            whisper_collector, "_download_audio_for_whisper", _fake_download(tmp_path)
+        )
+        calls: list[str] = []
+        monkeypatch.setattr(
+            yt_mod,
+            "_transcribe_audio_file",
+            lambda path, model, log_prefix=None: calls.append(path.name) or None,
+        )
+
+        whisper_collector.transcribe_pending()
+        whisper_collector.transcribe_pending()
+
+        assert len(calls) == 1, "a video whose transcription failed must not be retried"
+
+    def test_attempts_persisted_across_collector_instances(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
+        monkeypatch.setattr(
+            yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
+        )
+        monkeypatch.setattr(
+            yt_mod, "_WHISPER_ATTEMPTS_PATH", tmp_path / "youtube_whisper_attempts.json"
+        )
+        monkeypatch.setattr(yt_mod, "_MLX_WHISPER_AVAILABLE", True)
+        cfg = YouTubeConfig(
+            enabled=True,
+            fetch_transcripts=True,
+            auto_transcribe=True,
+            transcripts_dir=str(tmp_path / "captions"),
+            whisper_transcripts_dir=str(tmp_path / "whisper"),
+        )
+        first = YouTubeCollector(cfg)
+        first._caption_attempts["vid-fail"] = datetime.now(timezone.utc).isoformat()
+        monkeypatch.setattr(first, "_download_audio_for_whisper", lambda v: None)
+        first.transcribe_pending()
+
+        second = YouTubeCollector(cfg)
+        second._caption_attempts["vid-fail"] = first._caption_attempts["vid-fail"]
+        calls: list[str] = []
+        monkeypatch.setattr(second, "_download_audio_for_whisper", lambda v: calls.append(v))
+        second.transcribe_pending()
+
+        assert calls == []
+
+
+class TestDownloadAudioForWhisper:
+    def test_success_returns_wav_path_and_uses_correct_flags(
+        self, whisper_collector, monkeypatch
+    ):
+        captured = {}
+
+        class FakeCompletedProcess:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None, check=None):
+            captured["cmd"] = cmd
+            captured["cwd"] = cwd
+            (Path(cwd) / "vid-ok.wav").write_bytes(b"fake-wav-bytes")
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
+
+        try:
+            result = whisper_collector._download_audio_for_whisper("vid-ok")
+
+            assert result is not None
+            assert result.name == "vid-ok.wav"
+            assert result.exists()
+            cmd = captured["cmd"]
+            assert "-x" in cmd
+            assert cmd[cmd.index("--audio-format") + 1] == "wav"
+            assert "--cookies-from-browser" in cmd
+        finally:
+            shutil.rmtree(captured["cwd"], ignore_errors=True)
+
+    def test_returns_none_and_cleans_temp_dir_on_timeout(self, whisper_collector, monkeypatch):
+        import subprocess as subprocess_mod
+
+        captured = {}
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None, check=None):
+            captured["cwd"] = cwd
+            raise subprocess_mod.TimeoutExpired(cmd, timeout)
+
+        monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
+
+        result = whisper_collector._download_audio_for_whisper("vid-timeout")
+
+        assert result is None
+        assert not Path(captured["cwd"]).exists(), "temp dir must be cleaned up on timeout"
+
+    def test_returns_none_and_cleans_temp_dir_when_binary_missing(
+        self, whisper_collector, monkeypatch
+    ):
+        captured = {}
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None, check=None):
+            captured["cwd"] = cwd
+            raise FileNotFoundError("yt-dlp not found")
+
+        monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
+
+        result = whisper_collector._download_audio_for_whisper("vid-missing-binary")
+
+        assert result is None
+        assert not Path(captured["cwd"]).exists(), (
+            "temp dir must be cleaned up when yt-dlp binary is missing"
+        )
+
+    def test_returns_none_and_cleans_temp_dir_when_no_wav_produced(
+        self, whisper_collector, monkeypatch
+    ):
+        captured = {}
+
+        class FakeCompletedProcess:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None, check=None):
+            captured["cwd"] = cwd
+            return FakeCompletedProcess()  # exits clean but writes no wav file
+
+        monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
+
+        result = whisper_collector._download_audio_for_whisper("vid-no-wav")
+
+        assert result is None
+        assert not Path(captured["cwd"]).exists(), (
+            "temp dir must be cleaned up when no wav file is produced"
+        )
+
+    def test_nonzero_exit_discards_wav_file_and_cleans_temp_dir(
+        self, whisper_collector, monkeypatch
+    ):
+        """A non-zero yt-dlp exit must never hand back a (possibly corrupt or
+        partial) wav file — even if yt-dlp left one on disk before failing."""
+        captured = {}
+
+        class FakeCompletedProcess:
+            returncode = 1
+            stdout = ""
+            stderr = "ERROR: postprocessing failed"
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None, check=None):
+            captured["cwd"] = cwd
+            (Path(cwd) / "vid-corrupt.wav").write_bytes(b"not really a valid wav")
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
+
+        result = whisper_collector._download_audio_for_whisper("vid-corrupt")
+
+        assert result is None, "a wav file left behind by a failing yt-dlp must be discarded"
+        assert not Path(captured["cwd"]).exists(), "temp dir must be cleaned up"
+
+    def test_high_exit_code_also_discards_wav_file(self, whisper_collector, monkeypatch):
+        captured = {}
+
+        class FakeCompletedProcess:
+            returncode = 2
+            stdout = ""
+            stderr = "ERROR: fatal"
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None, check=None):
+            captured["cwd"] = cwd
+            (Path(cwd) / "vid-fatal.wav").write_bytes(b"partial")
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(yt_mod.subprocess, "run", fake_run)
+
+        result = whisper_collector._download_audio_for_whisper("vid-fatal")
+
+        assert result is None
+        assert not Path(captured["cwd"]).exists()
 
 
 class TestTranscriptionBackgroundTrigger:
@@ -1154,6 +1377,9 @@ class TestTranscriptsEndpoint:
         monkeypatch.setattr(yt_mod, "_SEEN_CACHE_PATH", tmp_path / "youtube_seen.json")
         monkeypatch.setattr(
             yt_mod, "_CAPTION_ATTEMPTS_PATH", tmp_path / "youtube_caption_attempts.json"
+        )
+        monkeypatch.setattr(
+            yt_mod, "_WHISPER_ATTEMPTS_PATH", tmp_path / "youtube_whisper_attempts.json"
         )
         c = YouTubeCollector(
             YouTubeConfig(
