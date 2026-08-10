@@ -18,8 +18,12 @@ meaningful timestamp, this collector maintains a **seen-cache**
 
 When polling runs every 15–30 minutes the approximation is tight enough that
 ``first_seen_at ≈ watched_at``.  On the very first run the entire history page
-(≈ 200 videos) lands at the same timestamp; subsequent polls only surface videos
-that are genuinely new.
+(≈ 200 videos) is assigned strictly increasing synthetic timestamps
+(``now + i microseconds``, in discovery order) rather than a single shared
+timestamp — this keeps every ``first_seen_at`` unique so the strictly-greater-
+than ``since`` cursor can page through the full backlog instead of dropping
+everything past the first page.  Subsequent polls only surface videos that are
+genuinely new.
 
 Whisper fallback transcription
 ===============================
