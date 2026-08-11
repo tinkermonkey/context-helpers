@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -227,6 +227,34 @@ class YouTubeConfig(BaseSettings):
     enabled: bool = False
     browser: Literal["safari", "chrome", "firefox", "chromium", "brave", "opera", "edge"] = "safari"
     push_page_size: int = 50    # max videos returned per push-trigger cycle
+    # Transcript support — yt-dlp captions
+    fetch_transcripts: bool = False
+    sub_langs: str = "en"
+    transcripts_dir: str = (
+        "~/.local/share/context-helpers/youtube_transcripts/captions"
+    )
+    caption_batch_size: int = 5      # max videos caption-fetched per poll cycle
+    # Whisper auto-transcription fallback (requires mlx-whisper extra)
+    auto_transcribe: bool = False
+    whisper_model: str = "base.en"   # short name or full mlx-community HuggingFace repo
+    whisper_transcripts_dir: str = (
+        "~/.local/share/context-helpers/youtube_transcripts"
+    )
+    whisper_batch_size: int = 3      # max videos transcribed per push cycle
+    # Backfill safety rail: on first run (or cursor reset), only videos seen
+    # within this many days are eligible for transcript fetching.
+    transcript_lookback_days: int = 30
+
+    @model_validator(mode="after")
+    def _auto_transcribe_requires_fetch_transcripts(self) -> YouTubeConfig:
+        if self.auto_transcribe and not self.fetch_transcripts:
+            raise ValueError(
+                "collectors.youtube.auto_transcribe requires "
+                "collectors.youtube.fetch_transcripts to be true. Whisper "
+                "candidates are drawn from caption fetch attempts, so "
+                "auto_transcribe has no effect without fetch_transcripts."
+            )
+        return self
 
 
 class PodcastsConfig(BaseSettings):

@@ -59,6 +59,17 @@ collectors:
     enabled: false
     browser: safari             # Browser whose cookies yt-dlp reads: safari | chrome | firefox | chromium
     # push_page_size: 50        # Max videos returned per push-trigger cycle
+    # Transcript support — yt-dlp captions (cheap, preferred path; no audio/video download)
+    # fetch_transcripts: false
+    # sub_langs: en
+    # transcripts_dir: "~/.local/share/context-helpers/youtube_transcripts/captions"
+    # transcript_lookback_days: 30   # backfill safety rail: only videos first-seen within this window are fetched
+    # caption_batch_size: 5          # max videos caption-fetched per poll cycle
+    # Whisper auto-transcription fallback (requires the `whisper` extra; Mac Silicon only)
+    # auto_transcribe: false
+    # whisper_model: base.en
+    # whisper_transcripts_dir: "~/.local/share/context-helpers/youtube_transcripts"
+    # whisper_batch_size: 3
 
 push:
   enabled: false

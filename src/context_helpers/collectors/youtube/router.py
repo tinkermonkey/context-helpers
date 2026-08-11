@@ -35,7 +35,39 @@ def make_youtube_router(collector: YouTubeCollector) -> APIRouter:
         Results are sorted by ``watched_at`` ASC and bounded by
         ``push_page_size`` to prevent oversized responses during catch-up.
         """
-        items = collector.fetch_history(since=collector.resolve_push_since(since))
-        return collector.apply_push_paging(items, "watched_at")
+        items = collector.fetch_history(
+            since=collector.resolve_push_since(since, "youtube_history")
+        )
+        return collector.apply_push_paging(items, "watched_at", "youtube_history")
+
+    @router.get("/youtube/transcripts")
+    def get_transcripts(
+        since: str | None = Query(
+            default=None,
+            description=(
+                "ISO 8601 lower-bound (exclusive). "
+                "Return only transcripts created after this timestamp."
+            ),
+        ),
+    ) -> list[dict]:
+        """Return YouTube video transcripts from caption and whisper sources.
+
+        Caption transcripts: videos with a caption track fetched via yt-dlp
+        (requires fetch_transcripts: true).
+
+        Whisper transcripts: videos with no caption track, transcribed locally
+        by the background mlx-whisper pipeline (requires auto_transcribe: true
+        and the whisper extra). Caption transcripts take priority when both
+        exist for the same video.
+
+        Independently paginated from /youtube/history via the
+        youtube_transcripts push cursor.
+        """
+        items = collector.fetch_transcripts(
+            since=collector.resolve_push_since(since, "youtube_transcripts")
+        )
+        return collector.apply_push_paging(
+            items, "transcriptCreatedAt", "youtube_transcripts"
+        )
 
     return router

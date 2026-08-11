@@ -9,6 +9,7 @@ from context_helpers.config import (
     AppConfig,
     EmailAccountConfig,
     EmailConfig,
+    YouTubeConfig,
     load_config,
 )
 from tests.conftest import TEST_API_KEY, write_config
@@ -269,4 +270,40 @@ class TestEmailConfig:
             },
         )
         with pytest.raises(ValidationError, match="host"):
+            load_config(p)
+
+
+class TestYouTubeConfig:
+    def test_auto_transcribe_without_fetch_transcripts_raises(self):
+        with pytest.raises(ValidationError, match="fetch_transcripts"):
+            YouTubeConfig(enabled=True, auto_transcribe=True, fetch_transcripts=False)
+
+    def test_auto_transcribe_with_fetch_transcripts_ok(self):
+        cfg = YouTubeConfig(enabled=True, auto_transcribe=True, fetch_transcripts=True)
+        assert cfg.auto_transcribe is True
+        assert cfg.fetch_transcripts is True
+
+    def test_fetch_transcripts_without_auto_transcribe_ok(self):
+        cfg = YouTubeConfig(enabled=True, auto_transcribe=False, fetch_transcripts=True)
+        assert cfg.fetch_transcripts is True
+
+    def test_neither_flag_ok(self):
+        cfg = YouTubeConfig()
+        assert cfg.auto_transcribe is False
+        assert cfg.fetch_transcripts is False
+
+    def test_auto_transcribe_without_fetch_transcripts_raises_via_load_config(self, tmp_path):
+        p = write_config(
+            tmp_path / "config.yaml",
+            {
+                "collectors": {
+                    "youtube": {
+                        "enabled": True,
+                        "auto_transcribe": True,
+                        "fetch_transcripts": False,
+                    }
+                }
+            },
+        )
+        with pytest.raises(ValidationError, match="fetch_transcripts"):
             load_config(p)
