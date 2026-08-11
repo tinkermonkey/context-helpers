@@ -172,17 +172,26 @@ class iMessageCollector(BaseCollector):
                 ]
                 attachments_by_message_id: dict[int, list[dict]] = {}
                 if attachment_message_ids:
-                    placeholders = ",".join("?" * len(attachment_message_ids))
-                    attachment_rows = conn.execute(
-                        _ATTACHMENTS_SQL.format(placeholders=placeholders),
-                        attachment_message_ids,
-                    ).fetchall()
-                    for a_row in attachment_rows:
-                        attachments_by_message_id.setdefault(a_row["message_id"], []).append({
-                            "mime_type": a_row["mime_type"],
-                            "filename": a_row["filename"],
-                            "transfer_name": a_row["transfer_name"],
-                        })
+                    try:
+                        placeholders = ",".join("?" * len(attachment_message_ids))
+                        attachment_rows = conn.execute(
+                            _ATTACHMENTS_SQL.format(placeholders=placeholders),
+                            attachment_message_ids,
+                        ).fetchall()
+                        for a_row in attachment_rows:
+                            attachments_by_message_id.setdefault(
+                                a_row["message_id"], []
+                            ).append({
+                                "mime_type": a_row["mime_type"],
+                                "filename": a_row["filename"],
+                                "transfer_name": a_row["transfer_name"],
+                            })
+                    except sqlite3.OperationalError:
+                        logger.warning(
+                            "Attachment metadata query failed; "
+                            "returning messages without attachments",
+                            exc_info=True,
+                        )
 
                 messages = []
                 for row in rows:
