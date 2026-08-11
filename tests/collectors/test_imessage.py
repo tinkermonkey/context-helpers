@@ -1,6 +1,6 @@
 """Tests for iMessageCollector — SQLite reads, epoch conversion, filtering."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -32,12 +32,14 @@ class TestFetchMessages:
         result = _collector(chat_db).fetch_messages(since=None)
         assert isinstance(result, list)
 
-    def test_null_text_messages_excluded(self, chat_db):
-        """Messages with NULL text must not appear (WHERE m.text IS NOT NULL)."""
+    def test_null_text_without_attachment_excluded(self, chat_db):
+        """Messages with NULL text and no attachment must not appear."""
         result = _collector(chat_db).fetch_messages(since=None)
         assert all(m["text"] is not None for m in result)
-        # The fixture inserts 4 messages but 1 has NULL text → expect 3
-        assert len(result) == 3
+        # The fixture inserts 6 messages: msg 4 (NULL text, no attachment) is
+        # excluded; msg 5 (attachment-only) and msg 6 (text + attachment) are
+        # included → expect 5.
+        assert len(result) == 5
 
     def test_required_keys_present_in_every_message(self, chat_db):
         result = _collector(chat_db).fetch_messages(since=None)
@@ -49,6 +51,7 @@ class TestFetchMessages:
             assert "timestamp" in msg
             assert "thread_id" in msg
             assert "is_from_me" in msg
+            assert "attachments" in msg
 
     def test_is_from_me_false_uses_handle_id(self, chat_db):
         result = _collector(chat_db).fetch_messages(since=None)
@@ -58,9 +61,9 @@ class TestFetchMessages:
 
     def test_is_from_me_true_sender_is_me(self, chat_db):
         result = _collector(chat_db).fetch_messages(since=None)
-        sent = [m for m in result if m["is_from_me"]]
-        assert len(sent) == 1
-        assert sent[0]["sender"] == "me"
+        sent = next(m for m in result if m["text"] == "Hi back!")
+        assert sent["is_from_me"] is True
+        assert sent["sender"] == "me"
 
     def test_is_from_me_field_is_bool(self, chat_db):
         result = _collector(chat_db).fetch_messages(since=None)
@@ -143,9 +146,10 @@ class TestSinceFilter:
         result = _collector(chat_db).fetch_messages(since=since_dt.isoformat())
         assert len(result) >= 1  # at least msgs 2 and 3
 
-    def test_no_since_returns_all_non_null_messages(self, chat_db):
+    def test_no_since_returns_all_eligible_messages(self, chat_db):
         result = _collector(chat_db).fetch_messages(since=None)
-        assert len(result) == 3  # 4 inserted, 1 has NULL text
+        # 6 inserted; msg 4 (NULL text, no attachment) is excluded → 5
+        assert len(result) == 5
 
     def test_since_far_future_returns_empty(self, chat_db):
         result = _collector(chat_db).fetch_messages(since="2099-01-01T00:00:00+00:00")
@@ -153,7 +157,7 @@ class TestSinceFilter:
 
     def test_since_far_past_returns_all(self, chat_db):
         result = _collector(chat_db).fetch_messages(since="2000-01-01T00:00:00+00:00")
-        assert len(result) == 3
+        assert len(result) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +175,97 @@ class TestThreadId:
         result = _collector(chat_db).fetch_messages(since=None)
         group_msg = next(m for m in result if m["text"] == "Group hello")
         assert group_msg["thread_id"] == "group-chat-xyz"
+
+
+# ---------------------------------------------------------------------------
+# Attachment handling
+# ---------------------------------------------------------------------------
+
+class TestAttachments:
+    def test_attachment_only_message_gets_text_stub(self, chat_db):
+        result = _collector(chat_db).fetch_messages(since=None)
+        msg = next(m for m in result if m["id"] == "5")
+        assert msg["text"] == "[attachment]"
+
+    def test_attachment_only_message_has_populated_attachments(self, chat_db):
+        result = _collector(chat_db).fetch_messages(since=None)
+        msg = next(m for m in result if m["id"] == "5")
+        assert msg["attachments"] == [
+            {
+                "mime_type": "image/jpeg",
+                "filename": "/var/tmp/photo.jpg",
+                "transfer_name": "photo.jpg",
+            }
+        ]
+
+    def test_text_only_message_has_empty_attachments(self, chat_db):
+        result = _collector(chat_db).fetch_messages(since=None)
+        hello_msg = next(m for m in result if m["text"] == "Hello!")
+        assert hello_msg["attachments"] == []
+
+    def test_message_with_text_and_attachment_retains_text(self, chat_db):
+        result = _collector(chat_db).fetch_messages(since=None)
+        msg = next(m for m in result if m["id"] == "6")
+        assert msg["text"] == "Check this out"
+
+    def test_message_with_text_and_attachment_has_populated_attachments(self, chat_db):
+        result = _collector(chat_db).fetch_messages(since=None)
+        msg = next(m for m in result if m["id"] == "6")
+        assert msg["attachments"] == [
+            {
+                "mime_type": "application/pdf",
+                "filename": "/var/tmp/doc.pdf",
+                "transfer_name": "doc.pdf",
+            }
+        ]
+
+    def test_null_text_no_attachment_still_excluded(self, chat_db):
+        result = _collector(chat_db).fetch_messages(since=None)
+        assert all(m["id"] != "4" for m in result)
+
+    def test_no_n_plus_one_attachment_queries(self, chat_db, monkeypatch):
+        """Attachment metadata must be fetched via one batched query, not
+        once per attachment-bearing message."""
+        import sqlite3 as sqlite3_module
+
+        original_connect = sqlite3_module.connect
+        executed_sql: list[str] = []
+
+        def tracking_connect(*args, **kwargs):
+            conn = original_connect(*args, **kwargs)
+            conn.set_trace_callback(executed_sql.append)
+            return conn
+
+        monkeypatch.setattr(sqlite3_module, "connect", tracking_connect)
+        _collector(chat_db).fetch_messages(since=None)
+        attachment_query_calls = [
+            sql for sql in executed_sql if "FROM message_attachment_join" in sql
+        ]
+        assert len(attachment_query_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# has_changes_since
+# ---------------------------------------------------------------------------
+
+class TestHasChangesSince:
+    def _no_cursor(self, collector, monkeypatch):
+        """Stub the push cursor to None for test isolation from real cursor files on disk."""
+        monkeypatch.setattr(collector, "get_push_cursor", lambda: None)
+
+    def test_true_when_only_attachment_only_messages_past_watermark(self, chat_db, monkeypatch):
+        collector = _collector(chat_db)
+        self._no_cursor(collector, monkeypatch)
+        # Just after msg 4 (base + 3s), before msg 5, the attachment-only
+        # message (base + 4s).
+        watermark = _BASE_DT + timedelta(seconds=3, microseconds=500000)
+        assert collector.has_changes_since(watermark) is True
+
+    def test_false_when_no_messages_past_watermark(self, chat_db, monkeypatch):
+        collector = _collector(chat_db)
+        self._no_cursor(collector, monkeypatch)
+        watermark = datetime(2099, 1, 1, tzinfo=timezone.utc)
+        assert collector.has_changes_since(watermark) is False
 
 
 # ---------------------------------------------------------------------------

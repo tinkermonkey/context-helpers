@@ -24,7 +24,10 @@ def chat_db(tmp_path) -> Path:
     - is_from_me = 0 (received, sender from handle table)
     - is_from_me = 1 (sent, sender = "me")
     - chat join present / absent (tests thread_id fallback)
-    - NULL text (should be excluded by WHERE clause)
+    - NULL text with cache_has_attachments = 1 (attachment-only message)
+    - non-NULL text with cache_has_attachments = 1 (mixed text + attachment)
+    - NULL text with cache_has_attachments = 0 (no attachment metadata at all —
+      should still be excluded)
     """
     db_path = tmp_path / "chat.db"
 
@@ -35,12 +38,13 @@ def chat_db(tmp_path) -> Path:
     with sqlite3.connect(str(db_path)) as conn:
         conn.executescript("""
             CREATE TABLE message (
-                ROWID           INTEGER PRIMARY KEY,
-                text            TEXT,
-                is_from_me      INTEGER DEFAULT 0,
-                date            INTEGER DEFAULT 0,
-                handle_id       INTEGER DEFAULT 0,
-                cache_roomnames TEXT
+                ROWID                   INTEGER PRIMARY KEY,
+                text                    TEXT,
+                is_from_me              INTEGER DEFAULT 0,
+                date                    INTEGER DEFAULT 0,
+                handle_id               INTEGER DEFAULT 0,
+                cache_roomnames         TEXT,
+                cache_has_attachments   INTEGER DEFAULT 0
             );
 
             CREATE TABLE handle (
@@ -61,6 +65,18 @@ def chat_db(tmp_path) -> Path:
             CREATE TABLE chat_handle_join (
                 chat_id    INTEGER,
                 handle_id  INTEGER
+            );
+
+            CREATE TABLE attachment (
+                ROWID           INTEGER PRIMARY KEY,
+                mime_type       TEXT,
+                filename        TEXT,
+                transfer_name   TEXT
+            );
+
+            CREATE TABLE message_attachment_join (
+                message_id     INTEGER,
+                attachment_id  INTEGER
             );
         """)
 
@@ -100,13 +116,42 @@ def chat_db(tmp_path) -> Path:
         )
         conn.execute("INSERT INTO chat_message_join VALUES (3, 2)")
 
-        # msg 4: NULL text — must be excluded from results
+        # msg 4: NULL text, no attachment — must still be excluded from results
         conn.execute(
-            "INSERT INTO message (ROWID, text, is_from_me, date, handle_id, cache_roomnames) "
-            "VALUES (4, NULL, 0, ?, 1, NULL)",
+            "INSERT INTO message "
+            "(ROWID, text, is_from_me, date, handle_id, cache_roomnames, cache_has_attachments) "
+            "VALUES (4, NULL, 0, ?, 1, NULL, 0)",
             (base_ns + 3_000_000_000,),
         )
         conn.execute("INSERT INTO chat_message_join VALUES (4, 1)")
+
+        # msg 5: attachment-only (NULL text, cache_has_attachments = 1)
+        conn.execute(
+            "INSERT INTO message "
+            "(ROWID, text, is_from_me, date, handle_id, cache_roomnames, cache_has_attachments) "
+            "VALUES (5, NULL, 0, ?, 1, NULL, 1)",
+            (base_ns + 4_000_000_000,),
+        )
+        conn.execute("INSERT INTO chat_message_join VALUES (5, 1)")
+        conn.execute(
+            "INSERT INTO attachment (ROWID, mime_type, filename, transfer_name) "
+            "VALUES (1, 'image/jpeg', '/var/tmp/photo.jpg', 'photo.jpg')"
+        )
+        conn.execute("INSERT INTO message_attachment_join VALUES (5, 1)")
+
+        # msg 6: text + attachment (both present)
+        conn.execute(
+            "INSERT INTO message "
+            "(ROWID, text, is_from_me, date, handle_id, cache_roomnames, cache_has_attachments) "
+            "VALUES (6, 'Check this out', 1, ?, 0, NULL, 1)",
+            (base_ns + 5_000_000_000,),
+        )
+        conn.execute("INSERT INTO chat_message_join VALUES (6, 1)")
+        conn.execute(
+            "INSERT INTO attachment (ROWID, mime_type, filename, transfer_name) "
+            "VALUES (2, 'application/pdf', '/var/tmp/doc.pdf', 'doc.pdf')"
+        )
+        conn.execute("INSERT INTO message_attachment_join VALUES (6, 2)")
 
         conn.commit()
 

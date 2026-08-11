@@ -26,13 +26,14 @@ SELECT
     m.date                  AS date_ns,
     m.handle_id             AS handle_id,
     m.cache_roomnames       AS thread_id,
+    m.cache_has_attachments AS cache_has_attachments,
     h.id                    AS sender_id,
     c.chat_identifier       AS chat_identifier
 FROM message m
 LEFT JOIN handle h ON h.ROWID = m.handle_id
 LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
 LEFT JOIN chat c ON c.ROWID = cmj.chat_id
-WHERE m.text IS NOT NULL
+WHERE (m.text IS NOT NULL OR m.cache_has_attachments = 1)
 {since_clause}
 ORDER BY m.date ASC
 LIMIT ?
@@ -45,6 +46,17 @@ JOIN handle h ON h.ROWID = chj.handle_id
 WHERE chj.chat_id = (
     SELECT c.ROWID FROM chat c WHERE c.chat_identifier = ?
 )
+"""
+
+_ATTACHMENTS_SQL = """
+SELECT
+    maj.message_id   AS message_id,
+    a.mime_type       AS mime_type,
+    a.filename        AS filename,
+    a.transfer_name   AS transfer_name
+FROM message_attachment_join maj
+JOIN attachment a ON a.ROWID = maj.attachment_id
+WHERE maj.message_id IN ({placeholders})
 """
 
 
@@ -106,7 +118,8 @@ class iMessageCollector(BaseCollector):
             apple_ns = int((unix_ts - _APPLE_EPOCH_OFFSET) * 1_000_000_000)
             with sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True) as conn:
                 row = conn.execute(
-                    "SELECT 1 FROM message WHERE date > ? AND text IS NOT NULL LIMIT 1",
+                    "SELECT 1 FROM message WHERE date > ? "
+                    "AND (text IS NOT NULL OR cache_has_attachments = 1) LIMIT 1",
                     (apple_ns,),
                 ).fetchone()
             return row is not None
@@ -154,6 +167,23 @@ class iMessageCollector(BaseCollector):
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(sql, params).fetchall()
 
+                attachment_message_ids = [
+                    row["id"] for row in rows if row["cache_has_attachments"]
+                ]
+                attachments_by_message_id: dict[int, list[dict]] = {}
+                if attachment_message_ids:
+                    placeholders = ",".join("?" * len(attachment_message_ids))
+                    attachment_rows = conn.execute(
+                        _ATTACHMENTS_SQL.format(placeholders=placeholders),
+                        attachment_message_ids,
+                    ).fetchall()
+                    for a_row in attachment_rows:
+                        attachments_by_message_id.setdefault(a_row["message_id"], []).append({
+                            "mime_type": a_row["mime_type"],
+                            "filename": a_row["filename"],
+                            "transfer_name": a_row["transfer_name"],
+                        })
+
                 messages = []
                 for row in rows:
                     w = dict(row)
@@ -177,14 +207,18 @@ class iMessageCollector(BaseCollector):
                         except sqlite3.OperationalError:
                             pass
 
+                    attachments = attachments_by_message_id.get(w["id"], [])
+                    text = w["text"] if w["text"] is not None else "[attachment]"
+
                     messages.append({
                         "id": str(w["id"]),
-                        "text": w["text"] or "",
+                        "text": text,
                         "sender": sender,
                         "recipients": recipients,
                         "timestamp": timestamp,
                         "thread_id": chat_id,
                         "is_from_me": is_from_me,
+                        "attachments": attachments,
                     })
 
                 return messages
