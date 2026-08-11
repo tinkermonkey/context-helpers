@@ -36,10 +36,10 @@ class TestFetchMessages:
         """Messages with NULL text and no attachment must not appear."""
         result = _collector(chat_db).fetch_messages(since=None)
         assert all(m["text"] is not None for m in result)
-        # The fixture inserts 6 messages: msg 4 (NULL text, no attachment) is
-        # excluded; msg 5 (attachment-only) and msg 6 (text + attachment) are
-        # included → expect 5.
-        assert len(result) == 5
+        # The fixture inserts 7 messages: msg 4 (NULL text, no attachment) is
+        # excluded; msg 5 and msg 7 (attachment-only) and msg 6 (text +
+        # attachment) are included → expect 6.
+        assert len(result) == 6
 
     def test_required_keys_present_in_every_message(self, chat_db):
         result = _collector(chat_db).fetch_messages(since=None)
@@ -148,8 +148,8 @@ class TestSinceFilter:
 
     def test_no_since_returns_all_eligible_messages(self, chat_db):
         result = _collector(chat_db).fetch_messages(since=None)
-        # 6 inserted; msg 4 (NULL text, no attachment) is excluded → 5
-        assert len(result) == 5
+        # 7 inserted; msg 4 (NULL text, no attachment) is excluded → 6
+        assert len(result) == 6
 
     def test_since_far_future_returns_empty(self, chat_db):
         result = _collector(chat_db).fetch_messages(since="2099-01-01T00:00:00+00:00")
@@ -157,7 +157,7 @@ class TestSinceFilter:
 
     def test_since_far_past_returns_all(self, chat_db):
         result = _collector(chat_db).fetch_messages(since="2000-01-01T00:00:00+00:00")
-        assert len(result) == 5
+        assert len(result) == 6
 
 
 # ---------------------------------------------------------------------------
@@ -219,10 +219,6 @@ class TestAttachments:
             }
         ]
 
-    def test_null_text_no_attachment_still_excluded(self, chat_db):
-        result = _collector(chat_db).fetch_messages(since=None)
-        assert all(m["id"] != "4" for m in result)
-
     def test_no_n_plus_one_attachment_queries(self, chat_db, monkeypatch):
         """Attachment metadata must be fetched via one batched query, not
         once per attachment-bearing message."""
@@ -256,9 +252,11 @@ class TestHasChangesSince:
     def test_true_when_only_attachment_only_messages_past_watermark(self, chat_db, monkeypatch):
         collector = _collector(chat_db)
         self._no_cursor(collector, monkeypatch)
-        # Just after msg 4 (base + 3s), before msg 5, the attachment-only
-        # message (base + 4s).
-        watermark = _BASE_DT + timedelta(seconds=3, microseconds=500000)
+        # Just after msg 6 (base + 5s, the last text-bearing message), before
+        # msg 7 (base + 6s), which is attachment-only. No text-bearing
+        # message is past this watermark, so this genuinely isolates the
+        # "only an attachment-only message is past the watermark" case.
+        watermark = _BASE_DT + timedelta(seconds=5, microseconds=500000)
         assert collector.has_changes_since(watermark) is True
 
     def test_false_when_no_messages_past_watermark(self, chat_db, monkeypatch):

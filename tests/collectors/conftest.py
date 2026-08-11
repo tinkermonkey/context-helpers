@@ -153,6 +153,22 @@ def chat_db(tmp_path) -> Path:
         )
         conn.execute("INSERT INTO message_attachment_join VALUES (6, 2)")
 
+        # msg 7: attachment-only, most recent message — lets has_changes_since
+        # tests isolate the "only an attachment-only message is past the
+        # watermark" case without a later text-bearing message masking it.
+        conn.execute(
+            "INSERT INTO message "
+            "(ROWID, text, is_from_me, date, handle_id, cache_roomnames, cache_has_attachments) "
+            "VALUES (7, NULL, 0, ?, 1, NULL, 1)",
+            (base_ns + 6_000_000_000,),
+        )
+        conn.execute("INSERT INTO chat_message_join VALUES (7, 1)")
+        conn.execute(
+            "INSERT INTO attachment (ROWID, mime_type, filename, transfer_name) "
+            "VALUES (3, 'image/png', '/var/tmp/screenshot.png', 'screenshot.png')"
+        )
+        conn.execute("INSERT INTO message_attachment_join VALUES (7, 3)")
+
         conn.commit()
 
     return db_path
