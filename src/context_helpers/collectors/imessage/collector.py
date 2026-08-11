@@ -217,7 +217,17 @@ class iMessageCollector(BaseCollector):
                             pass
 
                     attachments = attachments_by_message_id.get(w["id"], [])
-                    text = w["text"] if w["text"] is not None else "[attachment]"
+                    if w["text"] is not None:
+                        text = w["text"]
+                    elif attachments:
+                        # Real attachment with no caption text.
+                        text = "[attachment]"
+                    else:
+                        # cache_has_attachments=1 but no attachment rows exist
+                        # (common for tapbacks, reactions, and system events).
+                        # Distinct from "[attachment]" so consumers can tell
+                        # this apart from a genuine attachment-only message.
+                        text = "[message unavailable]"
 
                     messages.append({
                         "id": str(w["id"]),

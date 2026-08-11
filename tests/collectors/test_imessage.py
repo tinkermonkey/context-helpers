@@ -36,10 +36,10 @@ class TestFetchMessages:
         """Messages with NULL text and no attachment must not appear."""
         result = _collector(chat_db).fetch_messages(since=None)
         assert all(m["text"] is not None for m in result)
-        # The fixture inserts 7 messages: msg 4 (NULL text, no attachment) is
-        # excluded; msg 5 and msg 7 (attachment-only) and msg 6 (text +
-        # attachment) are included → expect 6.
-        assert len(result) == 6
+        # The fixture inserts 8 messages: msg 4 (NULL text, no attachment) is
+        # excluded; msg 5, msg 7, and msg 8 (attachment-only / phantom
+        # attachment) and msg 6 (text + attachment) are included → expect 7.
+        assert len(result) == 7
 
     def test_required_keys_present_in_every_message(self, chat_db):
         result = _collector(chat_db).fetch_messages(since=None)
@@ -148,8 +148,8 @@ class TestSinceFilter:
 
     def test_no_since_returns_all_eligible_messages(self, chat_db):
         result = _collector(chat_db).fetch_messages(since=None)
-        # 7 inserted; msg 4 (NULL text, no attachment) is excluded → 6
-        assert len(result) == 6
+        # 8 inserted; msg 4 (NULL text, no attachment) is excluded → 7
+        assert len(result) == 7
 
     def test_since_far_future_returns_empty(self, chat_db):
         result = _collector(chat_db).fetch_messages(since="2099-01-01T00:00:00+00:00")
@@ -157,7 +157,7 @@ class TestSinceFilter:
 
     def test_since_far_past_returns_all(self, chat_db):
         result = _collector(chat_db).fetch_messages(since="2000-01-01T00:00:00+00:00")
-        assert len(result) == 6
+        assert len(result) == 7
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +218,20 @@ class TestAttachments:
                 "transfer_name": "doc.pdf",
             }
         ]
+
+    def test_phantom_attachment_message_gets_distinct_text_stub(self, chat_db):
+        """cache_has_attachments=1 with no attachment rows (tapbacks,
+        reactions, system events) must not be reported as "[attachment]" —
+        that would be indistinguishable from a real attachment-only message."""
+        result = _collector(chat_db).fetch_messages(since=None)
+        msg = next(m for m in result if m["id"] == "8")
+        assert msg["text"] == "[message unavailable]"
+        assert msg["text"] != "[attachment]"
+
+    def test_phantom_attachment_message_has_empty_attachments(self, chat_db):
+        result = _collector(chat_db).fetch_messages(since=None)
+        msg = next(m for m in result if m["id"] == "8")
+        assert msg["attachments"] == []
 
     def test_no_n_plus_one_attachment_queries(self, chat_db, monkeypatch):
         """Attachment metadata must be fetched via one batched query, not

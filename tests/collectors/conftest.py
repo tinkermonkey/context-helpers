@@ -28,6 +28,8 @@ def chat_db(tmp_path) -> Path:
     - non-NULL text with cache_has_attachments = 1 (mixed text + attachment)
     - NULL text with cache_has_attachments = 0 (no attachment metadata at all —
       should still be excluded)
+    - NULL text with cache_has_attachments = 1 but no attachment rows (phantom
+      attachment — e.g. a tapback/reaction/system event)
     """
     db_path = tmp_path / "chat.db"
 
@@ -168,6 +170,17 @@ def chat_db(tmp_path) -> Path:
             "VALUES (3, 'image/png', '/var/tmp/screenshot.png', 'screenshot.png')"
         )
         conn.execute("INSERT INTO message_attachment_join VALUES (7, 3)")
+
+        # msg 8: phantom attachment — cache_has_attachments = 1 but no rows in
+        # the attachment tables (common for tapbacks, reactions, and system
+        # events). Must not be mistaken for a real attachment-only message.
+        conn.execute(
+            "INSERT INTO message "
+            "(ROWID, text, is_from_me, date, handle_id, cache_roomnames, cache_has_attachments) "
+            "VALUES (8, NULL, 0, ?, 1, NULL, 1)",
+            (base_ns + 7_000_000_000,),
+        )
+        conn.execute("INSERT INTO chat_message_join VALUES (8, 1)")
 
         conn.commit()
 
