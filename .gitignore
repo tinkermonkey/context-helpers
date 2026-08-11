@@ -9,5 +9,6 @@ build/
 .mypy_cache/
 .ruff_cache/
 .DS_Store/
+.repair_cycle.log
 
 config.yaml
