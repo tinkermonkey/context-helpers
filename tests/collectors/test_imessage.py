@@ -233,6 +233,54 @@ class TestAttachments:
         msg = next(m for m in result if m["id"] == "8")
         assert msg["attachments"] == []
 
+    def test_attachment_query_failure_falls_back_to_cache_has_attachments(
+        self, chat_db, monkeypatch
+    ):
+        """If the batched attachment metadata query raises OperationalError,
+        messages with cache_has_attachments=1 must still be classified as
+        "[attachment]" rather than mislabeled "[message unavailable]" —
+        the empty attachments dict alone must not drive text classification."""
+        import sqlite3 as sqlite3_module
+
+        original_connect = sqlite3_module.connect
+
+        class FailingConnection:
+            def __init__(self, real_conn):
+                self._real_conn = real_conn
+
+            def execute(self, sql, *args, **kwargs):
+                if "FROM message_attachment_join" in sql:
+                    raise sqlite3_module.OperationalError("simulated failure")
+                return self._real_conn.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real_conn, name)
+
+            def __setattr__(self, name, value):
+                if name == "_real_conn":
+                    object.__setattr__(self, name, value)
+                else:
+                    setattr(self._real_conn, name, value)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return self._real_conn.__exit__(*exc_info)
+
+        def failing_connect(*args, **kwargs):
+            return FailingConnection(original_connect(*args, **kwargs))
+
+        monkeypatch.setattr(sqlite3_module, "connect", failing_connect)
+        result = _collector(chat_db).fetch_messages(since=None)
+
+        # msg 5 is a genuine attachment-only message; it must not be
+        # mislabeled as "[message unavailable]" just because the
+        # attachment query failed.
+        real_attachment_msg = next(m for m in result if m["id"] == "5")
+        assert real_attachment_msg["text"] == "[attachment]"
+        assert real_attachment_msg["attachments"] == []
+
     def test_no_n_plus_one_attachment_queries(self, chat_db, monkeypatch):
         """Attachment metadata must be fetched via one batched query, not
         once per attachment-bearing message."""

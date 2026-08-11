@@ -171,6 +171,7 @@ class iMessageCollector(BaseCollector):
                     row["id"] for row in rows if row["cache_has_attachments"]
                 ]
                 attachments_by_message_id: dict[int, list[dict]] = {}
+                attachment_query_failed = False
                 if attachment_message_ids:
                     try:
                         placeholders = ",".join("?" * len(attachment_message_ids))
@@ -187,9 +188,11 @@ class iMessageCollector(BaseCollector):
                                 "transfer_name": a_row["transfer_name"],
                             })
                     except sqlite3.OperationalError:
+                        attachment_query_failed = True
                         logger.warning(
-                            "Attachment metadata query failed; "
-                            "returning messages without attachments",
+                            "Attachment metadata query failed; returning messages "
+                            "without attachment details (text classification will "
+                            "fall back to cache_has_attachments)",
                             exc_info=True,
                         )
 
@@ -221,6 +224,12 @@ class iMessageCollector(BaseCollector):
                         text = w["text"]
                     elif attachments:
                         # Real attachment with no caption text.
+                        text = "[attachment]"
+                    elif attachment_query_failed and w["cache_has_attachments"]:
+                        # Attachment metadata query failed, so we can't tell
+                        # a genuine attachment from a phantom one (tapback,
+                        # reaction, system event). Trust cache_has_attachments
+                        # rather than mislabeling real attachments as unavailable.
                         text = "[attachment]"
                     else:
                         # cache_has_attachments=1 but no attachment rows exist
